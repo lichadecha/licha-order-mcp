@@ -3,6 +3,31 @@
 李茶的茶 · 企迈只读 MCP Server（一期）。让 AI 在对话里找店、看菜单、组单、算预估价。
 一期物理禁写：不产生真订单、不碰钱、不读经营数据。
 
+## 用户怎么用
+
+对你的 AI 说一句：
+
+> 我要喝李茶的茶，去 GitHub 拉取一下：lichadecha/licha-order-mcp
+
+装好后直接问「有什么奶茶」「哪家离我近」即可。目前仅支持到店（堂食/自取）。
+
+## 给 AI Agent 的安装说明（用户让你拉取本仓库时照做）
+
+1. 把下面这段合并进你的 MCP 配置（mcpServers）：
+
+```json
+"licha-order-mcp": {
+  "command": "npx",
+  "args": ["-y", "github:lichadecha/licha-order-mcp"]
+}
+```
+
+2. 把本仓库根目录的 `SKILL.md` 装进你的技能/指令目录（客户端支持 skills 时）。
+3. 按你的客户端要求重启或重载 MCP。
+4. 告诉用户装好了，并按 `SKILL.md` 的规则开始服务（第一句先说明：仅到店堂食/自取）。
+
+要求 Node ≥ 18；首次运行自动构建（prepare → tsc）。npx 找不到时换 Node 安装目录下的绝对路径。
+
 ## 四个工具
 
 | 工具 | 用途 |
