@@ -1,0 +1,36 @@
+{
+  "name": "licha-order-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "李茶的茶 · 企迈只读 MCP Server（一期）",
+  "bin": {
+    "licha-order-mcp": "dist/src/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "start": "npm run build && node dist/src/index.js",
+    "smoke": "npm run build && node dist/scripts/smoke.js",
+    "smoke:auth": "npm run build && node dist/scripts/smoke.js --auth-only",
+    "smoke:store": "npm run build && node dist/scripts/smokeStore.js",
+    "smoke:menu": "npm run build && node dist/scripts/smokeMenu.js",
+    "smoke:detail": "npm run build && node dist/scripts/smokeDetail.js",
+    "smoke:order": "npm run build && node dist/scripts/smokeOrder.js",
+    "smoke:mcp": "npm run build && node dist/scripts/mcpHandshake.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  }
+}
