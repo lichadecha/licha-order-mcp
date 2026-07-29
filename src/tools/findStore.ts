@@ -37,6 +37,7 @@ export interface Candidate {
   name: string;
   storeId: string;
   shopCode: string;
+  address: string;
   cityName: string;
   openStatusText: string;
 }
@@ -145,6 +146,7 @@ export async function findStore(query: string): Promise<FindStoreResult> {
         name: s.name,
         storeId: String(s.id),
         shopCode: String(s.code ?? ""),
+        address: s.address ?? "",
         cityName: s.cityName ?? "",
         openStatusText: openStatusText(s.openStatus),
       }))
