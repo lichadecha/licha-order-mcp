@@ -5,7 +5,7 @@ import { selfTest } from "../src/auth.js";
 import { call } from "../src/client.js";
 import { CHANNEL } from "../src/constants.js";
 
-// 无损锚点：取自 outputs/T2_step0_v6_result.json（Python 任意精度解析，无抹零）。
+// 无损锚点：取自 【归档】/outputs/T2_step0_v6_result.json（Python 任意精度解析，无抹零；2026-07-27 归档）。
 // 对照：qmai CLI 同字段返回 …800（抹零），本锚点为 …792（真值）。
 const ANCHOR = { categoryName: "茶奶", frontCategoryId: "1123766423256481792" } as const;
 
