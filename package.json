@@ -1,6 +1,6 @@
 {
   "name": "licha-order-mcp",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "李茶的茶 · 企迈只读 MCP Server（一期）",

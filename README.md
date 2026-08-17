@@ -18,7 +18,7 @@
 ```json
 "licha-order-mcp": {
   "command": "npx",
-  "args": ["-y", "github:lichadecha/licha-order-mcp"]
+  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.2.1"]
 }
 ```
 
@@ -46,11 +46,13 @@ mcpServers 配置：
   "mcpServers": {
     "licha-order-mcp": {
       "command": "npx",
-      "args": ["-y", "github:ORG_NAME/licha-order-mcp"]
+      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.2.1"]
     }
   }
 }
 ```
+
+安装命令固定指向版本标签（`#v0.2.1`），不追踪最新提交；升级时以新版 README 给出的标签为准。
 
 要求 Node 不低于 18；首次安装会自动构建（prepare 钩子跑 tsc）。
 
@@ -80,3 +82,7 @@ npm run smoke
 
 smoke 系列还有 smoke:store / smoke:menu / smoke:detail / smoke:order。
 冒烟走真实只读接口（基础类 0.1 元/百次，10 万次/月免费额度内，单次复验不超过 30 次调用）。
+
+## 许可证
+
+代码部分（src/、scripts/、test/、配置文件）采用 Apache-2.0；文字部分（SKILL.md、README 及其他文档）采用 CC BY-ND 4.0。「李茶的茶」名称与标识归品牌方所有，不在任何许可证授权范围内。详见 [LICENSE](./LICENSE)。
