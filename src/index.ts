@@ -9,6 +9,8 @@ import { findStore } from "./tools/findStore.js";
 import { getMenu } from "./tools/getMenu.js";
 import { getItemDetail } from "./tools/getItemDetail.js";
 import { previewOrder } from "./tools/previewOrder.js";
+import { ENABLE_ORDERING_ENV } from "./constants.js";
+import { placeOrderHandler } from "./placeOrderTool.js";
 
 const SERVER_NAME = "licha-order-mcp";
 const SERVER_VERSION = "0.3.1";
@@ -121,11 +123,43 @@ server.registerTool(
   },
 );
 
+// ---------- 二期写工具：默认关闭，LICHA_ENABLE_ORDERING=1 才注册 ----------
+//
+// 未设置该环境变量时，下面这段代码根本不会跑到 registerTool——tools/list 里连工具名都看不见。
+// 理由（施工令 § 3.1）：① 公开库突然多出下单能力会伤装机信任；② 开发期任何误触发都不该能真下单。
+//
+// 实际处理逻辑（校验 userId 黑名单 → 校验令牌 → 过护栏 → 调 callWrite）在 placeOrderTool.ts 里，
+// 不写在这里——因为本文件顶层有 main().catch(...) 会启动真实 stdio transport connect，
+// 单元测试不能安全地 import 这个文件；处理逻辑拆到独立模块后，测试才能直接 import + mock fetch。
+const ORDERING_ENABLED = process.env[ENABLE_ORDERING_ENV] === "1";
+
+if (ORDERING_ENABLED) {
+  server.registerTool(
+    "place_order",
+    {
+      title: "确认下单（写·唯一，M2 施工骨架）",
+      description:
+        "【M2 施工骨架，非最终形态】校验一次性确认令牌与护栏后调用企迈 6.2.9 创建订单。" +
+        "完整参数组装与下单前确认单见 M4 的 prepare_order；当前阶段没有工具能签发合法令牌，" +
+        "任何调用都会被护栏拒绝——这是预期行为，不是 bug。orderParams 不接受 userId 字段（任意嵌套层级）。",
+      inputSchema: {
+        confirmToken: z.string().min(1).describe("prepare_order 签发的一次性确认令牌（M4 交付物；M2 阶段传任意值都会被拒绝）"),
+        amountFen: z.number().int().positive().describe("本地预估金额（分），金额护栏用，> 10000 直接拒绝"),
+        orderParams: z
+          .record(z.string(), z.unknown())
+          .describe("6.2.9 完整下单参数（M2 阶段原样透传给 callWrite，参数组装规则见 M4；不接受 userId 字段）"),
+      },
+    },
+    placeOrderHandler,
+  );
+}
+
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  const writeNote = ORDERING_ENABLED ? " + place_order（写，已开启）" : "（写工具未开启）";
   console.error(
-    `[${SERVER_NAME}] v${SERVER_VERSION} stdio 已启动，四工具已注册：find_store / get_menu / get_item_detail / preview_order`,
+    `[${SERVER_NAME}] v${SERVER_VERSION} stdio 已启动，四只读工具已注册：find_store / get_menu / get_item_detail / preview_order${writeNote}`,
   );
 }
 

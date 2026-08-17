@@ -31,3 +31,18 @@ export const STORES = [
   { code: "06", name: "万象天地（深圳）", storeId: 539316 },
   { code: "07", name: "平安金融中心（深圳）", storeId: 549331 },
 ] as const;
+
+// ---------- 二期写通道常量（T5 施工令 § 4.1 / § 5 M2 节，2026-08-17） ----------
+// 写操作白名单（硬编码）：第一批只放一个写接口。与 READONLY_WHITELIST 物理分离——
+// callRead 不认它（写路径在 callRead 里仍会命中 ReadOnlyViolation），callWrite 只认它。
+export const WRITE_WHITELIST: readonly string[] = [
+  "v3/newPattern/cateringApiserver/post/order/v1/create", // 6.2.9 创建商品订单（第一批唯一写接口）
+];
+
+export const ORDER_GUARD = {
+  maxAmountFen: 10000, // 单笔 ≤ ¥100
+  maxOrdersPerDay: 5, // 单日 ≤ 5 单（北京时间自然日）
+  confirmTokenTtlMs: 5 * 60 * 1000, // 确认令牌 5 分钟
+} as const;
+
+export const ENABLE_ORDERING_ENV = "LICHA_ENABLE_ORDERING";

@@ -23,7 +23,8 @@
     "smoke:menu": "npm run build && node dist/scripts/smokeMenu.js",
     "smoke:detail": "npm run build && node dist/scripts/smokeDetail.js",
     "smoke:order": "npm run build && node dist/scripts/smokeOrder.js",
-    "smoke:mcp": "npm run build && node dist/scripts/mcpHandshake.js"
+    "smoke:mcp": "npm run build && node dist/scripts/mcpHandshake.js",
+    "test": "npm run build && node --test 'dist/test/**/*.test.js'"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
