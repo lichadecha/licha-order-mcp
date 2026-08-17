@@ -11,6 +11,8 @@
 
 装好后直接问「有什么奶茶」「哪家离我近」即可。目前仅支持到店（堂食/自取）。
 
+第一次喝不知道选什么？直接问「有什么推荐」。想让 AI 帮你算哪家店近，可以再给它装一个高德地图 MCP（可选）。
+
 ## 给 AI Agent 的安装说明（用户让你拉取本仓库时照做）
 
 1. 把下面这段合并进你的 MCP 配置（mcpServers）：
@@ -18,7 +20,7 @@
 ```json
 "licha-order-mcp": {
   "command": "npx",
-  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.2.1"]
+  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.0"]
 }
 ```
 
@@ -46,13 +48,13 @@ mcpServers 配置：
   "mcpServers": {
     "licha-order-mcp": {
       "command": "npx",
-      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.2.1"]
+      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.0"]
     }
   }
 }
 ```
 
-安装命令固定指向版本标签（`#v0.2.1`），不追踪最新提交；升级时以新版 README 给出的标签为准。
+安装命令固定指向版本标签（`#v0.3.0`），不追踪最新提交；升级时以新版 README 给出的标签为准。
 
 要求 Node 不低于 18；首次安装会自动构建（prepare 钩子跑 tsc）。
 
