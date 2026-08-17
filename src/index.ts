@@ -11,7 +11,7 @@ import { getItemDetail } from "./tools/getItemDetail.js";
 import { previewOrder } from "./tools/previewOrder.js";
 
 const SERVER_NAME = "licha-order-mcp";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.3.1";
 
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 

@@ -20,7 +20,7 @@
 ```json
 "licha-order-mcp": {
   "command": "npx",
-  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.0"]
+  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.1"]
 }
 ```
 
@@ -48,13 +48,13 @@ mcpServers 配置：
   "mcpServers": {
     "licha-order-mcp": {
       "command": "npx",
-      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.0"]
+      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.1"]
     }
   }
 }
 ```
 
-安装命令固定指向版本标签（`#v0.3.0`），不追踪最新提交；升级时以新版 README 给出的标签为准。
+安装命令固定指向版本标签（`#v0.3.1`），不追踪最新提交；升级时以新版 README 给出的标签为准。
 
 要求 Node 不低于 18；首次安装会自动构建（prepare 钩子跑 tsc）。
 
