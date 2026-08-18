@@ -123,7 +123,12 @@ export async function bindMemberHandler({ code, codeType }: BindMemberInput): Pr
       audit.record({
         event: "bind_rejected",
         result: "rejected",
-        reason: resp.message ? `CustomerNotFound:${resp.message}` : "CustomerNotFound",
+        // 不再把企迈的 message 原文拼进审计（§ 8 第 25 条）：那段文本是**外部输入**，
+        // 内容不受我们控制——4.2.2 的异常示例在文档里是空的，实测已知它会把手机号嵌在句子里
+        // （M3 的 B7 缺陷），完全可能哪天也把会员 ID、动态码原样带出来。出口脱敏虽然能兜住
+        // 已知形态，但「不把不受控的外部文本落盘」比「落盘后再洗」少一整类风险。
+        // 排查所需的信息量并没有损失：错误枚举 + 原文长度 + 企迈 code 足以区分是哪一类失败。
+        reason: `CustomerNotFound:len=${resp.message?.length ?? 0}:code=${resp.code ?? "none"}`,
         codeLast4,
         sessionKey: DEFAULT_SESSION_KEY,
         tool: "bind_member",

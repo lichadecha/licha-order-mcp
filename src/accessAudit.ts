@@ -13,7 +13,7 @@
 
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { beijingDateKey, beijingTimeString, maskDeep } from "./writeGuard.js";
+import { beijingDateKey, beijingTimeString, sanitizeAuditRecord } from "./writeGuard.js";
 import { logFilePath } from "./logPaths.js";
 
 // ---------- 默认路径（生产用；测试请通过构造参数注入临时路径，见 setAccessAuditLoggerForTesting） ----------
@@ -101,9 +101,11 @@ export class AccessAuditLogger {
     };
     try {
       mkdirSync(dirname(this.logPath), { recursive: true });
-      // maskDeep 兜底：调用方理应已经只传 Last4 形态，这里再扫一遍防止任何疏漏把完整识别值
-      // 或凭证字段带进日志——同一份脱敏实现来自 writeGuard.ts，不在这里复制第二份。
-      appendFileSync(this.logPath, `${JSON.stringify(maskDeep(line))}\n`);
+      // 统一出口脱敏兜底：调用方理应已经只传 Last4 形态，这里再扫一遍防止任何疏漏把完整识别值
+      // 或凭证字段带进日志——同一份实现来自 writeGuard.ts，不在这里复制第二份。
+      // 从 maskDeep 升级为 sanitizeAuditRecord（§ 8 第 25 条）：会员 ID/动态码/40+ 位长串
+      // 在普通字段里能穿透 maskDeep，数字类型的手机号也穿透，改成默认全脱敏 + 白名单例外。
+      appendFileSync(this.logPath, `${JSON.stringify(sanitizeAuditRecord(line))}\n`);
     } catch {
       // 写入失败不阻塞主链路：拒绝/放行的决定已经在 record 调用之前做出。
     }

@@ -3,7 +3,7 @@
 import { randomInt } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { BASE_URL, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
+import { BASE_URL, ENABLE_ORDERING_ENV, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
 import { loadCredentials, sign, type Credentials } from "./auth.js";
 import { fingerprint, getWriteGuard, PHONE_RE, type WriteAuditSummary } from "./writeGuard.js";
 import { logFilePath } from "./logPaths.js";
@@ -21,6 +21,16 @@ export class WriteNotAllowed extends Error {
   constructor(path: string) {
     super(`WriteNotAllowed: 路径不在写白名单：${path}`);
     this.name = "WriteNotAllowed";
+  }
+}
+
+export class WriteDisabled extends Error {
+  constructor() {
+    super(
+      `WriteDisabled: 写能力未开启（需要环境变量 ${ENABLE_ORDERING_ENV}=1）。这是防御纵深的第二道闸：` +
+        `index.ts 在开关关闭时根本不注册写工具，本检查用来挡住任何绕过工具注册层、直接调用写出口的路径。`,
+    );
+    this.name = "WriteDisabled";
   }
 }
 
@@ -244,6 +254,15 @@ export async function callWrite<T = unknown>(
   const t0 = Date.now();
   const summary = summarizeWriteParams(params, opts.amountFen);
   const auditBase = { path, tokenId: opts.confirmToken ?? null, summary };
+
+  // ⓪ 写能力开关兜底（M5 前置修复第 3 项 c）：env ≠ "1" 直接拒绝。
+  // 为什么工具注册层已经门控了还要再来一道：那一道防的是「模型看不见写工具」，
+  // 挡不住任何直接 import callWrite 的代码路径（本进程内的脚本、将来新写的工具、误接线）。
+  // 写请求是不可撤销的现实动作，值得两道独立的闸——这一道离真正发出请求最近。
+  if (process.env[ENABLE_ORDERING_ENV] !== "1") {
+    guard.recordAudit({ ...auditBase, result: "rejected", reason: "OrderingDisabled", idempotencyKey: null, durationMs: Date.now() - t0 });
+    throw new WriteDisabled();
+  }
 
   // ① 写白名单——不在名单里，连指纹都不算，直接拒绝（先记审计、再抛错、请求不发出）。
   if (!WRITE_WHITELIST.includes(path)) {

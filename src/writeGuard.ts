@@ -117,6 +117,74 @@ export function maskDeep(value: unknown): unknown {
   return maskValue(value);
 }
 
+// ---------- 统一出口脱敏 sink（M5 前置修复第 3 项，施工令 § 8 第 25 条） ----------
+//
+// maskDeep 只认两类东西：凭证类字段名、手机号形态的字符串。Codex 审计的实物探针打穿了它——
+// 会员 ID（19 位纯数字）、动态码、40+ 位高熵串放在**任意普通字段**里都能原样落盘；数字类型的
+// 手机号（number 而不是 string）也穿透；写审计的顶层 reason 当时压根没过 maskDeep。
+//
+// 修法不是再补几个字段名，而是把判据从「哪些字段危险」翻转成「哪些字段确定安全」：
+// 落盘前整条记录过一遍 sanitizeAuditRecord，**默认全脱敏**，只有白名单里的字段保留完整值。
+// 这样将来任何人往审计记录里加新字段，默认都是安全的一侧——漏一个字段名的代价从「泄露」
+// 变成「多打几个星号」。
+//
+// 白名单成员逐个都有非它不可的理由（不是"看着不敏感"就放）：
+//   orderNo         —— 订单号是排查与核对的唯一抓手，脱敏了整本审计就没用了；它不是识别值，
+//                      拿到订单号也查不到人（6.1.5/6.1.9 都要 userId 才给数据）。
+//   tokenId         —— 随机 16 字节 hex，本地签发、5 分钟即焚，不含任何身份信息。
+//   idempotencyKey  —— 本地 sha256 指纹，不可逆，是幂等与频次重建的连接键。
+//   resolvedKeys    —— 就是一组 idempotencyKey（未决销账靠它按键清账，脱敏了重建就对不上，
+//                      「已发出≠已成功」闸门会在重启后错误地一直挂着）。
+//   path/time/dateKey —— 接口路径与时间戳，审计的骨架字段。
+const AUDIT_PLAIN_KEYS = new Set(["orderNo", "tokenId", "idempotencyKey", "resolvedKeys", "path", "time", "dateKey"]);
+
+// 40 位以上高熵字母数字串（token/密钥/长哈希形态）。
+const LONG_ENTROPY_RE = /(?<![0-9A-Za-z])[0-9A-Za-z]{40,}(?![0-9A-Za-z])/g;
+// 15 位以上连续数字串（企迈的 19 位雪花 ID、会员 ID、动态码都在这个形态里）。
+// 前后的负向断言把「被字母粘住」的数字串排除在外——订单号 D00281924556183175168 的
+// 数字段紧跟在字母 D 后面，不会被当成独立数字串拆掉（orderNo 字段本身也在白名单里，双保险）。
+const LONG_DIGITS_RE = /(?<![0-9A-Za-z])\d{15,}(?![0-9A-Za-z])/g;
+// 数字类型的手机号形态（number 而不是 string——JSON 里 13800001234 写成数字照样是手机号）。
+const PHONE_NUMERIC_RE = /^1[3-9]\d{9}$/;
+
+function maskLongTokens(s: string): string {
+  return s.replace(LONG_ENTROPY_RE, (m) => `***${m.slice(-4)}`).replace(LONG_DIGITS_RE, (m) => `***${m.slice(-4)}`);
+}
+
+/** 数字值的脱敏：11 位手机号形态、或 15 位以上的长数字，转成 "***后四位" 字符串。 */
+function maskNumber(v: number): unknown {
+  if (!Number.isFinite(v) || !Number.isInteger(v)) return v;
+  const digits = String(Math.abs(v));
+  if (PHONE_NUMERIC_RE.test(digits) || digits.length >= 15) return `***${digits.slice(-4)}`;
+  return v;
+}
+
+function sanitizeNode(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeNode);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (CREDENTIAL_KEY_RE.test(k)) continue; // 凭证字段名：整条丢弃（同 maskDeep）
+      out[k] = AUDIT_PLAIN_KEYS.has(k) ? v : sanitizeNode(v); // 白名单字段整棵子树原样保留
+    }
+    return out;
+  }
+  if (typeof value === "number") return maskNumber(value);
+  if (typeof value === "string") return maskLongTokens(maskValue(value) as string);
+  return value;
+}
+
+/**
+ * 审计落盘的唯一出口脱敏：整条记录（含顶层 reason）过一遍。
+ * 规则 = maskDeep 的两条（凭证字段名删除 + 嵌入式手机号）叠加三条新的：
+ *   ① 15 位以上连续数字串只留后四位；② 40 位以上高熵字母数字串只留后四位；
+ *   ③ 数字类型的 11 位手机号 / 15 位以上长数字同样脱敏。
+ * 白名单字段（见 AUDIT_PLAIN_KEYS）例外。
+ */
+export function sanitizeAuditRecord(value: unknown): unknown {
+  return sanitizeNode(value);
+}
+
 // ---------- 确认令牌 ----------
 interface TokenRecord {
   tokenId: string;
@@ -375,7 +443,7 @@ export class WriteGuard {
       reason: entry.reason ?? null,
       tokenId: entry.tokenId ?? null,
       idempotencyKey: entry.idempotencyKey ?? null,
-      summary: entry.summary ? maskDeep(entry.summary) : undefined,
+      summary: entry.summary,
       orderNo: entry.orderNo ?? null,
       code: entry.code ?? null,
       ...(entry.resolvedKeys ? { resolvedKeys: entry.resolvedKeys } : {}),
@@ -386,7 +454,9 @@ export class WriteGuard {
     this.applyAuditToState(line);
     try {
       mkdirSync(dirname(this.auditLogPath), { recursive: true });
-      appendFileSync(this.auditLogPath, `${JSON.stringify(line)}\n`);
+      // 统一出口脱敏：整条记录（含顶层 reason）而不是只有 summary——顶层 reason 会拼接
+      // 命中路径、错误枚举一类外部来源的文本，Codex 审计实证它是可穿透的落盘口（§ 8 第 25 条）。
+      appendFileSync(this.auditLogPath, `${JSON.stringify(sanitizeAuditRecord(line))}\n`);
     } catch {
       // 审计写入失败不阻塞主链路判定（拒绝/放行的决定已经在 recordAudit 调用之前做出）。
     }
