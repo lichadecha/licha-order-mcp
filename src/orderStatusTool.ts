@@ -2,8 +2,8 @@
 // 头部注释：index.ts 顶层的 main().catch(...) 会触发真实 stdio transport connect，测试不能安全
 // import 它；处理逻辑拆到独立模块后才能直接 import + mock fetch。
 //
-// 本文件同时导出 assertOrderOwnership：M4 的 6.1.9（订单详情）/ 6.1.6（订单列表）工具要复用
-// 同一份所有权校验，不许各自再写一份判据不一致的版本。
+// 本文件同时导出 assertOrderOwnership 与 statusText：M4 的 6.1.9（订单详情读回）/ 6.1.6（订单
+// 列表）工具要复用同一份所有权校验与同一份状态文案，不许各自再写一份判据不一致的版本。
 
 import { callRead } from "./client.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
@@ -46,7 +46,8 @@ const STATUS_TEXT_MAP: Record<number, string> = {
   70: "已关闭",
 };
 
-function statusText(status: number): string {
+/** 导出给 M4 的 my_orders 复用：状态枚举与文案只允许有一份（同 assertOrderOwnership 的理由）。 */
+export function statusText(status: number): string {
   return STATUS_TEXT_MAP[status] ?? `未知状态(${status})`;
 }
 

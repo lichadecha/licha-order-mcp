@@ -51,7 +51,9 @@ async function listToolNames(enableOrdering: string | undefined): Promise<string
 }
 
 const READONLY_TOOLS = ["find_store", "get_menu", "get_item_detail", "preview_order"] as const;
-const PHASE2_TOOLS = ["place_order", "bind_member", "get_order_status"] as const;
+// M4 追加 prepare_order 与 my_orders。prepare_order 虽然是只读工具（不创建订单），但它属于
+// 交易链路，与 my_orders 一样放在写能力开关门控内——开关关闭时 tools/list 必须仍只有一期四工具。
+const PHASE2_TOOLS = ["place_order", "bind_member", "get_order_status", "prepare_order", "my_orders"] as const;
 
 test("T1: 开关未设置 → tools/list 不含任何写工具（含 place_order）", async () => {
   const names = await listToolNames(undefined);
@@ -67,7 +69,7 @@ test("T2: 开关 =1 → tools/list 含 place_order", async () => {
   assert.ok(names.includes("place_order"), `设置 LICHA_ENABLE_ORDERING=1 后应出现 place_order，实得：${names.join(", ")}`);
 });
 
-test("U12: tools/list 双态——开关关闭 = 4 工具；开启 = 7 工具（四只读 + place_order + bind_member + get_order_status）", async () => {
+test("U12: tools/list 双态——开关关闭 = 4 工具；开启 = 9 工具（四只读 + prepare_order + place_order + bind_member + get_order_status + my_orders）", async () => {
   const offNames = await listToolNames(undefined);
   assert.strictEqual(offNames.length, 4, `开关关闭时应恰好 4 个工具，实得：${offNames.join(", ")}`);
   for (const t of PHASE2_TOOLS) {
@@ -76,7 +78,7 @@ test("U12: tools/list 双态——开关关闭 = 4 工具；开启 = 7 工具（
 
   const onTools = await listTools("1");
   const onNames = onTools.map((t) => t.name);
-  assert.strictEqual(onNames.length, 7, `开关开启时应恰好 7 个工具，实得：${onNames.join(", ")}`);
+  assert.strictEqual(onNames.length, 9, `开关开启时应恰好 9 个工具，实得：${onNames.join(", ")}`);
   for (const t of [...READONLY_TOOLS, ...PHASE2_TOOLS]) {
     assert.ok(onNames.includes(t), `开关开启时应包含 ${t}，实得：${onNames.join(", ")}`);
   }

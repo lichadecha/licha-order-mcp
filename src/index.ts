@@ -10,7 +10,9 @@ import { getMenu } from "./tools/getMenu.js";
 import { getItemDetail } from "./tools/getItemDetail.js";
 import { previewOrder } from "./tools/previewOrder.js";
 import { ENABLE_ORDERING_ENV } from "./constants.js";
-import { placeOrderHandler } from "./placeOrderTool.js";
+import { placeOrderConfirmedHandler } from "./placeOrderTool.js";
+import { prepareOrderHandler } from "./prepareOrderTool.js";
+import { myOrdersHandler } from "./myOrdersTool.js";
 import { bindMemberHandler } from "./bindMemberTool.js";
 import { getOrderStatusHandler } from "./orderStatusTool.js";
 
@@ -132,31 +134,63 @@ server.registerTool(
 // M3 追加理由：bind_member / get_order_status 虽是只读调用，但属二期交易域（身份绑定与查单
 // 都是"下单"这条业务线的一部分），开关关闭时 tools/list 必须仍只有一期四工具，保持公开仓只读形象。
 //
-// 实际处理逻辑都拆到独立模块（placeOrderTool.ts / bindMemberTool.ts / orderStatusTool.ts），
+// M4 追加：prepare_order 虽是纯只读工具（本地算价 + 签发确认令牌，不创建任何订单），仍然放在
+// 门控内——它是下单链路的一环，开关关闭时整条交易链路都不该出现在 tools/list 里。my_orders 同理。
+//
+// 实际处理逻辑都拆到独立模块（prepareOrderTool.ts / placeOrderTool.ts / bindMemberTool.ts /
+// orderStatusTool.ts / myOrdersTool.ts），
 // 不写在这里——因为本文件顶层有 main().catch(...) 会启动真实 stdio transport connect，
 // 单元测试不能安全地 import 这个文件；处理逻辑拆到独立模块后，测试才能直接 import + mock fetch。
 const ORDERING_ENABLED = process.env[ENABLE_ORDERING_ENV] === "1";
 
 if (ORDERING_ENABLED) {
   server.registerTool(
-    "place_order",
+    "prepare_order",
     {
-      title: "确认下单（写·唯一，M2/M3 施工骨架）",
+      title: "组单（下单前确认，只读）",
       description:
-        "【M2/M3 施工骨架，非最终形态】校验一次性确认令牌与护栏后调用企迈 6.2.9 创建订单。" +
-        "需先用 bind_member 绑定会员身份——本会话尚未绑定时会被直接拒绝，不会发起请求。" +
-        "完整参数组装与下单前确认单见 M4 的 prepare_order；当前阶段没有工具能签发合法令牌，" +
-        "任何调用都会被护栏拒绝——这是预期行为，不是 bug。orderParams 不接受 userId 字段（任意嵌套层级，" +
-        "userId 只能由会话态注入）。",
+        "两阶段下单的第一步（只读，不会创建任何订单）：本地算价、组装下单参数，返回一张「待确认单」" +
+        "和一个 5 分钟内有效、只能用一次的确认令牌。需先用 bind_member 绑定会员身份。" +
+        "拿到待确认单后必须逐项念给顾客确认（门店、每杯商品与规格做法、杯数、总金额），" +
+        "顾客确认后再调用 place_order。入参与 preview_order 同构；不接受 userId、金额与渠道参数。",
       inputSchema: {
-        confirmToken: z.string().min(1).describe("prepare_order 签发的一次性确认令牌（M4 交付物；M2 阶段传任意值都会被拒绝）"),
-        amountFen: z.number().int().positive().describe("本地预估金额（分），金额护栏用，> 10000 直接拒绝"),
-        orderParams: z
-          .record(z.string(), z.unknown())
-          .describe("6.2.9 完整下单参数（M2 阶段原样透传给 callWrite，参数组装规则见 M4；不接受 userId 字段）"),
+        storeId: storeIdSchema,
+        items: z
+          .array(
+            z.object({
+              goodsId: z.string().min(1).describe("商品 ID"),
+              skuId: z.string().optional().describe("规格 ID；唯一规格可省略自动选"),
+              practices: z.array(z.string()).optional().describe('做法值名，如 ["少冰（400ml)", "70%-L阿拉伯糖"]'),
+              attaches: z.array(z.string()).optional().describe("加料名"),
+              quantity: z.number().int().min(1).max(99),
+            }),
+          )
+          .min(1)
+          .max(20),
       },
     },
-    placeOrderHandler,
+    prepareOrderHandler,
+  );
+
+  server.registerTool(
+    "place_order",
+    {
+      title: "确认下单（写·唯一）",
+      description:
+        "两阶段下单的第二步（写）：凭 prepare_order 签发的确认令牌创建真实订单。" +
+        "下单参数完全来自那张待确认单，本工具不接受任何订单内容参数——" +
+        "这保证「下的单 = 念给顾客听过的那张单」。下单成功后会强制读回企迈的实付金额与优惠明细，" +
+        "与本地预估比对；差额超阈值时返回体带 warning，必须先向顾客说清差额再引导付款。" +
+        "我们不代付、不碰支付凭据，只引导顾客去小程序「我的订单」自行付款。",
+      inputSchema: {
+        confirmToken: z.string().min(1).describe("prepare_order 签发的一次性确认令牌（5 分钟内有效，用一次即失效）"),
+        confirmAmountYuan: z
+          .number()
+          .positive()
+          .describe("你刚刚念给顾客确认的总金额（元）。必须与待确认单一致，不一致会被拒绝下单"),
+      },
+    },
+    placeOrderConfirmedHandler,
   );
 
   server.registerTool(
@@ -195,13 +229,27 @@ if (ORDERING_ENABLED) {
     },
     getOrderStatusHandler,
   );
+
+  server.registerTool(
+    "my_orders",
+    {
+      title: "我的订单",
+      description:
+        "列出当前绑定会员最近几天的订单（订单号、状态、实付金额、下单时间、商品）。" +
+        "只查当前绑定的会员本人——不接受指定他人身份，最多返回最近 10 条。",
+      inputSchema: {
+        days: z.number().int().min(1).max(90).default(7).describe("查最近几天（1-90，默认 7；企迈限制查询窗口最长 90 天）"),
+      },
+    },
+    myOrdersHandler,
+  );
 }
 
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const writeNote = ORDERING_ENABLED
-    ? " + place_order/bind_member/get_order_status（二期已开启）"
+    ? " + prepare_order/place_order/bind_member/get_order_status/my_orders（二期已开启）"
     : "（二期工具未开启）";
   console.error(
     `[${SERVER_NAME}] v${SERVER_VERSION} stdio 已启动，四只读工具已注册：find_store / get_menu / get_item_detail / preview_order${writeNote}`,

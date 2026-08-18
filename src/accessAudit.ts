@@ -24,7 +24,11 @@ export type AccessAuditEvent =
   | "bind_success"
   | "bind_rejected"
   | "unbound_call_rejected"
-  | "ownership_mismatch";
+  | "ownership_mismatch"
+  // M4 新增：prepare_order 签发一次性确认令牌。记的是"这张单被确认过"这个访问控制事实
+  // （谁、什么时候、多少钱、几行商品），不记商品明细——审计要能回答"有没有凭空冒出来的确认"，
+  // 不需要回答"顾客点了什么"，后者属于订单数据，不该在审计日志里留副本。
+  | "token_issued";
 
 export interface AccessAuditEntry {
   event: AccessAuditEvent;
@@ -37,6 +41,12 @@ export interface AccessAuditEntry {
   orderNo?: string | null;
   sessionKey?: string | null;
   tool?: string | null;
+  /** M4：确认令牌 ID（token_issued 事件用）。令牌 ID 本身是随机串，不是识别值。 */
+  tokenId?: string | null;
+  /** M4：本地预估金额，单位「分」（整数）。金额一律用分记，与写审计 summary 的口径一致。 */
+  estimatedAmountFen?: number | null;
+  /** M4：待确认单的商品行数（不记商品名与规格）。 */
+  itemCount?: number | null;
 }
 
 interface AccessAuditLoggerOptions {
@@ -81,6 +91,9 @@ export class AccessAuditLogger {
       orderNo: entry.orderNo ?? null,
       sessionKey: entry.sessionKey ?? null,
       tool: entry.tool ?? null,
+      tokenId: entry.tokenId ?? null,
+      estimatedAmountFen: entry.estimatedAmountFen ?? null,
+      itemCount: entry.itemCount ?? null,
     };
     try {
       mkdirSync(dirname(this.logPath), { recursive: true });
