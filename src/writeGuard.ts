@@ -76,9 +76,24 @@ export const PHONE_RE = /^(?:\+?86|0086)?1\d{10}$/;
 // 凭证类字段名：命中即整字段丢弃，不管值是什么（比 grep 关键字更早一步，防止任何形式的凭证落盘）。
 const CREDENTIAL_KEY_RE = /openkey|opentoken|grantcode|openid|password|secret/i;
 
+// 手机号「嵌入式」正则：maskValue 用它在任意字符串值内部就地替换嵌入的手机号——不要求整个
+// 字符串恰好就是手机号。总工验收裁决（M3 B7 修复）：企迈接口的 message 字段可能把手机号嵌在
+// 一句话里（如"手机号13800001234不存在"），PHONE_RE 的整串匹配（^...$）接不住这种情形，会
+// 导致完整号码经由 reason 一类字段落进审计日志。
+//
+// 负向断言 (?<!\d) / (?!\d) 是防误伤的关键：像订单号 D00281924556183175168 这种长数字串，
+// 中段可能偶然长得像一个 11 位手机号，但它的前后仍然是数字——负向断言据此把这类"被更长数字
+// 串包裹的子串"排除在外，只有号码前后确实不是数字（汉字、标点、字符串首尾）时才判定为真实
+// 嵌入号码。第二位限定 [3-9] 额外贴合真实手机号段（13x-19x），减少误判面。
+//
+// 对纯 11 位 / 86 前缀 / +86 前缀 / 0086 前缀这几种整串形态，本正则的匹配行为与 PHONE_RE
+// 一致（是其超集），不引入行为倒退；PHONE_RE 本身保留不动，client.ts 的 summarizeWriteParams
+// 仍用它做整串检测，两处判据不必也不应该合并成一个。
+const PHONE_EMBED_RE = /(?<!\d)(?:\+?86|0086)?1[3-9]\d{9}(?!\d)/g;
+
 function maskValue(v: unknown): unknown {
-  if (typeof v === "string" && PHONE_RE.test(v)) return `***${v.slice(-4)}`;
-  return v;
+  if (typeof v !== "string") return v;
+  return v.replace(PHONE_EMBED_RE, (m) => `***${m.slice(-4)}`);
 }
 
 // export：M3 的 accessAudit.ts 复用同一份脱敏实现，不许复制粘贴第二份（见该文件头部注释）。

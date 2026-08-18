@@ -9,6 +9,8 @@
 // HTTP/WebSocket 连接一个），存储结构现在就按 Map<sessionKey, binding> 预埋，三期接入时
 // SessionStore 的接口不用变，只是调用方传入的 key 不再永远是同一个字符串。
 
+import { beijingTimeString } from "./writeGuard.js";
+
 /** stdio 单进程 = 单会话，本期唯一会话键。三期远程化后由真实会话 ID 取代。 */
 export const DEFAULT_SESSION_KEY = "stdio-session";
 
@@ -25,7 +27,8 @@ export interface SessionBinding {
 export class SessionAlreadyBound extends Error {
   constructor(existing: SessionBinding) {
     const last4 = existing.customerId.slice(-4);
-    const boundAtStr = new Date(existing.boundAt).toISOString();
+    // 项目纪律：一切时间戳用北京时间，不用本机时区/UTC（同 writeGuard.ts 的 beijingTimeString）。
+    const boundAtStr = beijingTimeString(existing.boundAt);
     super(
       `SessionAlreadyBound：本会话已绑定会员（***${last4}，绑定于 ${boundAtStr}）。` +
         `一个会话只能绑定一位会员，要换人请重开会话。`,
