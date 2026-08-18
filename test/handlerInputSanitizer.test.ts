@@ -38,6 +38,13 @@
 //     grep 不到任何完整假手机号、假会员 ID、45 位假高熵串，订单号 D+20 位完整保留；
 //   · 🚨 红线双证：发给企迈的 params 里手机号仍是完整原值，且原 order_request 对象一字未改。
 // 实跑输出留在本轮交付汇报里。
+//
+// 第二轮微补丁（2026-08-18，字母侧豁免取消）后两支探针重跑，断言按新口径更新并全部通过：
+//   · m1.scrub_text / m1.safe_print / m1.scrub_deep 与 m3.sanitize_message 对
+//     「探针ID1234567890123456789贴字母」一律只留尾号（旧口径下完整穿透）；
+//   · 订单号形态的断言从「文本里保持完整」改为「数字段遮成 D***5168」——py 侧没有
+//     mcp-server 那样的字段级白名单，落盘与打印的订单号都会遮尾号，后果已在
+//     m1_scout_order.py 的 sanitizer 注释里如实登记并上报总工待裁决。
 // ---------------------------------------------------------------------------
 
 import { test, after } from "node:test";
@@ -255,6 +262,69 @@ test("R6: AUDIT_PLAIN_KEYS 逐键喂格式不符的恶意值 → 全部脱敏；
   const proto = sanitizeAuditRecord({ toString: FAKE_PHONE, constructor: OTHER_MEMBER_ID }) as Record<string, unknown>;
   assert.strictEqual(proto.toString, "***1234", "toString 字段照普通字段脱敏");
   assert.strictEqual(proto.constructor, "***4321", "constructor 字段照普通字段脱敏");
+});
+
+// ============================================================================
+// R8：字母紧贴 15+ 位数字（总工探针形态）→ 处理器级同样只留尾号
+// ============================================================================
+// P-W2 第二轮微补丁的正面回归。被打穿的旧口径：LONG_DIGITS_RE 的负向断言连**字母侧**一起
+// 豁免（(?<![0-9A-Za-z])），本意是保住文本里的订单号，实测放行了「字母贴会员 ID」——
+// 企迈英文键名回显（ID/no/uid 后面直接跟号）是这种形态最常见的来源。豁免取消后只看数字侧。
+test("R8: 字母紧贴 19 位假会员 ID 当 orderNo 调 get_order_status → 数字段只留尾号", async () => {
+  setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
+  const { logger, logPath } = freshAccessAudit();
+  setAccessAuditLoggerForTesting(logger);
+  const spy = installFetchSpy(`{"status":true,"code":0,"data":{"status":10,"userId":${OTHER_MEMBER_ID}}}`);
+  try {
+    // orderNo 位置塞「ID + 19 位假会员 ID」：既不是合法订单号格式（白名单双校验不放行），
+    // 又是字母紧贴长数字（旧口径的漏网形态）。
+    const result = await getOrderStatusHandler({ orderNo: `ID${OTHER_MEMBER_ID}` });
+    assert.strictEqual(result.isError, true);
+    const { raw, obj } = lastLine(logPath);
+    assert.strictEqual(obj.event, "ownership_mismatch");
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "字母紧贴也不许让完整会员 ID 落盘（这就是本轮被打穿的口）");
+    assert.strictEqual(obj.orderNo, "ID***4321", "字母前缀保留（仍能看出是哪类值），数字段只留尾四位");
+  } finally {
+    spy.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+});
+
+// ============================================================================
+// R9：自由文本 reason 里的「字母贴长数字」→ 尾号；同一条记录的白名单 orderNo → 全值
+// ============================================================================
+// 总工探针的原样复现（reason 文本「探针ID1234567890123456789贴字母」），外加本轮裁决依据的
+// 正面自证：订单号的审计价值由白名单 orderNo 字段承接，所以「文本遮尾号」与「字段留全值」
+// 必须在同一条记录里同时成立——缺后者，遮文本就是真的在削弱审计。
+test("R9: reason 含字母贴 19 位假 ID → 只留尾号；白名单 orderNo（D+20 位）同条记录仍完整", () => {
+  const { guard, auditLogPath } = freshWriteGuard();
+  guard.recordAudit({
+    path: WRITE_WHITELIST[0],
+    result: "rejected",
+    reason: `探针ID${OTHER_MEMBER_ID}贴字母`,
+    orderNo: REAL_FORMAT_ORDER_NO,
+    idempotencyKey: null,
+    durationMs: 0,
+  });
+  const { raw, obj } = lastLine(auditLogPath);
+  assert.ok(!raw.includes(OTHER_MEMBER_ID), "落盘整行不得出现完整会员 ID");
+  assert.strictEqual(obj.reason, "探针ID***4321贴字母", "字母贴长数字的数字段只留尾四位");
+  assert.strictEqual(obj.orderNo, REAL_FORMAT_ORDER_NO, "白名单 orderNo 字段仍是全值（审计价值在这里承接）");
+
+  // 同一条口径下：自由文本里的订单号数字段被遮成 D***5168，仍能认出事件类型，
+  // 要全值就回到 orderNo 字段取——这正是本轮裁决的依据成立的样子。
+  guard.recordAudit({
+    path: WRITE_WHITELIST[0],
+    result: "rejected",
+    reason: `DuplicateOf:${REAL_FORMAT_ORDER_NO}`,
+    orderNo: REAL_FORMAT_ORDER_NO,
+    idempotencyKey: null,
+    durationMs: 0,
+  });
+  const { obj: obj2 } = lastLine(auditLogPath);
+  assert.strictEqual(obj2.reason, "DuplicateOf:D***5168");
+  assert.strictEqual(obj2.orderNo, REAL_FORMAT_ORDER_NO);
 });
 
 // ============================================================================

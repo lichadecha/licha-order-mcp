@@ -154,18 +154,25 @@ test("U-S5: orderNo / tokenId / idempotencyKey / resolvedKeys 走白名单，值
   assert.deepEqual(obj.resolvedKeys, [idemKey], "resolvedKeys 是一组幂等键，脱敏会让未决闸门销不掉账");
   assert.equal(obj.path, WRITE_WHITELIST[0]);
 
-  // 同样的订单号出现在**非白名单字段**里时，前缀字母保护它不被数字规则误拆
+  // 同一个订单号出现在**非白名单字段**（自由文本 reason）里时：数字段只留尾四位。
+  // P-W2 第二轮微补丁（2026-08-18）改的就是这条断言的口径——改前断言的是「前缀字母保护它
+  // 不被数字规则误拆」，那个字母侧豁免被总工探针打穿：「探针ID1234567890123456789」同样是
+  // 字母贴长数字，会员 ID 于是完整落盘。豁免取消后自由文本里的订单号遮成 D***5168。
+  // 这不是削弱断言，而是把「订单号的核对价值由谁承接」钉清楚：靠白名单 orderNo 字段，
+  // 不靠自由文本。所以同一条记录里两件事必须同时成立——文本遮尾号、字段仍是全值。
   const { obj: obj2 } = (() => {
     guard.recordAudit({
       path: WRITE_WHITELIST[0],
       result: "rejected",
       reason: `DuplicateOf:${REAL_ORDER_NO}`,
+      orderNo: REAL_ORDER_NO,
       idempotencyKey: null,
       durationMs: 0,
     });
     return lastLine(auditLogPath);
   })();
-  assert.equal(obj2.reason, `DuplicateOf:${REAL_ORDER_NO}`, "带字母前缀的订单号不被 15+ 位数字规则误伤");
+  assert.equal(obj2.reason, "DuplicateOf:D***5168", "自由文本里的订单号数字段只留尾四位（字母侧豁免已取消）");
+  assert.equal(obj2.orderNo, REAL_ORDER_NO, "同一条记录的白名单 orderNo 字段仍是全值——排查回到这里取号");
 });
 
 // ============================================================================
