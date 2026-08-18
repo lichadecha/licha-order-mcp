@@ -81,7 +81,8 @@ function maskValue(v: unknown): unknown {
   return v;
 }
 
-function maskDeep(value: unknown): unknown {
+// export：M3 的 accessAudit.ts 复用同一份脱敏实现，不许复制粘贴第二份（见该文件头部注释）。
+export function maskDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(maskDeep);
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = {};

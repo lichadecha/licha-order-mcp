@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findUserIdField, placeOrderHandler } from "../src/placeOrderTool.js";
 import { WriteGuard, setWriteGuardForTesting } from "../src/writeGuard.js";
+import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "../src/session.js";
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
 process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
@@ -131,7 +132,17 @@ test("orderParams 嵌套层级塞 userId → 被拒，fetch 未被调用", async
 test("orderParams 不含 userId → 不会被这道关卡拦，会继续往下走到令牌校验（TokenNotFound）", async () => {
   // M2 阶段没有任何工具能签发合法令牌，所以即使闯过了 userId 检查，也一定会在 callWrite 的
   // 令牌校验这一步被拒绝——这里验证的是"正常输入不会被 userId 黑名单误伤"，而不是完整成功路径。
+  //
+  // M3 补丁（会话绑定夹具）：placeOrderHandler 现在在 userId 黑名单之后、callWrite 之前新增了
+  // "要求会话已绑定会员" 这一步（未绑定会直接拒绝，见 SessionNotBound 分支）。本用例的原意是
+  // 验证"正常 orderParams 能闯过 userId 检查、继续走到令牌校验"，为了不让新加的绑定要求提前
+  // 拦截、掩盖掉本用例真正要测的东西，这里注入一个已绑定的会话——闯过 userId 检查后会直接命中
+  // 绑定态（不产生任何 access 审计事件），继续往下走到 callWrite 的令牌校验，仍然应该拿到
+  // TokenNotFound，与 M2 时期的断言完全一致（未削弱）。
   setWriteGuardForTesting(freshGuard());
+  const sessionStore = new SessionStore();
+  sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: "1234567890123456789", boundAt: Date.now(), boundVia: "phone" });
+  setSessionStoreForTesting(sessionStore);
   const spy = installFetchSpy();
   try {
     const result = await placeOrderHandler({
@@ -141,10 +152,12 @@ test("orderParams 不含 userId → 不会被这道关卡拦，会继续往下�
     });
     assert.strictEqual(result.isError, true);
     assert.ok(!/UserIdInOrderParams/.test(result.content[0].text), "不应该是被 userId 检查拒绝的");
+    assert.ok(!/SessionNotBound|尚未绑定/.test(result.content[0].text), "不应该是被会话绑定检查拒绝的（本用例已注入绑定）");
     assert.ok(/TokenNotFound/.test(result.content[0].text), "应该是被令牌校验拒绝的（M2 阶段没有合法令牌来源）");
     assert.strictEqual(spy.count(), 0, "fetch 不应被调用");
   } finally {
     spy.restore();
     setWriteGuardForTesting(null);
+    setSessionStoreForTesting(null);
   }
 });

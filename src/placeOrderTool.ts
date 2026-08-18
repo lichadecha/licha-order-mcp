@@ -13,10 +13,17 @@
 //
 // 🚨 红线提醒（写在这里，不能只写在文档里）：任何真实调用都会在企迈侧创建真实订单、
 // 可能进入门店 POS 排单。开发/测试环境必须 mock 拦截 fetch，禁止用真实调用来验证本工具或护栏逻辑。
+//
+// M3 追加：接入会话态身份绑定。流程升级为「拦 userId 黑盒后门 → 要求会话已绑定会员 →
+// 把绑定的 customerId 注入 finalParams.userId → 校验令牌 → 过护栏 → 调 callWrite」。
+// 调用方仍然不能自己传 userId（黑名单挡在最前面），真正生效的 userId 只能来自
+// bind_member 写入的会话态——这是"userId 只能由会话态注入"这条架构硬规矩的物理实现。
 
 import { callWrite } from "./client.js";
 import { WRITE_WHITELIST } from "./constants.js";
 import { getWriteGuard } from "./writeGuard.js";
+import { getAccessAuditLogger } from "./accessAudit.js";
+import { DEFAULT_SESSION_KEY, getSessionStore } from "./session.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -82,7 +89,30 @@ export async function placeOrderHandler({ confirmToken, amountFen, orderParams }
         `orderParams 不能包含 userId 字段（命中路径：${userIdPath}）：userId 只能由会话态注入（M3 架构硬规矩），不接受调用方传入`,
       );
     }
-    const result = await callWrite(WRITE_WHITELIST[0], orderParams, { amountFen, confirmToken });
+
+    // ② M3 新增：未绑定会员身份 → 直接拒绝，不进 callWrite、不发请求。
+    // 这一步记 access 审计而非 write 审计——身份缺失是访问控制事件；write-audit 语义
+    // 保持为「进入写通道后的护栏事件」，两类事件不混在一个日志文件里。
+    const binding = getSessionStore().getBinding(DEFAULT_SESSION_KEY);
+    if (!binding) {
+      getAccessAuditLogger().record({
+        event: "unbound_call_rejected",
+        result: "rejected",
+        reason: "SessionNotBound",
+        sessionKey: DEFAULT_SESSION_KEY,
+        tool: "place_order",
+      });
+      return fail(new Error("本会话尚未绑定会员身份，请先用 bind_member 绑定后再下单"));
+    }
+
+    // ③ userId 只能由会话态注入的物理落地：orderParams 本身不许带 userId（上面已挡），
+    // 这里把绑定得到的 customerId 直接拼进最终发往 callWrite 的参数对象。
+    // 给 M4 的提醒：确认令牌与幂等键的指纹在 callWrite 内是对 finalParams（含这里注入的
+    // userId）计算的——M4 的 prepare_order 签发令牌时必须对同样「注入 userId 后的最终
+    // params」算指纹，两侧的指纹才能对得上，verifyToken 的 TokenFingerprintMismatch 判据
+    // 才不会被误伤。
+    const finalParams = { ...orderParams, userId: binding.customerId };
+    const result = await callWrite(WRITE_WHITELIST[0], finalParams, { amountFen, confirmToken });
     return ok(result);
   } catch (e) {
     return fail(e);

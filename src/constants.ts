@@ -46,3 +46,13 @@ export const ORDER_GUARD = {
 } as const;
 
 export const ENABLE_ORDERING_ENV = "LICHA_ENABLE_ORDERING";
+
+// ---------- M3 新增：二期只读白名单（施工令 § 3.1 放行清单） ----------
+// 与一期 READONLY_WHITELIST 分列独立常量，是为了保护一期「零写自证」证据链——
+// 那 7 条常量一字不动。callRead 的白名单判断会同时认这两份名单。
+export const READONLY_WHITELIST_PHASE2: readonly string[] = [
+  "v3/crm/customer/getCustomerIdByCode", // 4.2.2 会员标识查会员ID（身份绑定）
+  "v3/order/status", // 6.1.5 查询订单状态
+  "v3/order/standard/cyOrderDetail", // 6.1.9 查询订单详情（M4 接工具）
+  "v3/order/userAppointTimeOrderList", // 6.1.6 用户订单列表（M4 接工具）
+];

@@ -1,0 +1,93 @@
+// M3 会话态：会员身份绑定（内存，不持久化）。
+//
+// 为什么不持久化（施工令 § 3.3）：会话 = 进程生命周期，绑定态跨重启保留反而是安全隐患——
+// 动态码本身 30 秒即失效，一个"绑定关系"活得比签发它的凭证还久，本身就说明这层状态不该落盘。
+// stdio 单进程场景下"重开会话"就是"重启进程"，绑定态随之清零，语义上刚好对得上。
+//
+// 为什么按会话键 Map 存储而不是单个变量：当前 stdio 单进程 = 单会话，只用得到
+// DEFAULT_SESSION_KEY 这一个键；但三期要做远程化，届时会话键会换成真实的会话 ID（比如每个
+// HTTP/WebSocket 连接一个），存储结构现在就按 Map<sessionKey, binding> 预埋，三期接入时
+// SessionStore 的接口不用变，只是调用方传入的 key 不再永远是同一个字符串。
+
+/** stdio 单进程 = 单会话，本期唯一会话键。三期远程化后由真实会话 ID 取代。 */
+export const DEFAULT_SESSION_KEY = "stdio-session";
+
+/** 绑定所用的标识形态：手机号 / 实体卡号或会员码 / 小程序动态码。 */
+export type BoundVia = "phone" | "card" | "dynamic_code";
+
+export interface SessionBinding {
+  customerId: string;
+  boundAt: number;
+  boundVia: BoundVia;
+}
+
+/** 一个会话已经绑定过会员身份，再次尝试绑定（无论是否同一个人）都会命中这个错误。 */
+export class SessionAlreadyBound extends Error {
+  constructor(existing: SessionBinding) {
+    const last4 = existing.customerId.slice(-4);
+    const boundAtStr = new Date(existing.boundAt).toISOString();
+    super(
+      `SessionAlreadyBound：本会话已绑定会员（***${last4}，绑定于 ${boundAtStr}）。` +
+        `一个会话只能绑定一位会员，要换人请重开会话。`,
+    );
+    this.name = "SessionAlreadyBound";
+  }
+}
+
+/** 会话尚未绑定任何会员身份时，需要绑定态的操作（下单、查订单）会命中这个错误。 */
+export class SessionNotBound extends Error {
+  constructor() {
+    super("本会话尚未绑定会员身份，请先用 bind_member 绑定");
+    this.name = "SessionNotBound";
+  }
+}
+
+/**
+ * 会话态存储：按会话键分组的绑定关系。
+ *
+ * 规则：一会话一次绑定，即使是同一个人再绑也拒绝——语义最清晰，也不用为了判断"是不是同一人"
+ * 再多花一次接口调用（本身也没有可靠的"是不是同一人"判据，客户端标识本来就可能对应多个会员）。
+ */
+export class SessionStore {
+  private bindings = new Map<string, SessionBinding>();
+
+  /** 绑定；该 key 已有绑定则抛 SessionAlreadyBound，不覆盖既有绑定。 */
+  bind(sessionKey: string, binding: SessionBinding): void {
+    const existing = this.bindings.get(sessionKey);
+    if (existing) {
+      throw new SessionAlreadyBound(existing);
+    }
+    this.bindings.set(sessionKey, binding);
+  }
+
+  /** 返回该会话的绑定（若有），不存在返回 undefined。不抛错，供"允许未绑定"的调用方自行判断。 */
+  getBinding(sessionKey: string): SessionBinding | undefined {
+    return this.bindings.get(sessionKey);
+  }
+
+  /** 要求已绑定；未绑定则抛 SessionNotBound。供下单/查单等强制要求身份的工具调用。 */
+  requireBinding(sessionKey: string): SessionBinding {
+    const binding = this.bindings.get(sessionKey);
+    if (!binding) {
+      throw new SessionNotBound();
+    }
+    return binding;
+  }
+}
+
+// ---------- 单例（生产用） ----------
+let singleton: SessionStore | null = null;
+
+export function getSessionStore(): SessionStore {
+  if (!singleton) singleton = new SessionStore();
+  return singleton;
+}
+
+/**
+ * 仅供测试使用：注入一个自定义 SessionStore 实例，让所有 getSessionStore() 调用方
+ * 转而使用它。传 null 清除注入、恢复生产单例。沿用 writeGuard.ts 的测试注入模式，
+ * 让单元测试之间互不污染会话绑定状态。
+ */
+export function setSessionStoreForTesting(store: SessionStore | null): void {
+  singleton = store;
+}

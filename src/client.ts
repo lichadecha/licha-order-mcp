@@ -4,7 +4,7 @@ import { randomInt } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BASE_URL, READONLY_WHITELIST, WRITE_WHITELIST } from "./constants.js";
+import { BASE_URL, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
 import { loadCredentials, sign, type Credentials } from "./auth.js";
 import { fingerprint, getWriteGuard, PHONE_RE, type WriteAuditSummary } from "./writeGuard.js";
 
@@ -63,10 +63,24 @@ export function restoreIdsForSend(text: string): string {
 // ---------- 审计日志（只记 path/时间/成败，不记参数值与凭证） ----------
 const AUDIT_LOG = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "logs", "audit.log");
 
+// M3 追加：测试注入路径（不改 callRead 白名单判断之外的任何逻辑，只给这个独立的私有审计
+// 函数开一个可覆盖的路径出口）。背景：M3 之前从没有单元测试会让 callRead 真正跑到这一步——
+// 二期新增的只读白名单（4.2.2/6.1.5 等）在 bind_member / get_order_status 的 mock-fetch
+// 单测里会被真实调用到，如果不给这个函数也配一条测试注入路径，这些新单测会把记录写进生产
+// logs/audit.log（内容不敏感，只有 path/时间/成败，但"测试不许碰生产 logs/ 目录"是明确红线，
+// 一次意外全写不算例外）。默认路径与生产行为完全不变，仅新增可选覆盖。
+let auditLogPathOverride: string | null = null;
+
+/** 仅供测试使用：注入自定义只读审计日志路径。传 null 恢复默认生产路径。 */
+export function setReadAuditLogPathForTesting(path: string | null): void {
+  auditLogPathOverride = path;
+}
+
 function audit(path: string, ok: boolean, ms: number): void {
+  const logPath = auditLogPathOverride ?? AUDIT_LOG;
   try {
-    mkdirSync(dirname(AUDIT_LOG), { recursive: true });
-    appendFileSync(AUDIT_LOG, `${new Date().toISOString()}\t${path}\t${ok ? "ok" : "fail"}\t${ms}ms\n`);
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, `${new Date().toISOString()}\t${path}\t${ok ? "ok" : "fail"}\t${ms}ms\n`);
   } catch {
     // 日志失败不阻塞主链路
   }
@@ -111,7 +125,7 @@ function getCreds(): Credentials {
 // 这是一期「零写自证」证据链不被推翻的前提。文末 `export const call = callRead` 保留别名，
 // 四个一期工具文件的 import 一行都不用改。
 export async function callRead<T = unknown>(path: string, params: Record<string, unknown>): Promise<ApiResult<T>> {
-  if (!READONLY_WHITELIST.includes(path)) {
+  if (!READONLY_WHITELIST.includes(path) && !READONLY_WHITELIST_PHASE2.includes(path)) {
     throw new ReadOnlyViolation(path);
   }
   const c = getCreds();
