@@ -2,11 +2,11 @@
 
 import { randomInt } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
 import { BASE_URL, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
 import { loadCredentials, sign, type Credentials } from "./auth.js";
 import { fingerprint, getWriteGuard, PHONE_RE, type WriteAuditSummary } from "./writeGuard.js";
+import { logFilePath } from "./logPaths.js";
 
 export class ReadOnlyViolation extends Error {
   constructor(path: string) {
@@ -61,7 +61,12 @@ export function restoreIdsForSend(text: string): string {
 }
 
 // ---------- 审计日志（只记 path/时间/成败，不记参数值与凭证） ----------
-const AUDIT_LOG = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "logs", "audit.log");
+// 路径不再按「编译产物往上两级」推算（那个写法已经把日志实际分裂成两本，§ 8 第 24 条）——
+// 改由 logPaths 统一解析：LICHA_LOG_DIR 优先，缺省锚定 package.json 所在目录下的 logs/。
+// 每次调用现取而不是模块加载时定格：环境变量在进程启动后才被设置也照样生效。
+function auditLogPath(): string {
+  return logFilePath("audit.log");
+}
 
 // M3 追加：测试注入路径（不改 callRead 白名单判断之外的任何逻辑，只给这个独立的私有审计
 // 函数开一个可覆盖的路径出口）。背景：M3 之前从没有单元测试会让 callRead 真正跑到这一步——
@@ -77,7 +82,7 @@ export function setReadAuditLogPathForTesting(path: string | null): void {
 }
 
 function audit(path: string, ok: boolean, ms: number): void {
-  const logPath = auditLogPathOverride ?? AUDIT_LOG;
+  const logPath = auditLogPathOverride ?? auditLogPath();
   try {
     mkdirSync(dirname(logPath), { recursive: true });
     appendFileSync(logPath, `${new Date().toISOString()}\t${path}\t${ok ? "ok" : "fail"}\t${ms}ms\n`);

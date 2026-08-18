@@ -12,13 +12,17 @@
 // 不应该成为主流程的单点故障。
 
 import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
 import { beijingDateKey, beijingTimeString, maskDeep } from "./writeGuard.js";
+import { logFilePath } from "./logPaths.js";
 
 // ---------- 默认路径（生产用；测试请通过构造参数注入临时路径，见 setAccessAuditLoggerForTesting） ----------
-const HERE = dirname(fileURLToPath(import.meta.url));
-export const ACCESS_AUDIT_LOG_PATH = join(HERE, "..", "..", "logs", "access-audit.log");
+// 与另外两本日志同源解析（§ 8 第 24 条修复）：LICHA_LOG_DIR 优先，缺省锚定 package.json 目录下的 logs/。
+// 工单只点了 client.ts 与 writeGuard.ts 两处，本文件是同一个写法的第三处——只修两处会让
+// access-audit.log 继续按老规则漂，等于把同一个坑留在原地，所以一并改。
+export function accessAuditLogPath(): string {
+  return logFilePath("access-audit.log");
+}
 
 export type AccessAuditEvent =
   | "bind_success"
@@ -74,7 +78,7 @@ export class AccessAuditLogger {
   private readonly clock: () => number;
 
   constructor(opts?: AccessAuditLoggerOptions) {
-    this.logPath = opts?.logPath ?? ACCESS_AUDIT_LOG_PATH;
+    this.logPath = opts?.logPath ?? accessAuditLogPath();
     this.clock = opts?.clock ?? Date.now;
   }
 

@@ -11,14 +11,21 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
 import { ORDER_GUARD, WRITE_WHITELIST } from "./constants.js";
+import { logFilePath } from "./logPaths.js";
 
 // ---------- 默认路径（生产用；测试请通过构造参数注入临时路径，见 setWriteGuardForTesting） ----------
-const HERE = dirname(fileURLToPath(import.meta.url));
-export const WRITE_AUDIT_LOG_PATH = join(HERE, "..", "..", "logs", "write-audit.log");
-export const PLACED_ORDERS_PATH = join(HERE, "..", "..", "logs", "placed-orders.json");
+// 不再按「编译产物往上两级」推算（§ 8 第 24 条：那个写法已让 audit.log 分裂成两本，
+// 而写审计日志同时是频次护栏的持久化载体，路径一漂护栏就被静默清零）。
+// 由 logPaths 统一解析：LICHA_LOG_DIR 优先，缺省锚定 package.json 所在目录下的 logs/。
+// 保留为函数而不是常量：环境变量在进程启动后才设置也照样生效，测试也不必绕模块级缓存。
+export function writeAuditLogPath(): string {
+  return logFilePath("write-audit.log");
+}
+export function placedOrdersPath(): string {
+  return logFilePath("placed-orders.json");
+}
 
 // ---------- 北京时间（自然日判定与审计时间戳一律用它，不用本机时区） ----------
 function beijingParts(ts: number): { year: string; month: string; day: string; hour: string; minute: string; second: string } {
@@ -177,8 +184,8 @@ export class WriteGuard {
 
   constructor(opts?: WriteGuardOptions) {
     this.clock = opts?.clock ?? Date.now;
-    this.auditLogPath = opts?.auditLogPath ?? WRITE_AUDIT_LOG_PATH;
-    this.placedOrdersPath = opts?.placedOrdersPath ?? PLACED_ORDERS_PATH;
+    this.auditLogPath = opts?.auditLogPath ?? writeAuditLogPath();
+    this.placedOrdersPath = opts?.placedOrdersPath ?? placedOrdersPath();
     this.loadPlacedOrders();
     // T9 关键：当日计数不能只放内存——启动时（含"进程重启"这个场景）必须从写审计日志重建，
     // 否则重启一次就能把频次护栏清零绕过。
