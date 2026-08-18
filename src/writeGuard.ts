@@ -12,7 +12,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { ORDER_GUARD, WRITE_WHITELIST } from "./constants.js";
+import { ORDER_GUARD, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
 import { logFilePath } from "./logPaths.js";
 
 // ---------- 默认路径（生产用；测试请通过构造参数注入临时路径，见 setWriteGuardForTesting） ----------
@@ -136,7 +136,77 @@ export function maskDeep(value: unknown): unknown {
 //   resolvedKeys    —— 就是一组 idempotencyKey（未决销账靠它按键清账，脱敏了重建就对不上，
 //                      「已发出≠已成功」闸门会在重启后错误地一直挂着）。
 //   path/time/dateKey —— 接口路径与时间戳，审计的骨架字段。
-const AUDIT_PLAIN_KEYS = new Set(["orderNo", "tokenId", "idempotencyKey", "resolvedKeys", "path", "time", "dateKey"]);
+//
+// P-W2 收尾补丁（2026-08-18）：白名单从「只看字段名」升级为「字段名 + 值格式」双校验。
+// 被推翻的假设是「叫这个名字的字段，值就一定是那个安全形态」——实测穿透口证明它不成立：
+// orderNo / confirmToken 这类字段的值直接来自**调用方入参**，把假手机号当 orderNo 调一次
+// get_order_status，ownership 拒绝路径就会把这个完整识别值经由白名单原样落盘。白名单原本
+// 想放行的是「我们自己生成的骨架字段」，实际放行的是「叫这个名字的任意外部输入」。
+//
+// 现在的规则：命中白名单键 **且** 值符合该键的既定格式 → 原样保留；命中键但值不符格式
+// → 掉回普通 sanitizer（脱敏后落盘），绝不明文放行。格式判据全部来自实测/本地签发形态，
+// 见下方每条校验函数上的注释。
+export const AUDIT_PLAIN_KEYS = ["orderNo", "tokenId", "idempotencyKey", "resolvedKeys", "path", "time", "dateKey"] as const;
+export type AuditPlainKey = (typeof AUDIT_PLAIN_KEYS)[number];
+type PlainValueValidator = (value: unknown) => boolean;
+
+// 订单号：实测样本 D + 20 位数字（如 D0028192455618317xxxx），16-24 位留余量应对企迈改号长。
+const ORDER_NO_RE = /^D\d{16,24}$/;
+// 令牌 ID：本地 randomBytes(16).toString("hex") 的签发形态 = 32 位小写 hex。
+const TOKEN_ID_RE = /^[0-9a-f]{32}$/;
+// 幂等键：本地 sha256(规范化 JSON) = 64 位小写 hex（见 fingerprint）。
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+// 审计时间戳：beijingTimeString 的固定输出形态。
+const AUDIT_TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+08:00$/;
+// 自然日 key：beijingDateKey 的固定输出形态。
+const AUDIT_DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// 接口路径：只认三份硬编码白名单的成员。path 字段虽然一直由我们自己填，但它是「审计里
+// 唯一会原样落盘的路径类字段」，钉死成员判定顺手把「将来有人把 URL/query 塞进 path」这条
+// 路也堵上（query 里带 phone= 是最常见的泄露形态）。
+const AUDIT_PLAIN_PATHS: ReadonlySet<string> = new Set<string>([
+  ...READONLY_WHITELIST,
+  ...READONLY_WHITELIST_PHASE2,
+  ...WRITE_WHITELIST,
+]);
+
+const isPlainString = (v: unknown): v is string => typeof v === "string";
+
+// 键 → 值格式校验函数。
+// 编译期闸门：AUDIT_PLAIN_KEYS 是 as const 元组，本表类型是 Record<AuditPlainKey, ...>——
+// 往元组里加一个键却忘了配校验函数，tsc 立刻报「缺少属性」，编译不过。这是本补丁要求的
+// 「新增白名单键不给校验函数直接报错」的第一道闸（第二道见下方启动期自检）。
+const AUDIT_PLAIN_VALIDATOR_TABLE: Readonly<Record<AuditPlainKey, PlainValueValidator>> = {
+  orderNo: (v) => isPlainString(v) && ORDER_NO_RE.test(v),
+  tokenId: (v) => isPlainString(v) && TOKEN_ID_RE.test(v),
+  idempotencyKey: (v) => isPlainString(v) && SHA256_HEX_RE.test(v),
+  // resolvedKeys 是一组 idempotencyKey：必须是数组、且每个元素都是 sha256 形态。
+  // 有一个元素不合格就整棵子树掉回 sanitizer——半信半疑的数组不值得为它开一半的口子。
+  resolvedKeys: (v) => Array.isArray(v) && v.length > 0 && v.every((x) => isPlainString(x) && SHA256_HEX_RE.test(x)),
+  path: (v) => isPlainString(v) && AUDIT_PLAIN_PATHS.has(v),
+  time: (v) => isPlainString(v) && AUDIT_TIME_RE.test(v),
+  dateKey: (v) => isPlainString(v) && AUDIT_DATE_KEY_RE.test(v),
+};
+
+// 运行时查表故意用 Map 而不是直接对普通对象取属性：对象取属性会命中 Object 原型链——
+// 一条名为 "toString" / "constructor" 的字段能取到 Object.prototype 上的同名函数，
+// 于是「有校验函数」判定为真，该字段被明文放行。这是把白名单从 Set 改成键值表时新开的
+// 一个穿透口，用 Map（无原型链）从结构上堵掉，不靠记性。
+const AUDIT_PLAIN_VALIDATORS: ReadonlyMap<string, PlainValueValidator> = new Map<string, PlainValueValidator>(
+  Object.entries(AUDIT_PLAIN_VALIDATOR_TABLE),
+);
+
+// 启动期闸门（第二道）：模块一 import 就核对「每个白名单键都配了校验函数」，缺一个直接抛错。
+// 为什么编译期之外还要这一道：dist/ 里跑的是编译后的 JS，纯 JS 调用方、或有人把 AUDIT_PLAIN_KEYS
+// 的类型放宽成 string[]，编译期闸门就绕过去了；那种情况下宁可进程起不来，也不接受一个
+// 「有名字、没校验」的字段静默明文落盘。
+for (const key of AUDIT_PLAIN_KEYS) {
+  if (!AUDIT_PLAIN_VALIDATORS.has(key)) {
+    throw new Error(
+      `审计白名单键 "${key}" 缺少值格式校验函数：新增白名单键必须同时在 AUDIT_PLAIN_VALIDATOR_TABLE 登记校验，` +
+        `否则该键会变成明文放行的穿透口（P-W2 收尾补丁的设计前提）。`,
+    );
+  }
+}
 
 // 40 位以上高熵字母数字串（token/密钥/长哈希形态）。
 const LONG_ENTROPY_RE = /(?<![0-9A-Za-z])[0-9A-Za-z]{40,}(?![0-9A-Za-z])/g;
@@ -165,7 +235,10 @@ function sanitizeNode(value: unknown): unknown {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
       if (CREDENTIAL_KEY_RE.test(k)) continue; // 凭证字段名：整条丢弃（同 maskDeep）
-      out[k] = AUDIT_PLAIN_KEYS.has(k) ? v : sanitizeNode(v); // 白名单字段整棵子树原样保留
+      // 双校验：命中白名单键**且**值符合该键格式 → 整棵子树原样保留；
+      // 命中键但值不符格式（典型：orderNo 位置塞了手机号）→ 掉回 sanitizeNode 脱敏。
+      const validate = AUDIT_PLAIN_VALIDATORS.get(k);
+      out[k] = validate !== undefined && validate(v) ? v : sanitizeNode(v);
     }
     return out;
   }
@@ -179,7 +252,8 @@ function sanitizeNode(value: unknown): unknown {
  * 规则 = maskDeep 的两条（凭证字段名删除 + 嵌入式手机号）叠加三条新的：
  *   ① 15 位以上连续数字串只留后四位；② 40 位以上高熵字母数字串只留后四位；
  *   ③ 数字类型的 11 位手机号 / 15 位以上长数字同样脱敏。
- * 白名单字段（见 AUDIT_PLAIN_KEYS）例外。
+ * 白名单字段（见 AUDIT_PLAIN_KEYS）例外——但例外要过「字段名 + 值格式」双校验：
+ * 值不符合该键既定格式的（例如 orderNo 位置塞了手机号），照普通字段脱敏，不给明文放行。
  */
 export function sanitizeAuditRecord(value: unknown): unknown {
   return sanitizeNode(value);
