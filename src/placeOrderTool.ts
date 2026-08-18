@@ -84,7 +84,10 @@ export async function placeOrderHandler({ confirmToken, amountFen, orderParams }
         path: WRITE_WHITELIST[0],
         result: "rejected",
         reason: `UserIdInOrderParams:${userIdPath}`,
-        tokenId: confirmToken || null,
+        // P-W2 第四轮微补丁：总工局部解除本函数的冻结，只改这一行。这一步在 callWrite 之前，
+        // 令牌未经任何本地验证（连仓库都没查），是纯入参 → 只留尾四位。
+        // callWrite 内部的审计路径不用管：那边的 auditBase 已是明文授予权的唯一判定点。
+        tokenId: untrustedAuditValue(confirmToken),
         idempotencyKey: null,
         durationMs: 0,
       });

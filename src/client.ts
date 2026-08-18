@@ -5,7 +5,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { BASE_URL, ENABLE_ORDERING_ENV, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
 import { loadCredentials, sign, type Credentials } from "./auth.js";
-import { fingerprint, getWriteGuard, PHONE_RE, type WriteAuditSummary } from "./writeGuard.js";
+import { fingerprint, getWriteGuard, PHONE_RE, untrustedAuditValue, type WriteAuditSummary } from "./writeGuard.js";
 import { logFilePath } from "./logPaths.js";
 
 export class ReadOnlyViolation extends Error {
@@ -253,7 +253,23 @@ export async function callWrite<T = unknown>(
   const guard = getWriteGuard();
   const t0 = Date.now();
   const summary = summarizeWriteParams(params, opts.amountFen);
-  const auditBase = { path, tokenId: opts.confirmToken ?? null, summary };
+  // ---------- 明文授予权的唯一判定点（P-W2 第四轮微补丁，2026-08-18） ----------
+  //
+  // auditBase 是 callWrite 内**所有**审计路径的公共底座（OrderingDisabled / WriteNotAllowed /
+  // 金额 / 频次 / 令牌四项校验 / 幂等 / inflight / 成功 / 失败 / unknown 全都从它派生）。
+  // 把 tokenId 的明文判定放在这一处，等于给整个写通道一次性封口：此后任何上层调用——
+  // 现有工具、旧导出的 placeOrderHandler、将来新接的代码、直接 import callWrite 的脚本——
+  // 都自动安全，不再依赖每个调用点自己记得脱敏。第三轮那种「逐个调用点判来源」的写法能堵住
+  // 已知入口，但它的正确性依赖人的自觉，多一个入口就多一个漏点；这一处是收敛后的唯一判定点。
+  //
+  // 判据（同第三轮原则）：明文权看**来源**，不看长相。isLocallyIssued 查的是令牌仓库里
+  // 有没有这条记录，记录只可能由 issueConfirmToken 写入——外部拼一串合格的 32 位 hex
+  // （内嵌会员 ID 也照样能拼）进来必然判 false，只留尾四位。
+  const auditBase = {
+    path,
+    tokenId: guard.isLocallyIssued(opts.confirmToken) ? opts.confirmToken : untrustedAuditValue(opts.confirmToken),
+    summary,
+  };
 
   // ⓪ 写能力开关兜底（M5 前置修复第 3 项 c）：env ≠ "1" 直接拒绝。
   // 为什么工具注册层已经门控了还要再来一道：那一道防的是「模型看不见写工具」，

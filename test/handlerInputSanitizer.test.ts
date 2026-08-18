@@ -54,7 +54,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { setReadAuditLogPathForTesting } from "../src/client.js";
+import { setReadAuditLogPathForTesting, callWrite, WriteGuardRejected } from "../src/client.js";
 import { WRITE_WHITELIST, ORDER_GUARD } from "../src/constants.js";
 import { WriteGuard, setWriteGuardForTesting, sanitizeAuditRecord, AUDIT_PLAIN_KEYS } from "../src/writeGuard.js";
 import { AccessAuditLogger, setAccessAuditLoggerForTesting } from "../src/accessAudit.js";
@@ -62,7 +62,7 @@ import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "..
 import { PendingOrderStore, setPendingOrderStoreForTesting } from "../src/pendingOrders.js";
 import { getOrderStatusHandler } from "../src/orderStatusTool.js";
 import { prepareOrderHandler } from "../src/prepareOrderTool.js";
-import { placeOrderConfirmedHandler } from "../src/placeOrderTool.js";
+import { placeOrderConfirmedHandler, placeOrderHandler } from "../src/placeOrderTool.js";
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
 process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
@@ -578,6 +578,153 @@ test("S5: 正常下单链路读回 ownership_mismatch（6.1.9 回显他人 userI
   } finally {
     router.restore();
     fx.restore();
+  }
+});
+
+// ============================================================================
+// T1-T4：导出面封口（P-W2 第四轮微补丁）——明文授予权收敛到 callWrite 的唯一判定点
+// ============================================================================
+//
+// 前三轮把 MCP 协议入口（模型能看见的那几个工具）逐个堵住了，但这个包是公开库：任何人
+// `import { placeOrderHandler, callWrite }` 就绕过了协议层，直接踩在旧导出与写通道上。
+// Codex 终验点出的三条残留路径都在这个面上：旧 handler 的 UserIdInOrderParams 与
+// TokenNotFound、以及直接调 callWrite。
+//
+// 修法不是再逐个调用点补脱敏（那条路的正确性依赖人的自觉，多一个入口就多一个漏点），
+// 而是把明文授予权收敛到 callWrite 构造 auditBase 的那一处——它是 callWrite 内全部审计
+// 路径的公共底座，封住它等于封住整条写通道。判据仍是第三轮那条：来源，不是长相。
+// T1-T3 打伪装（同一串合格的 32 位 hex，内嵌 19 位假会员 ID），T4 守防误杀（真令牌全值）。
+
+// 32 位 hex 的伪装令牌：前 19 位就是假会员 ID，后 13 位补足格式（尾四位 3456）。
+// 格式校验层完全放行——能挡住它的只有「令牌仓库里查不到」这个来源判据。
+const DISGUISED_TOKEN = `${OTHER_MEMBER_ID}abcdef0123456`;
+
+/** callWrite 直调用的最小合法参数（storeId 是公开门店编码，非识别值）。 */
+function minimalOrderParams(): Record<string, unknown> {
+  return { storeId: STORE_ID, orderType: 1, source: 18, items: [{ goodsId: "1200000000000000801", num: 1 }] };
+}
+
+// ============================================================================
+// T1：伪装 token 直调旧导出 placeOrderHandler → UserIdInOrderParams 拒绝路径
+// ============================================================================
+test("T1: 伪装 token 直调旧 placeOrderHandler（orderParams 带 userId）→ 写审计只留尾号，fetch 零调用", async () => {
+  assert.match(DISGUISED_TOKEN, /^[0-9a-f]{32}$/, "伪装值必须真的符合令牌格式，否则这条用例没意义");
+  const { guard, auditLogPath } = freshWriteGuard();
+  setWriteGuardForTesting(guard);
+  const spy = installFetchSpy('{"status":true,"code":0,"data":{}}');
+  try {
+    const result = await placeOrderHandler({
+      confirmToken: DISGUISED_TOKEN,
+      amountFen: 2400,
+      orderParams: { storeId: STORE_ID, userId: OTHER_MEMBER_ID },
+    });
+    assert.strictEqual(result.isError, true, "orderParams 带 userId 应被黑名单拒");
+    assert.strictEqual(spy.count(), 0, "🚨 这一步在 callWrite 之前，任何请求都不许发出");
+    const { raw, obj } = lastLine(auditLogPath);
+    assert.match(obj.reason, /^UserIdInOrderParams:/, "确认命中的正是这条残留路径");
+    assert.ok(!raw.includes(DISGUISED_TOKEN), "落盘整行不得出现完整伪装 token");
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "内嵌的完整会员 ID 同样不得出现");
+    assert.strictEqual(obj.tokenId, "***3456", "未经任何本地验证的入参 token → 只留尾四位");
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
+  }
+});
+
+// ============================================================================
+// T2：伪装 token 直调旧 handler → 走进 callWrite 命中 TokenNotFound
+// ============================================================================
+// 与 T1 的差别只在 orderParams 不带 userId：于是穿过黑名单、穿过绑定检查，一路走到
+// callWrite 的令牌四项校验。这条路径的审计由 auditBase 派生，验的是第 2 项那处封口。
+test("T2: 伪装 token 直调旧 placeOrderHandler → callWrite 判 TokenNotFound，审计只留尾号，fetch 零调用", async () => {
+  setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
+  const { guard, auditLogPath } = freshWriteGuard();
+  setWriteGuardForTesting(guard);
+  const spy = installFetchSpy('{"status":true,"code":0,"data":{}}');
+  try {
+    const result = await placeOrderHandler({
+      confirmToken: DISGUISED_TOKEN,
+      amountFen: 2400,
+      orderParams: minimalOrderParams(),
+    });
+    assert.strictEqual(result.isError, true);
+    assert.match(result.content[0].text, /TokenNotFound/, "确认命中的是令牌四项校验的第一项");
+    assert.strictEqual(spy.count(), 0, "🚨 令牌校验在 fetch 之前，请求不许发出");
+    const { raw, obj } = lastLine(auditLogPath);
+    assert.strictEqual(obj.reason, "TokenNotFound");
+    assert.ok(!raw.includes(DISGUISED_TOKEN), "落盘整行不得出现完整伪装 token");
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "内嵌的完整会员 ID 同样不得出现");
+    assert.strictEqual(obj.tokenId, "***3456");
+    assert.match(obj.idempotencyKey, /^[0-9a-f]{64}$/, "幂等键照旧完整（本地 sha256，不是识别值）");
+  } finally {
+    spy.restore();
+    setSessionStoreForTesting(null);
+    setWriteGuardForTesting(null);
+  }
+});
+
+// ============================================================================
+// T3：伪装 token 直调导出的 callWrite（完全绕开工具层）
+// ============================================================================
+test("T3: 伪装 token 直调导出的 callWrite → TokenNotFound 拒，审计只留尾号，fetch 零调用", async () => {
+  const { guard, auditLogPath } = freshWriteGuard();
+  setWriteGuardForTesting(guard);
+  const spy = installFetchSpy('{"status":true,"code":0,"data":{}}');
+  try {
+    await assert.rejects(
+      () => callWrite(WRITE_WHITELIST[0], minimalOrderParams(), { amountFen: 2400, confirmToken: DISGUISED_TOKEN }),
+      (e: unknown) => e instanceof WriteGuardRejected && /TokenNotFound/.test((e as Error).message),
+      "直调 callWrite 也必须被令牌校验拦下",
+    );
+    assert.strictEqual(spy.count(), 0, "🚨 请求不许发出");
+    const { raw, obj } = lastLine(auditLogPath);
+    assert.strictEqual(obj.reason, "TokenNotFound");
+    assert.ok(!raw.includes(DISGUISED_TOKEN));
+    assert.ok(!raw.includes(OTHER_MEMBER_ID));
+    assert.strictEqual(obj.tokenId, "***3456", "封口在 auditBase，直调 callWrite 也自动安全");
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
+  }
+});
+
+// ============================================================================
+// T4（防误杀）：本地真实签发的令牌走 callWrite → 成功路径与重放路径都留全值
+// ============================================================================
+// isLocallyIssued 查的是令牌仓库：真令牌在库里 → 全值。第二段刻意验「已用、未过期」这一态——
+// pruneExpiredTokens 保留这类记录，所以 TokenAlreadyUsed 的重放审计仍能留全值，
+// 「哪张令牌被重放了」是真实排查需求，不能连它也遮掉。
+test("T4: 真实签发令牌走 callWrite（成功 + TokenAlreadyUsed 重放）→ 审计 tokenId 全值", async () => {
+  const { guard, auditLogPath } = freshWriteGuard();
+  setWriteGuardForTesting(guard);
+  const params = minimalOrderParams();
+  const { tokenId } = guard.issueConfirmToken(params); // 本地签发：值进了令牌仓库
+  assert.match(tokenId, /^[0-9a-f]{32}$/);
+  assert.strictEqual(guard.isLocallyIssued(tokenId), true, "刚签发的令牌应判为本地签发");
+  assert.strictEqual(guard.isLocallyIssued(DISGUISED_TOKEN), false, "外部伪装值必然判 false");
+  const spy = installFetchSpy('{"status":true,"code":0,"message":"创建订单成功","data":{"orderNo":"D00281924556183178888","payAmount":24.0,"needPay":1}}');
+  try {
+    // —— 第一段：成功路径 ——
+    const result = await callWrite(WRITE_WHITELIST[0], params, { amountFen: 2400, confirmToken: tokenId });
+    assert.strictEqual(result.ok, true, "护栏全过应成功");
+    assert.strictEqual(spy.count(), 1, "真实请求恰好发出一次（mock，零真调）");
+    const { obj } = lastLine(auditLogPath);
+    assert.strictEqual(obj.result, "allowed");
+    assert.strictEqual(obj.tokenId, tokenId, "本地签发 → 全值：排查「这张单凭哪张令牌下的」要用它");
+
+    // —— 第二段：同一令牌重放 → TokenAlreadyUsed（consumeToken 已标记，且记录未过期仍在库） ——
+    await assert.rejects(
+      () => callWrite(WRITE_WHITELIST[0], params, { amountFen: 2400, confirmToken: tokenId }),
+      (e: unknown) => e instanceof WriteGuardRejected && /TokenAlreadyUsed/.test((e as Error).message),
+    );
+    assert.strictEqual(spy.count(), 1, "🚨 重放不许再发第二次请求");
+    assert.strictEqual(guard.isLocallyIssued(tokenId), true, "已用但未过期 → 仍算本地签发");
+    const { obj: obj2 } = lastLine(auditLogPath);
+    assert.strictEqual(obj2.reason, "TokenAlreadyUsed");
+    assert.strictEqual(obj2.tokenId, tokenId, "重放审计同样留全值——「哪张令牌被重放」要能查");
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
   }
 });
 
