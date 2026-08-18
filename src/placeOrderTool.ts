@@ -21,7 +21,7 @@
 
 import { callRead, callWrite } from "./client.js";
 import { WRITE_WHITELIST } from "./constants.js";
-import { getWriteGuard } from "./writeGuard.js";
+import { getWriteGuard, untrustedAuditValue } from "./writeGuard.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
 // M4 定稿新增（M2/M3 骨架不依赖这两个模块）：待确认单登记表 + 与 get_order_status 共用的所有权判据。
@@ -217,6 +217,11 @@ async function readbackOrder(
       event: "ownership_mismatch",
       result: "rejected",
       reason: `readback_${ownership.reason}`,
+      // 来源判定（P-W2 第三轮微补丁）：这里的 orderNo **不是**调用方入参——它是我们自己
+      // callWrite 下单成功后从企迈响应里取回的单号（服务端来源，调用方碰不到），
+      // 不可能是伪装的识别值，所以留全值。而且这条审计的价值全在单号上：
+      // "自己刚下的单读回来却不属于自己"是必须人工追到底的异常，遮成尾号就查不动了。
+      // 与 get_order_status 那处（入参来源 → 遮尾号）刻意不同，差别就是来源，不是字段名。
       orderNo,
       customerIdLast4: `***${binding.customerId.slice(-4)}`,
       sessionKey: DEFAULT_SESSION_KEY,
@@ -273,7 +278,12 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
         path: WRITE_WHITELIST[0],
         result: "rejected",
         reason: `UserIdInInput:${userIdPath}`,
-        tokenId: confirmToken || null,
+        // 来源判定（P-W2 第三轮微补丁）：这一步在 ③ 的 lookup 之前，令牌**还没经过任何
+        // 本地验证**——它此刻纯粹是一串调用方入参，和 orderNo 一样长相说明不了性质
+        // （19 位会员 ID 变形成 32 位 hex 就冒充得了令牌 ID），只留尾四位。
+        // 工单只点了 ③ 那一处，这里是同一判据下的同类漏点：token 连 lookup 都没走过，
+        // 来源比 lookup=absent 更不可信，没有理由反倒给它明文。
+        tokenId: untrustedAuditValue(confirmToken),
         idempotencyKey: null,
         durationMs: 0,
       });
@@ -306,7 +316,16 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
         path: WRITE_WHITELIST[0],
         result: "rejected",
         reason: lookup.status === "expired" ? "PendingOrderExpired" : "PendingOrderNotFound",
-        tokenId: confirmToken || null,
+        // 来源判定（P-W2 第三轮微补丁）：lookup 的两种失败态来源完全不同，明文权跟着来源走——
+        //   · expired：登记表**确实签发过**这张令牌（只是过了 5 分钟），值是本地 randomBytes
+        //     生成的，不可能是伪装的识别值 → 留全值，排查"哪张令牌超时了"要用它；
+        //   · absent：登记表从没见过它——要么根本不是我们签发的（编造/别的进程），要么已被
+        //     prune 消亡。前一种情况下这串东西完全由调用方控制，格式校验挡不住合法形态伪装
+        //     （32 位 hex 谁都拼得出来）→ 只留尾四位。
+        // 代价：已 prune 的真令牌也会被当作 absent 遮成尾号。可接受——prune 只在 register 时
+        // 触发且只清过期条目，被清掉的令牌本来就已经过期、已无排查价值，而"宁可多打星号"
+        // 正是本轮翻转判据时定下的取舍方向。
+        tokenId: lookup.status === "expired" ? confirmToken || null : untrustedAuditValue(confirmToken),
         idempotencyKey: null,
         durationMs: 0,
       });

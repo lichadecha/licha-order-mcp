@@ -7,7 +7,7 @@
 
 import { callRead } from "./client.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
-import { getWriteGuard } from "./writeGuard.js";
+import { getWriteGuard, untrustedAuditValue } from "./writeGuard.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -91,7 +91,12 @@ export async function getOrderStatusHandler({ orderNo }: OrderStatusInput): Prom
         event: "ownership_mismatch",
         result: "rejected",
         reason: ownership.reason,
-        orderNo,
+        // 来源判定（P-W2 第三轮微补丁）：这个 orderNo 是**调用方入参**，而本分支恰恰是
+        // 「归属没证实」的那一支——值的长相说明不了它是不是识别值（把会员 ID 补个 D 前缀
+        // 凑成 D+20 位就能骗过格式校验），所以一律只留尾四位。
+        // 排查不受影响：尾号 + time/dateKey + customerIdLast4 三者足以定位是哪一次调用；
+        // 真要全单号，本会话拒绝的这张单本来就不属于当前会员，也不该从审计里给出来。
+        orderNo: untrustedAuditValue(orderNo),
         customerIdLast4: `***${binding.customerId.slice(-4)}`,
         sessionKey: DEFAULT_SESSION_KEY,
         tool: "get_order_status",

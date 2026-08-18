@@ -117,6 +117,9 @@ export async function myOrdersHandler({ days }: MyOrdersInput): Promise<TextResu
             event: "ownership_mismatch",
             result: "rejected",
             reason: "my_orders_row_mismatch",
+            // 来源判定（P-W2 第三轮微补丁）：orderNo 取自 6.1.6 响应行本身（服务端来源，
+            // 调用方无从构造），与 place_order 读回那处同性质 → 留全值。
+            // 这条审计要回答"企迈把谁的单混进了我的列表"，单号是唯一抓手。
             orderNo: raw.orderNo != null ? String(raw.orderNo) : null,
             customerIdLast4: `***${binding.customerId.slice(-4)}`,
             sessionKey: DEFAULT_SESSION_KEY,

@@ -55,12 +55,13 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setReadAuditLogPathForTesting } from "../src/client.js";
-import { WRITE_WHITELIST } from "../src/constants.js";
+import { WRITE_WHITELIST, ORDER_GUARD } from "../src/constants.js";
 import { WriteGuard, setWriteGuardForTesting, sanitizeAuditRecord, AUDIT_PLAIN_KEYS } from "../src/writeGuard.js";
 import { AccessAuditLogger, setAccessAuditLoggerForTesting } from "../src/accessAudit.js";
 import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "../src/session.js";
 import { PendingOrderStore, setPendingOrderStoreForTesting } from "../src/pendingOrders.js";
 import { getOrderStatusHandler } from "../src/orderStatusTool.js";
+import { prepareOrderHandler } from "../src/prepareOrderTool.js";
 import { placeOrderConfirmedHandler } from "../src/placeOrderTool.js";
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
@@ -189,9 +190,14 @@ test("R3: 把 19 位假会员 ID 当 orderNo 调 get_order_status → access-aud
 });
 
 // ============================================================================
-// R4（防误杀）：正式格式订单号 D + 20 位 → 照旧完整落盘
+// R4：正式格式订单号 D + 20 位，来源仍是调用方入参 → 同样只留尾号
 // ============================================================================
-test("R4: 正式格式 orderNo（D+20 位）走同一条拒绝路径 → 完整落盘，排查价值不丢", async () => {
+// 第三轮微补丁改了这条的口径。改前它断言「格式合法 → 完整落盘」，那是把明文权交给了值的
+// 长相；Codex 微验用「19 位假会员 ID 补个 D 前缀凑成 D+20 位」直接骗过去了。裁决：明文权
+// 改由来源授予，本路径的 orderNo 是调用方入参 → 一律遮。
+// 「防误杀」的职责移交给 S4/S5 两条——它们守的是真正有明文权的来源（本地签发的令牌、
+// 企迈响应回传的单号），而不是"长得像"。
+test("R4: 正式格式 orderNo（D+20 位）但来源是入参 → 同样只留尾号（明文权看来源不看长相）", async () => {
   setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
   const { logger, logPath } = freshAccessAudit();
   setAccessAuditLoggerForTesting(logger);
@@ -200,7 +206,7 @@ test("R4: 正式格式 orderNo（D+20 位）走同一条拒绝路径 → 完整�
     const result = await getOrderStatusHandler({ orderNo: REAL_FORMAT_ORDER_NO });
     assert.strictEqual(result.isError, true, "仍走 ownership 拒绝路径（与 R1/R3 唯一的差别是值的形态）");
     const { obj } = lastLine(logPath);
-    assert.strictEqual(obj.orderNo, REAL_FORMAT_ORDER_NO, "合法订单号必须完整——脱敏了整本审计就没用了");
+    assert.strictEqual(obj.orderNo, "***5168", "格式再合法也不给明文：这一支的 orderNo 来自调用方入参");
     assert.match(obj.time, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+08:00$/, "time 骨架字段格式合规、照旧完整");
     assert.match(obj.dateKey, /^\d{4}-\d{2}-\d{2}$/, "dateKey 同上");
   } finally {
@@ -211,9 +217,12 @@ test("R4: 正式格式 orderNo（D+20 位）走同一条拒绝路径 → 完整�
 });
 
 // ============================================================================
-// R5（防误杀）：32 位 hex 令牌 ID → 照旧完整落盘
+// R5：32 位 hex 令牌形态，但登记表从没见过（lookup=absent）→ 同样只留尾号
 // ============================================================================
-test("R5: 正式格式 tokenId（32 位 hex）走同一条写侧拒绝路径 → 完整落盘", async () => {
+// 同 R4：第三轮微补丁把明文权从"长相"换成"来源"。32 位 hex 谁都拼得出来，
+// 登记表没有这张令牌就说明它不是我们签发的（或已随过期被 prune 清掉）→ 不给明文。
+// 真令牌的明文权由 S4 守（lookup=expired）。
+test("R5: 32 位 hex 令牌形态但 lookup=absent → 只留尾号（不是本地签发的就没有明文权）", async () => {
   setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
   setPendingOrderStoreForTesting(new PendingOrderStore());
   const { guard, auditLogPath } = freshWriteGuard();
@@ -223,9 +232,10 @@ test("R5: 正式格式 tokenId（32 位 hex）走同一条写侧拒绝路径 →
     const result = await placeOrderConfirmedHandler({ confirmToken: REAL_FORMAT_TOKEN_ID, confirmAmountYuan: 24 });
     assert.strictEqual(result.isError, true, "令牌不存在仍被拒（与 R2 唯一的差别是值的形态）");
     assert.strictEqual(spy.count(), 0);
-    const { obj } = lastLine(auditLogPath);
+    const { obj, raw } = lastLine(auditLogPath);
     assert.strictEqual(obj.reason, "PendingOrderNotFound");
-    assert.strictEqual(obj.tokenId, REAL_FORMAT_TOKEN_ID, "合法令牌 ID 必须完整——它是排查「这张单被谁确认过」的抓手");
+    assert.strictEqual(obj.tokenId, "***8f90", "登记表没见过它 → 来源未证实，只留尾号");
+    assert.ok(!raw.includes(REAL_FORMAT_TOKEN_ID), "整行不得出现这串调用方自带的完整值");
   } finally {
     spy.restore();
     setSessionStoreForTesting(null);
@@ -282,8 +292,10 @@ test("R8: 字母紧贴 19 位假会员 ID 当 orderNo 调 get_order_status → �
     assert.strictEqual(result.isError, true);
     const { raw, obj } = lastLine(logPath);
     assert.strictEqual(obj.event, "ownership_mismatch");
-    assert.ok(!raw.includes(OTHER_MEMBER_ID), "字母紧贴也不许让完整会员 ID 落盘（这就是本轮被打穿的口）");
-    assert.strictEqual(obj.orderNo, "ID***4321", "字母前缀保留（仍能看出是哪类值），数字段只留尾四位");
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "字母紧贴也不许让完整会员 ID 落盘（第二轮被打穿的口）");
+    // 第三轮微补丁后这一支先过来源判定（入参 → 整值遮成尾四位），比第二轮的正则层更早生效，
+    // 所以落盘是 "***4321" 而不是 "ID***4321"。正则层仍在（见 R9 的单元级断言），只是轮不到它。
+    assert.strictEqual(obj.orderNo, "***4321", "来源判定层先生效：入参来源整值只留尾四位");
   } finally {
     spy.restore();
     setSessionStoreForTesting(null);
@@ -325,6 +337,248 @@ test("R9: reason 含字母贴 19 位假 ID → 只留尾号；白名单 orderNo�
   const { obj: obj2 } = lastLine(auditLogPath);
   assert.strictEqual(obj2.reason, "DuplicateOf:D***5168");
   assert.strictEqual(obj2.orderNo, REAL_FORMAT_ORDER_NO);
+});
+
+// ============================================================================
+// S1-S5：来源判定（P-W2 第三轮微补丁）——明文权由「值从哪儿来」授予，不由「长得像不像」授予
+// ============================================================================
+//
+// Codex 微验打穿的是格式校验层：19 位假会员 ID 补个 D 前缀 → D+20 位、变形成 32 位 hex →
+// 冒充令牌 ID，格式全对所以完整落盘。根因是「值的长相由攻击者控制」，那条路上没有能守住的判据。
+// 裁决后的判据：调用点声明来源——自己生成/服务端回传的值可留全值，调用方入参一律只留尾号。
+// S1-S3 打伪装（三种合法形态），S4-S5 守防误杀（两种真有明文权的来源）。缺 S4/S5，这套判定
+// 就只剩"全遮"，审计会失去排查力；缺 S1-S3，格式伪装照旧穿透。五条是一组，不能只留一半。
+
+// ---------- 下单链路 fixture（S4/S5 用；结构对齐 m4ConfirmOrder.test.ts，那份文件不动） ----------
+const PATH_DETAIL = "v3/goods/item/getShopGoodsDetail";
+const PATH_CREATE = "v3/newPattern/cateringApiserver/post/order/v1/create";
+const PATH_DETAIL_ORDER = "v3/order/standard/cyOrderDetail";
+const STORE_ID = 503542; // 深圳湾万象城（公开门店编码，非识别值）
+
+function goodsDetailFixture(goodsId: string): Record<string, unknown> {
+  return {
+    status: true,
+    code: 0,
+    data: [
+      {
+        goodsId,
+        name: "测试奶茶",
+        type: 1,
+        status: 10,
+        goodsSkuList: [
+          {
+            skuId: "1288634197263667200",
+            salePrice: 2400,
+            clearStatus: 1,
+            inventory: 99,
+            specName: "标准杯",
+            skuItemList: [{ specValue: "标准杯" }],
+          },
+        ],
+        sortedPracticeList: [
+          {
+            practiceId: "1123413139990425601",
+            practiceName: "温度",
+            isRequired: 1,
+            practiceValueList: [{ practiceValueId: "1199823927794012164", practiceValue: "少冰（400ml)", price: 0, isDefault: 1 }],
+          },
+        ],
+        attachGoodsList: [],
+      },
+    ],
+  };
+}
+
+/** 按路径分发的 mock fetch 路由器，按路径分别计数——写路径的调用次数必须能单独断言。 */
+function installRouter(routes: Record<string, Record<string, unknown>>): {
+  countOf: (p: string) => number;
+  restore: () => void;
+} {
+  const counts = new Map<string, number>();
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    const key = Object.keys(routes).find((k) => url.includes(k));
+    if (!key) throw new Error(`mock 路由未覆盖的路径（说明代码调了预期之外的接口）：${url}`);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    return new Response(JSON.stringify(routes[key]), { status: 200 });
+  }) as typeof fetch;
+  return { countOf: (p) => counts.get(p) ?? 0, restore: () => { globalThis.fetch = realFetch; } };
+}
+
+/** 四件套 + 待确认单登记表全部注入临时实例；clock 可控，用来推进 TTL 而不真的等 5 分钟。 */
+function installFullFixture(clock?: () => number): {
+  pendingStore: PendingOrderStore;
+  writeAuditPath: string;
+  accessAuditPath: string;
+  restore: () => void;
+} {
+  const dir = mkdtempSync(join(tmpdir(), "licha-hsan-full-"));
+  const writeAuditPath = join(dir, "write-audit.log");
+  const accessAuditPath = join(dir, "access-audit.log");
+  setWriteGuardForTesting(new WriteGuard({ auditLogPath: writeAuditPath, placedOrdersPath: join(dir, "placed-orders.json"), clock }));
+  const pendingStore = new PendingOrderStore({ clock });
+  setPendingOrderStoreForTesting(pendingStore);
+  setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
+  setAccessAuditLoggerForTesting(new AccessAuditLogger({ logPath: accessAuditPath }));
+  setReadAuditLogPathForTesting(join(dir, "read-audit.log"));
+  return {
+    pendingStore,
+    writeAuditPath,
+    accessAuditPath,
+    restore: () => {
+      setWriteGuardForTesting(null);
+      setPendingOrderStoreForTesting(null);
+      setSessionStoreForTesting(null);
+      setAccessAuditLoggerForTesting(null);
+      setReadAuditLogPathForTesting(null);
+      globalThis.fetch = realFetch;
+    },
+  };
+}
+
+// ============================================================================
+// S1：D + 19 位假会员 ID 当 orderNo（差一位的伪装）→ 只留尾号
+// ============================================================================
+test("S1: orderNo 传「D + 19 位假会员 ID」→ access-audit 只留尾号", async () => {
+  setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
+  const { logger, logPath } = freshAccessAudit();
+  setAccessAuditLoggerForTesting(logger);
+  const spy = installFetchSpy(`{"status":true,"code":0,"data":{"status":10,"userId":${OTHER_MEMBER_ID}}}`);
+  try {
+    const result = await getOrderStatusHandler({ orderNo: `D${OTHER_MEMBER_ID}` });
+    assert.strictEqual(result.isError, true);
+    const { raw, obj } = lastLine(logPath);
+    assert.strictEqual(obj.event, "ownership_mismatch");
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "整行不得出现完整会员 ID");
+    assert.strictEqual(obj.orderNo, "***4321");
+  } finally {
+    spy.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+});
+
+// ============================================================================
+// S2：假会员 ID 补一位凑成 D + 20 位（格式校验完全通过的伪装）→ 只留尾号
+// ============================================================================
+// 这条就是 Codex 微验的原样复现：D + 20 位数字 = 白名单 orderNo 的合法形态，
+// 格式层放行，唯一能挡住它的是来源判定。
+test("S2: 假会员 ID 补一位凑成合法 D+20 位 orderNo → 仍只留尾号（格式层放行，来源层拦住）", async () => {
+  setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
+  const { logger, logPath } = freshAccessAudit();
+  setAccessAuditLoggerForTesting(logger);
+  const disguised = `D${OTHER_MEMBER_ID}0`; // D + 20 位：^D\d{16,24}$ 完全匹配
+  const spy = installFetchSpy(`{"status":true,"code":0,"data":{"status":10,"userId":${OTHER_MEMBER_ID}}}`);
+  try {
+    const result = await getOrderStatusHandler({ orderNo: disguised });
+    assert.strictEqual(result.isError, true);
+    const { raw, obj } = lastLine(logPath);
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "伪装成合法订单号也不许把会员 ID 带进落盘");
+    assert.ok(!raw.includes(disguised), "整个伪装值都不该出现");
+    assert.strictEqual(obj.orderNo, "***3210", "只留尾四位");
+  } finally {
+    spy.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+});
+
+// ============================================================================
+// S3：假会员 ID 变形为 32 位 hex 当 confirmToken（lookup=absent）→ 只留尾号 + 零调用
+// ============================================================================
+test("S3: 假会员 ID 变形成 32 位 hex 当 confirmToken（lookup=absent）→ 只留尾号，请求零发出", async () => {
+  setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
+  setPendingOrderStoreForTesting(new PendingOrderStore());
+  const { guard, auditLogPath } = freshWriteGuard();
+  setWriteGuardForTesting(guard);
+  // 19 位假会员 ID 补足到 32 位十六进制字符（^[0-9a-f]{32}$ 完全匹配），尾四位仍是 4321 的变形值
+  const disguised = `${OTHER_MEMBER_ID}abcdef0123456`;
+  assert.match(disguised, /^[0-9a-f]{32}$/, "构造的伪装值必须真的符合令牌 ID 格式，否则这条用例没意义");
+  const spy = installFetchSpy('{"status":true,"code":0,"data":{}}');
+  try {
+    const result = await placeOrderConfirmedHandler({ confirmToken: disguised, confirmAmountYuan: 24 });
+    assert.strictEqual(result.isError, true);
+    assert.strictEqual(spy.count(), 0, "🚨 令牌校验在 fetch 之前，任何请求都不许发出");
+    const { raw, obj } = lastLine(auditLogPath);
+    assert.strictEqual(obj.reason, "PendingOrderNotFound");
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "整行不得出现完整会员 ID");
+    assert.strictEqual(obj.tokenId, "***3456", "格式合法但登记表没见过 → 只留尾四位");
+  } finally {
+    spy.restore();
+    setSessionStoreForTesting(null);
+    setPendingOrderStoreForTesting(null);
+    setWriteGuardForTesting(null);
+  }
+});
+
+// ============================================================================
+// S4（防误杀）：本地真实签发的令牌过期（lookup=expired）→ 审计 tokenId 仍是全值
+// ============================================================================
+// expired 意味着登记表确实签发过它——值是本地 randomBytes 生成的，不可能是伪装的识别值。
+// 「哪张令牌超时了」是真实排查需求，遮成尾号就对不上 prepare_order 那侧的记录。
+test("S4: 真实签发的令牌推进时钟至过期（lookup=expired）→ write-audit 的 tokenId 仍完整", async () => {
+  let now = 1_760_000_000_000; // 固定基准，不用 Date.now()，避免用例随时间漂
+  const fx = installFullFixture(() => now);
+  const router = installRouter({ [PATH_DETAIL]: goodsDetailFixture("1200000000000000901") });
+  try {
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000901", quantity: 1 }] });
+    const token = JSON.parse(prep.content[0].text).confirmToken as string;
+    assert.match(token, /^[0-9a-f]{32}$/, "prepare_order 应签发 32 位 hex 令牌");
+    assert.strictEqual(fx.pendingStore.lookup(token).status, "ok", "刚签发时应命中");
+
+    now += ORDER_GUARD.confirmTokenTtlMs + 1000; // 推进时钟越过 5 分钟 TTL
+    assert.strictEqual(fx.pendingStore.lookup(token).status, "expired", "推进后应判为过期而非 absent");
+
+    const result = await placeOrderConfirmedHandler({ confirmToken: token, confirmAmountYuan: 24 });
+    assert.strictEqual(result.isError, true, "过期令牌应被拒");
+    assert.strictEqual(router.countOf(PATH_CREATE), 0, "🚨 过期令牌不许发出写请求");
+    const { obj } = lastLine(fx.writeAuditPath);
+    assert.strictEqual(obj.reason, "PendingOrderExpired");
+    assert.strictEqual(obj.tokenId, token, "本地签发过的令牌留全值——排查「哪张令牌超时」要用它");
+  } finally {
+    router.restore();
+    fx.restore();
+  }
+});
+
+// ============================================================================
+// S5（防误杀）：下单成功后读回归属不符 → access-audit 的 orderNo 仍是全值
+// ============================================================================
+// 这条走完整链路（prepare_order → place_order → callWrite 真发 mock → 6.1.9 读回），
+// 读回的 orderNo 来自企迈响应（服务端来源，调用方碰不到）→ 留全值。
+// 「自己刚下的单读回来却不属于自己」是必须人工追到底的异常，遮了单号就查不动。
+test("S5: 正常下单链路读回 ownership_mismatch（6.1.9 回显他人 userId）→ access-audit 的 orderNo 仍完整", async () => {
+  const fx = installFullFixture();
+  const SERVER_ORDER_NO = "D00281924556183179999"; // 企迈响应回传的单号（服务端来源）
+  const router = installRouter({
+    [PATH_DETAIL]: goodsDetailFixture("1200000000000000902"),
+    [PATH_CREATE]: { status: true, code: 0, message: "创建订单成功", data: { orderNo: SERVER_ORDER_NO, payAmount: 24.0, needPay: 1 } },
+    // 读回回显**他人** userId → readbackOrder 内的 ownership_mismatch
+    [PATH_DETAIL_ORDER]: {
+      status: true,
+      code: 0,
+      data: { orderNo: SERVER_ORDER_NO, orderStatus: 10, userId: OTHER_MEMBER_ID, actualAmount: 2400, totalAmount: 2400 },
+    },
+  });
+  try {
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000902", quantity: 1 }] });
+    const token = JSON.parse(prep.content[0].text).confirmToken as string;
+    const result = await placeOrderConfirmedHandler({ confirmToken: token, confirmAmountYuan: 24 });
+    assert.strictEqual(result.isError ?? false, false, `下单本身应成功：${result.content[0].text}`);
+    const out = JSON.parse(result.content[0].text);
+    assert.strictEqual(out.readbackFailed, true, "读回归属不符应标记失败");
+    assert.strictEqual(router.countOf(PATH_CREATE), 1, "🚨 写请求恰好一次，绝不重试");
+
+    const { raw, obj } = lastLine(fx.accessAuditPath);
+    assert.strictEqual(obj.event, "ownership_mismatch");
+    assert.match(obj.reason, /^readback_/, "确认命中的是读回那一支（不是 get_order_status 那支）");
+    assert.strictEqual(obj.orderNo, SERVER_ORDER_NO, "服务端来源的单号留全值——这条异常靠它追");
+    assert.ok(!raw.includes(OTHER_MEMBER_ID), "他人的完整会员 ID 照旧不许落盘（脱敏层仍在工作）");
+    assert.strictEqual(obj.customerIdLast4, "***6789");
+  } finally {
+    router.restore();
+    fx.restore();
+  }
 });
 
 // ============================================================================
