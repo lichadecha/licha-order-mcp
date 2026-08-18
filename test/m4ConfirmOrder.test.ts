@@ -253,6 +253,8 @@ test("V2: 绑定后 prepare_order 成功 → 返回待确认单与令牌；登�
     assert.equal(fp.storeId, STORE_ID);
     assert.equal(fp.orderType, 1, "orderType 固定 1 堂食");
     assert.equal(fp.source, 18, "source 固定 18 其他三方渠道");
+    assert.equal(fp.channelCode, "AI_AGENT", "channelCode 固定 AI_AGENT（2026-08-18 渠道归因探针实测坐实）");
+    assert.equal(fp.scene, "AI_AGENT", "scene 固定 AI_AGENT，与 channelCode 同值双保险");
     assert.equal(fp.items.length, 1);
 
     const item = fp.items[0];
@@ -328,8 +330,17 @@ test("V3: prepare_order 组装的 finalParams 递归不含 isPre/preTime/isWaite
     };
     walk(lookup.order.finalParams);
 
-    // 顶层键就是全集，多一个都不行（防止将来有人顺手加字段）
-    assert.deepEqual(Object.keys(lookup.order.finalParams).sort(), ["items", "orderType", "source", "storeId", "userId"]);
+    // 顶层键就是全集，多一个都不行（防止将来有人顺手加字段）。2026-08-18 渠道归因补丁：
+    // channelCode/scene 常量注入后，全集从 5 个键扩到 7 个（新增两个，其余不变）。
+    assert.deepEqual(Object.keys(lookup.order.finalParams).sort(), [
+      "channelCode",
+      "items",
+      "orderType",
+      "scene",
+      "source",
+      "storeId",
+      "userId",
+    ]);
   } finally {
     router.restore();
     fx.restore();
@@ -374,6 +385,64 @@ test("V3 附: 多规格商品指定 skuId 组单 → finalParams 里是被指定
     assert.equal(lookup.status, "ok");
     if (lookup.status !== "ok") return;
     assert.equal((lookup.order.finalParams as any).items[0].skuId, "1288634197263667202");
+  } finally {
+    router.restore();
+    fx.restore();
+  }
+});
+
+// ============================================================================
+// V3 附 2 / V3 附 3：渠道归因常量回归（2026-08-18 探针实测坐实后永久加入 finalParams）
+// ============================================================================
+test("V3 附 2: 登记的 finalParams 含 channelCode=AI_AGENT 且 scene=AI_AGENT（渠道归因回归）", async () => {
+  const fx = installFixture();
+  bindSession();
+  const GOODS = "1200000000000000015";
+  const router = installRouter({ [PATH_DETAIL]: goodsDetailFixture(GOODS) });
+  try {
+    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    assert.equal(r.isError ?? false, false, `prepare_order 应成功：${textOf(r)}`);
+    const out = jsonOf(r);
+    const lookup = fx.pendingStore.lookup(out.confirmToken);
+    assert.equal(lookup.status, "ok");
+    if (lookup.status !== "ok") return;
+    const fp = lookup.order.finalParams as any;
+    assert.equal(fp.channelCode, "AI_AGENT", "channelCode 必须固定为 AI_AGENT 常量，不接受入参");
+    assert.equal(fp.scene, "AI_AGENT", "scene 必须固定为 AI_AGENT 常量，与 channelCode 同值双保险");
+  } finally {
+    router.restore();
+    fx.restore();
+  }
+});
+
+test('V3 附 3: 发往 6.2.9 的写请求体原文含 "channelCode":"AI_AGENT" 与 "scene":"AI_AGENT"（防序列化丢失/改名回归）', async () => {
+  const fx = installFixture();
+  bindSession();
+  const GOODS = "1200000000000000016";
+  const router = installRouter({
+    [PATH_DETAIL]: goodsDetailFixture(GOODS, 2400),
+    [PATH_CREATE]: { status: true, code: 0, data: { orderNo: "D-M4-CHANNEL", payAmount: 24.0 } },
+    [PATH_DETAIL_ORDER]: {
+      status: true,
+      code: 0,
+      data: { orderNo: "D-M4-CHANNEL", userId: FAKE_CUSTOMER_ID, actualAmount: 2400, discountList: [] },
+    },
+  });
+  try {
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prepOut = jsonOf(prep);
+    const placed = await placeOrderConfirmedHandler({ confirmToken: prepOut.confirmToken, confirmAmountYuan: 24.0 });
+    assert.equal(placed.isError ?? false, false, `全链路应成功：${textOf(placed)}`);
+
+    assert.equal(router.countOf(PATH_CREATE), 1, "写请求应恰好发出一次");
+    const sent = router.bodiesOf(PATH_CREATE)[0];
+    const sentParams = JSON.parse(sent).params;
+    // 原文正则断言（与全文件其余用例对大数字段的口径一致）——不止 JSON.parse 后取值，
+    // 而是确认序列化到线上的请求体字符串里字面就有这两个键值对，防止中途被改名或丢弃。
+    assert.match(sent, /"channelCode":"AI_AGENT"/, '请求体原文必须含 "channelCode":"AI_AGENT"');
+    assert.match(sent, /"scene":"AI_AGENT"/, '请求体原文必须含 "scene":"AI_AGENT"');
+    assert.equal(sentParams.channelCode, "AI_AGENT");
+    assert.equal(sentParams.scene, "AI_AGENT");
   } finally {
     router.restore();
     fx.restore();

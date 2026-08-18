@@ -44,6 +44,16 @@ export function fail(e: unknown): TextResult {
 export const ORDER_TYPE_DINE_IN = 1;
 /** 订单来源渠道码：18 其他三方渠道。选 18 而非 100，是为了后台能把 AI 单与小程序单分开统计。 */
 export const ORDER_SOURCE_THIRD_PARTY = 18;
+/**
+ * Agent 单归因标识：2026-08-18 M6 渠道探针真发实测（二期侦察/m6_channel_probe.py，
+ * 老板登商户后台肉眼核对）——6.2.9 请求体多传 channelCode/scene="AI_AGENT" 后，
+ * 订单详情页「渠道参数」栏原样显示 AI_AGENT，「订单来源」仍正确显示三方渠道文案，
+ * 两者互不冲突。Agent 单从此在后台可被单独归因，不再和小程序原生单混在一起。
+ * channelCode 与 scene 同值双保险：doc168 定义两者都是自由文本选填字段，探针两个字段
+ * 同值传入，无法从后台单一展示结果反推到底是哪个字段映射了「渠道参数」栏——多传一个
+ * 自由文本字段不产生副作用，故两个都传，代价为零。与 userId 一样属常量注入，不接受入参。
+ */
+export const ORDER_CHANNEL_CODE = "AI_AGENT";
 
 /** 预约单/无需支付类字段黑名单：出现任意一个都要中止（M1 观察点 ⑥ 的第一层护栏）。 */
 const PREORDER_FORBIDDEN_KEYS = ["isPre", "preTime", "isWaiterCheck", "orderSubType"] as const;
@@ -302,6 +312,10 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
       // placeOrderTool.ts 里 M3 留下的提醒：签发侧与校验侧必须对同一个对象算指纹，
       // 否则 callWrite 的 TokenFingerprintMismatch 会误伤合法下单。
       userId: binding.customerId,
+      // Agent 单归因标识（2026-08-18 探针实测坐实，见 ORDER_CHANNEL_CODE 注释）。
+      // 与 userId 一样属常量注入、不接受入参。
+      channelCode: ORDER_CHANNEL_CODE,
+      scene: ORDER_CHANNEL_CODE,
     };
 
     // ⑤ 预约单字段静态自检（组装完成后必跑一次）。
