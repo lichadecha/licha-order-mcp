@@ -131,15 +131,29 @@ export interface WriteAuditSummary {
   [k: string]: unknown;
 }
 
+/**
+ * 写审计的五种结果（施工令 § 3.1 第 5 条补充：「已发出」不等于「已成功」）：
+ *   - inflight：请求**即将真实发出**，在 fetch 之前先落盘。进程在这之后崩溃、日志里就只剩这一条，
+ *     重启重建时它会被识别为「未决」——保守地当作「可能已经在企迈侧建了单」处理。
+ *   - allowed：企迈明确回话说这单成了。
+ *   - rejected：明确没发生（护栏在发出前拦下，或企迈明确回话说这单没成）。
+ *   - unknown：**结果未知**——网络异常或 HTTP 5xx。企迈侧可能已经建单，也可能没有，本地无从判断。
+ *     这一态过去被记成 rejected，等于把「可能已成功」谎报成「失败」，是本次修复的核心缺口。
+ *   - resolved：人（模型）已经用 6.1.5/6.1.6 真实读回核对过企迈侧的订单，未决状态在此解除。
+ */
+export type WriteAuditResult = "allowed" | "rejected" | "inflight" | "unknown" | "resolved";
+
 export interface WriteAuditEntry {
   path: string;
-  result: "allowed" | "rejected";
+  result: WriteAuditResult;
   reason?: string;
   tokenId?: string | null;
   idempotencyKey?: string | null;
   summary?: WriteAuditSummary;
   orderNo?: string | null;
   code?: number | string | null;
+  /** 仅 result="resolved" 用：本次被解除未决状态的幂等键清单。重建时按它清账。 */
+  resolvedKeys?: string[] | null;
   durationMs: number;
 }
 
@@ -152,7 +166,11 @@ interface WriteGuardOptions {
 export class WriteGuard {
   private tokens = new Map<string, TokenRecord>();
   private placedOrders = new Map<string, { orderNo: string; at: number }>();
-  private dailyCounts = new Map<string, number>(); // beijingDateKey -> 当日已放行写调用数
+  private dailyCounts = new Map<string, number>(); // beijingDateKey -> 当日已结算占额（allowed + unknown）
+  /** 已落 inflight、还没等到任何终态的写请求：idempotencyKey -> 该请求所属北京时间自然日。 */
+  private unresolvedInflight = new Map<string, string>();
+  /** 终态为「结果未知」的写请求：idempotencyKey -> 落账日与时间（给错误提示用）。 */
+  private unknownWrites = new Map<string, { dateKey: string; time: string }>();
   private readonly clock: () => number;
   private readonly auditLogPath: string;
   private readonly placedOrdersPath: string;
@@ -236,18 +254,89 @@ export class WriteGuard {
 
   // ---------- 频次（北京时间自然日） ----------
 
+  /**
+   * 当日已占额度（施工令 § 3.1 第 5 条补充②的保守口径）：
+   *   已结算占额（allowed + unknown）+ 当日未决 inflight 数。
+   *
+   * 三类都占额度的理由是同一条：**代价发生在请求发出那一刻，不是成功那一刻**。
+   *   - allowed：确实建了单，占额度天经地义；
+   *   - unknown（网络异常 / 5xx）：企迈侧可能已经建单，本地无从判断——不占额度就等于
+   *     把「单日 ≤5 单」偷偷放宽成「单日 ≤5 次**成功**」，异常越多闸门越松，方向正好反了；
+   *   - 未决 inflight（落了 inflight 却没等到任何终态，典型是进程在请求途中被杀）：性质同 unknown。
+   * 明确被拒的（护栏拦下、企迈回话说没成）不占额度——那是「明确没发生」，不是「不知道」。
+   */
+  currentDailyCount(dateKey: string = beijingDateKey(this.clock())): number {
+    let count = this.dailyCounts.get(dateKey) ?? 0;
+    for (const d of this.unresolvedInflight.values()) if (d === dateKey) count++;
+    return count;
+  }
+
   checkDailyLimit(): { ok: true } | { ok: false; reason: string } {
-    const key = beijingDateKey(this.clock());
-    const count = this.dailyCounts.get(key) ?? 0;
+    const count = this.currentDailyCount();
     if (count >= ORDER_GUARD.maxOrdersPerDay) {
       return { ok: false, reason: `DailyLimitExceeded:${count}/${ORDER_GUARD.maxOrdersPerDay}` };
     }
     return { ok: true };
   }
 
+  /**
+   * 手工把当日「已结算占额」+1。
+   * 生产链路不再调用它——占额度的推进已经统一收进 recordAudit（实时写入与重启重建共用
+   * 同一个状态机 applyAuditToState，两条路径的口径不可能各自漂移）。保留为公开方法是给
+   * 测试用的：把额度直接撑满来验证频次护栏，比伪造 5 条审计日志直观得多。
+   */
   incrementDailyCount(): void {
     const key = beijingDateKey(this.clock());
     this.dailyCounts.set(key, (this.dailyCounts.get(key) ?? 0) + 1);
+  }
+
+  // ---------- 未决写请求（「已发出≠已成功」闸门） ----------
+
+  /**
+   * 存在「结果未知」或「未决 inflight」的写请求 → true。
+   * place_order 在真正发请求之前用它做前置闸门：上一单到底成没成都还没弄清楚，
+   * 这时候放行新下单就是在赌——赌输的代价是顾客被扣两次钱。
+   *
+   * 刻意不按自然日限定：昨晚那条状态未知的写请求，今天照样可能对应企迈侧一张真实存在的单。
+   * 额度计数按日分组（那是「今天还能下几单」），未决闸门不按日分组（那是「有没有账没算清」）。
+   */
+  hasUnresolvedWrite(): boolean {
+    return this.unknownWrites.size > 0 || this.unresolvedInflight.size > 0;
+  }
+
+  /** 未决写请求的摘要，给拒绝提示与审计 reason 用（不含任何识别值）。 */
+  describeUnresolvedWrites(): { total: number; unknown: number; inflight: number; earliestTime: string | null } {
+    const times = [...this.unknownWrites.values()].map((v) => v.time).filter((t) => Boolean(t)).sort();
+    return {
+      total: this.unknownWrites.size + this.unresolvedInflight.size,
+      unknown: this.unknownWrites.size,
+      inflight: this.unresolvedInflight.size,
+      earliestTime: times[0] ?? null,
+    };
+  }
+
+  /**
+   * 解除未决状态：写一条 result="resolved" 审计并清账，返回被解除的条数。
+   *
+   * 谁能调用它是这道闸门的关键设计（总工请复核）：**只有 my_orders / get_order_status 在
+   * 真正拿到企迈返回的订单数据之后才调**——不给模型开一个「我说核对完了」就能解除的 MCP 工具。
+   * 解除的凭据因此是一次真实发生的读回，而不是模型的一句自述；模型物理上无法凭空解除闸门。
+   *
+   * 已经占用的额度不退还：核对的结论是「这单到底有没有成」，不是「这次请求有没有发出」——
+   * 请求确确实实发出过。不退还同时也堵死了「靠反复触发异常再解除来多下几单」这条路。
+   */
+  resolveUnresolvedWrites(opts: { via: string; checkedOrderCount: number }): number {
+    const keys = [...this.unresolvedInflight.keys(), ...this.unknownWrites.keys()];
+    if (keys.length === 0) return 0;
+    this.recordAudit({
+      path: WRITE_WHITELIST[0],
+      result: "resolved",
+      reason: `ResolvedBy:${opts.via}:checkedOrders=${opts.checkedOrderCount}`,
+      idempotencyKey: null,
+      resolvedKeys: keys,
+      durationMs: 0,
+    });
+    return keys.length;
   }
 
   // ---------- 金额 ----------
@@ -282,13 +371,75 @@ export class WriteGuard {
       summary: entry.summary ? maskDeep(entry.summary) : undefined,
       orderNo: entry.orderNo ?? null,
       code: entry.code ?? null,
+      ...(entry.resolvedKeys ? { resolvedKeys: entry.resolvedKeys } : {}),
       durationMs: entry.durationMs,
     };
+    // 先推进内存状态机、再落盘：落盘是尽力而为（磁盘满/权限问题都不阻塞主链路），
+    // 而额度与未决闸门是护栏本身，不能因为写日志失败就不生效。
+    this.applyAuditToState(line);
     try {
       mkdirSync(dirname(this.auditLogPath), { recursive: true });
       appendFileSync(this.auditLogPath, `${JSON.stringify(line)}\n`);
     } catch {
       // 审计写入失败不阻塞主链路判定（拒绝/放行的决定已经在 recordAudit 调用之前做出）。
+    }
+  }
+
+  /**
+   * 审计记录 → 内存状态（当日占额 + 未决集合）的唯一推进入口。
+   *
+   * 实时写入（recordAudit）与重启重建（rebuildDailyCountsFromAudit）**共用这一个函数**，
+   * 输入都是「一条审计记录的 JSON 形态」。这是刻意的：两条路径若各写一份口径，日后改动
+   * 必然一处改一处漏，而漏掉的那一处正好是重启场景——护栏被静默清零的经典姿势。
+   */
+  private applyAuditToState(line: {
+    result?: string;
+    dateKey?: string;
+    time?: string;
+    path?: string;
+    idempotencyKey?: unknown;
+    resolvedKeys?: unknown;
+  }): void {
+    // resolved 不属于任何一次写请求，先处理掉（它的 path 只是占位）。
+    if (line.result === "resolved") {
+      const keys = Array.isArray(line.resolvedKeys) ? line.resolvedKeys : [];
+      for (const k of keys) {
+        if (typeof k !== "string") continue;
+        this.unresolvedInflight.delete(k);
+        this.unknownWrites.delete(k);
+      }
+      return;
+    }
+
+    // 其余四态只认写白名单内的路径（沿用 M2 起的重建口径，防止别的记录混进来影响护栏）。
+    if (typeof line.path !== "string" || !WRITE_WHITELIST.includes(line.path)) return;
+
+    const key = typeof line.idempotencyKey === "string" ? line.idempotencyKey : null;
+    const dateKey = line.dateKey ?? (line.time ? beijingDateKey(Date.parse(line.time)) : undefined);
+    const addCount = (): void => {
+      if (dateKey) this.dailyCounts.set(dateKey, (this.dailyCounts.get(dateKey) ?? 0) + 1);
+    };
+
+    switch (line.result) {
+      case "inflight":
+        // 请求即将发出，先挂账。等到终态记录出现时再销账。
+        if (key && dateKey) this.unresolvedInflight.set(key, dateKey);
+        break;
+      case "allowed":
+        if (key) this.unresolvedInflight.delete(key);
+        addCount();
+        break;
+      case "unknown":
+        if (key) {
+          this.unresolvedInflight.delete(key); // inflight 的终态到了，从「未决 inflight」转成「结果未知」
+          this.unknownWrites.set(key, { dateKey: dateKey ?? "", time: line.time ?? "" });
+        }
+        addCount();
+        break;
+      case "rejected":
+        // 明确没发生：护栏在发出前拦下，或企迈明确回话说这单没成。销账、不占额度。
+        if (key) this.unresolvedInflight.delete(key);
+        break;
     }
   }
 
@@ -325,20 +476,19 @@ export class WriteGuard {
     try {
       if (!existsSync(this.auditLogPath)) return;
       const text = readFileSync(this.auditLogPath, "utf8");
+      // 严格按文件顺序回放（inflight → 终态 → resolved 的先后关系就是靠这个顺序表达的），
+      // 逐条喂给与实时写入完全相同的状态机。历史日志里只有 allowed/rejected 两态，
+      // 回放结果与改造前一字不差——旧证据链不被本次改造推翻。
       for (const raw of text.split("\n")) {
         const line = raw.trim();
         if (!line) continue;
-        let obj: { dateKey?: string; time?: string; path?: string; result?: string };
+        let obj: Record<string, unknown>;
         try {
-          obj = JSON.parse(line);
+          obj = JSON.parse(line) as Record<string, unknown>;
         } catch {
           continue; // 单行损坏不影响其余行的重建
         }
-        if (obj.result !== "allowed") continue;
-        if (typeof obj.path !== "string" || !WRITE_WHITELIST.includes(obj.path)) continue;
-        const key = obj.dateKey ?? (obj.time ? beijingDateKey(Date.parse(obj.time)) : undefined);
-        if (!key) continue;
-        this.dailyCounts.set(key, (this.dailyCounts.get(key) ?? 0) + 1);
+        this.applyAuditToState(obj as Parameters<WriteGuard["applyAuditToState"]>[0]);
       }
     } catch {
       // 审计日志本身读不到：新装机场景（文件不存在已在 existsSync 短路），

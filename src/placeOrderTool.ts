@@ -143,8 +143,9 @@ export async function placeOrderHandler({ confirmToken, amountFen, orderParams }
 //   ③ 凭令牌从待确认单登记表取回 finalParams 与预估金额（取不到 = 令牌不存在/已过期）
 //   ④ 复述金额比对（防"念给顾客的是 A 金额、实际下的是 B 金额"）
 //   ⑤ 登记单的 userId 必须等于当前会话绑定值（跨会话串用防护）
-//   ⑥ callWrite——四项令牌校验、幂等、金额频次护栏原样生效，不绕过、不重复实现
-//   ⑦ 成功后立刻强制 6.1.9 读回（施工令 § 8 第 16 条：查已取消订单返回空 data，
+//   ⑥ 未决写请求闸门——存在「结果未知」的旧请求时拒绝下单，先去读回核对（M5 前置修复第 1 项）
+//   ⑦ callWrite——四项令牌校验、幂等、金额频次护栏原样生效，不绕过、不重复实现
+//   ⑧ 成功后立刻强制 6.1.9 读回（施工令 § 8 第 16 条：查已取消订单返回空 data，
 //      读回必须在订单活着时立刻做，事后补查拿不到）
 
 
@@ -354,7 +355,35 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
       return fail(new Error("这张待确认单不属于当前绑定的会员，已拒绝。请重新用 prepare_order 组单。"));
     }
 
-    // ⑥ 写出口。callWrite 内部的四项令牌校验 / 幂等 / 金额频次护栏原样生效。
+    // ⑥ 未决写请求闸门（施工令 § 3.1 第 5 条补充③）：上一次写请求到底成没成还没弄清楚
+    // （网络异常 / 5xx / 进程被杀在半途），这时候放行新下单就是在赌——赌输的代价是顾客
+    // 被扣两次钱，而企迈侧没有幂等字段可以兜底（§ 8 第 4 条）。
+    // 解除方式不是「模型说核对完了」，而是真的去 my_orders / get_order_status 走一次读回：
+    // 那两个工具拿到企迈真实数据之后会自动销账（见 WriteGuard.resolveUnresolvedWrites 注释）。
+    const guard = getWriteGuard();
+    if (guard.hasUnresolvedWrite()) {
+      const pendingInfo = guard.describeUnresolvedWrites();
+      guard.recordAudit({
+        path: WRITE_WHITELIST[0],
+        result: "rejected",
+        reason: `UnresolvedWriteExists:unknown=${pendingInfo.unknown}:inflight=${pendingInfo.inflight}`,
+        tokenId: confirmToken,
+        idempotencyKey: null,
+        durationMs: 0,
+      });
+      return fail(
+        new Error(
+          `上一次下单请求的结果还没有核对清楚（${pendingInfo.total} 笔状态未知` +
+            `${pendingInfo.earliestTime ? `，最早一笔发生在 ${pendingInfo.earliestTime}` : ""}），暂不放行新的下单。\n` +
+            `那次请求可能已经在企迈侧真的建了单——现在直接重下会变成两单、扣两次钱。\n` +
+            `请先调用 my_orders（查最近订单）或 get_order_status（按订单号查）核对企迈侧到底有没有那一单：\n` +
+            `　· 已经有那一单 → 不要再下，直接引导顾客去小程序付款；\n` +
+            `　· 确实没有那一单 → 核对动作本身会解除这道闸门，再重新走一次 prepare_order 组单即可。`,
+        ),
+      );
+    }
+
+    // ⑦ 写出口。callWrite 内部的四项令牌校验 / 幂等 / 金额频次护栏原样生效。
     const result = await callWrite<Record<string, unknown>>(WRITE_WHITELIST[0], pending.finalParams, {
       amountFen: pending.estimatedAmountFen,
       confirmToken,
@@ -375,7 +404,7 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
       });
     }
 
-    // ⑦ 强制读回（立刻，趁订单还活着）。读回失败不算下单失败。
+    // ⑧ 强制读回（立刻，趁订单还活着）。读回失败不算下单失败。
     const readback = await readbackOrder(orderNo, pending.estimatedAmountFen, binding);
 
     // 6.2.9 响应的 payAmount 单位是「元」（实测 24.0），与 6.1.9 的 actualAmount（分）不同单位——

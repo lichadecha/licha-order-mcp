@@ -295,6 +295,13 @@ export async function callWrite<T = unknown>(
     JSON.stringify({ openId: c.openId, grantCode: c.grantCode, nonce, timestamp, token, params }),
   );
 
+  // 「已发出≠已成功」第①条（施工令 § 3.1 第 5 条补充）：在 fetch **之前**先落一条 inflight。
+  // 这一行的全部价值在它的位置上——放在 fetch 之后就毫无意义：进程若在请求途中被杀（Ctrl-C、
+  // OOM、机器断电），日志里必须留下「有一个请求已经发出去了、结果不知道」这个事实，
+  // 否则重启后本地会以为什么都没发生过，而企迈侧可能已经躺着一张真实订单。
+  // appendFileSync 是同步落盘，返回时数据已经交给内核，不存在「还在缓冲区里就崩了」的窗口。
+  guard.recordAudit({ ...auditWithKey, result: "inflight", reason: "RequestAboutToBeSent", durationMs: Date.now() - t0 });
+
   try {
     await throttle();
     const resp = await fetch(BASE_URL + path, {
@@ -305,7 +312,9 @@ export async function callWrite<T = unknown>(
     const text = await resp.text();
     const ms = Date.now() - t0;
     if (resp.status >= 500) {
-      guard.recordAudit({ ...auditWithKey, result: "rejected", reason: `HTTP${resp.status}`, durationMs: ms });
+      // 5xx = 结果未知，不是失败：企迈网关报 500 时，后端可能已经把单建好了。
+      // 记 unknown（占当日额度、拉起未决闸门），不再记 rejected——那是把「可能已成功」谎报成「失败」。
+      guard.recordAudit({ ...auditWithKey, result: "unknown", reason: `HTTP${resp.status}`, durationMs: ms });
       return {
         ok: false,
         error: { code: "TRANSPORT", message: `HTTP ${resp.status}`, hint: "服务异常，稍后再试；先去小程序查订单状态，不要立即重复下单" },
@@ -315,7 +324,8 @@ export async function callWrite<T = unknown>(
     if (data.status === true) {
       const orderNo = extractOrderNo(data.data);
       guard.recordPlacedOrder(idempotencyKey, orderNo ?? "");
-      guard.incrementDailyCount();
+      // 当日占额不在这里 +1：allowed 记录进 recordAudit 时由状态机统一推进（同一份口径
+      // 也被重启重建复用）。两处各加一次会导致成功一单扣两次额度。
       guard.recordAudit({ ...auditWithKey, result: "allowed", orderNo: orderNo ?? null, code: data.code ?? null, durationMs: ms });
       return { ok: true, code: data.code, message: data.message, data: data.data };
     }
@@ -327,7 +337,8 @@ export async function callWrite<T = unknown>(
       error: { code: data.code ?? "unknown", message: data.message ?? "未知错误", hint: humanHint(data.code) },
     };
   } catch (e) {
-    guard.recordAudit({ ...auditWithKey, result: "rejected", reason: "TransportError", durationMs: Date.now() - t0 });
+    // 同 5xx：请求已经发出去了、回话没收到，企迈侧可能已建单。记 unknown 而不是 rejected。
+    guard.recordAudit({ ...auditWithKey, result: "unknown", reason: "TransportError", durationMs: Date.now() - t0 });
     return {
       ok: false,
       error: { code: "TRANSPORT", message: String(e), hint: "网络异常，先去小程序查订单状态，不要立即重复下单" },

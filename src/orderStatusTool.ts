@@ -7,6 +7,7 @@
 
 import { callRead } from "./client.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
+import { getWriteGuard } from "./writeGuard.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -98,10 +99,31 @@ export async function getOrderStatusHandler({ orderNo }: OrderStatusInput): Prom
       return fail(new Error("无法查询：该订单不属于当前绑定的会员"));
     }
 
-    // ⑤ 通过 → 只返回 orderNo/status/statusText，不返回 userId（连自己的也不返回）。
+    // ⑤ 「已发出≠已成功」闸门的解除点（M5 前置修复第 1 项，同 my_orders）：这一步意味着
+    // 企迈侧确实有这张单、且确实属于当前会员——一次真实发生的 6.1.5 读回。
+    // 查无此单（上面 resp.ok=false 已返回）不销账：连订单号都查不到，证明不了那笔状态未知的
+    // 写请求到底有没有建单，要核对「有没有那一单」应该用 my_orders 按时间段列。
+    const resolvedPendingWrites = getWriteGuard().resolveUnresolvedWrites({
+      via: "get_order_status",
+      checkedOrderCount: 1,
+    });
+
+    // ⑥ 通过 → 只返回 orderNo/status/statusText，不返回 userId（连自己的也不返回）。
     const rawStatus = resp.data?.status;
     const status = typeof rawStatus === "number" ? rawStatus : Number(rawStatus);
-    return ok({ orderNo, status, statusText: statusText(status) });
+    return ok({
+      orderNo,
+      status,
+      statusText: statusText(status),
+      ...(resolvedPendingWrites > 0
+        ? {
+            resolvedPendingWrites,
+            pendingWriteNote:
+              "此前有下单请求结果未知、下单闸门被暂时关闭；本次核对已解除闸门。" +
+              "这张单已经真实存在，请引导顾客直接付款，不要重复下单。",
+          }
+        : {}),
+    });
   } catch (e) {
     return fail(e);
   }

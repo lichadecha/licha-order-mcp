@@ -17,7 +17,7 @@
 import { callRead } from "./client.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
 import { assertOrderOwnership, statusText } from "./orderStatusTool.js";
-import { beijingTimeString } from "./writeGuard.js";
+import { beijingTimeString, getWriteGuard } from "./writeGuard.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -143,11 +143,28 @@ export async function myOrdersHandler({ days }: MyOrdersInput): Promise<TextResu
       })
       .filter((o): o is NonNullable<typeof o> => o !== undefined);
 
+    // ⑤ 「已发出≠已成功」闸门的解除点（M5 前置修复第 1 项）：本次查询是一次**真实发生的**
+    // 6.1.6 读回，企迈侧到底有没有那笔状态未知的单，答案就在上面这份 orders 里。
+    // 只有走到这一步才销账——闸门的钥匙是一次真实读回，不是模型的一句「我核对过了」；
+    // 也正因如此，不给模型开任何「手工解除」的工具。列表为空同样算核对完成（结论是「没有那一单」）。
+    const resolvedPendingWrites = getWriteGuard().resolveUnresolvedWrites({
+      via: "my_orders",
+      checkedOrderCount: orders.length,
+    });
+
     return ok({
       days,
       count: orders.length,
       ...(discarded > 0 ? { discardedNotOwned: discarded } : {}),
       orders,
+      ...(resolvedPendingWrites > 0
+        ? {
+            resolvedPendingWrites,
+            pendingWriteNote:
+              "此前有下单请求结果未知、下单闸门被暂时关闭；本次核对已解除闸门。" +
+              "请先按上面的订单列表判断那一单是否已经存在：已存在就引导顾客付款、不要重下；不存在再重新走 prepare_order。",
+          }
+        : {}),
       note: `只列出最近 ${days} 天、最多 ${PAGE_SIZE} 条本人订单。要看某一单的最新状态用 get_order_status。`,
     });
   } catch (e) {
