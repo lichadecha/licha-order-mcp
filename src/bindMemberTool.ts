@@ -58,16 +58,40 @@ function validateCodeFormat(code: string, codeType: BoundVia): ValidateResult {
 }
 
 /**
+ * 「这个值等于查无此人」的判据（2026-08-19 实测得出，别按直觉简化）。
+ *
+ * 企迈对**没注册过的手机号**不报错——它返回一个彻头彻尾的成功响应：
+ *   `{"code":0,"status":true,"message":"请求成功","data":{"customerId":0,"blttUserId":null}}`
+ * 三个不同的未注册号实测返回同一个 `customerId: 0`，同号重复查也稳定为 0。
+ *
+ * 这个 `0` 是个陷阱：`String(0)` 是 `"0"`，**非空字符串在 JS 里是真值**，
+ * 于是「!customerId 就拒绝」那种写法会把它当成绑定成功——顾客会听到「已绑定尾号 ***0」，
+ * 然后单子挂到一个不存在的会员上，他在自己小程序里**永远看不到这张单**。
+ * （唯一的万幸是先付后做：未付款的单不进 POS，门店不会白做一杯。）
+ *
+ * 判据覆盖三种形态，因为大数 ID 在链路上可能以数字或字符串出现：数字 0、字符串 "0"、空串。
+ */
+function isAbsentCustomerId(v: unknown): boolean {
+  if (v == null) return true;
+  const s = String(v).trim();
+  return s === "" || s === "0";
+}
+
+/**
  * 从 4.2.2 响应体里取出 customerId：正常形态是 data 为对象、取 data.customerId；
  * 兜底 data 本身直接是 string/number 的情形。protectIds 已把响应文本里的大数 ID 字符串化，
  * 这里仍统一 String() 化，不假设它一定已经是字符串。
+ *
+ * 返回 undefined 表示「这个标识查不到会员」——`customerId: 0` 归入此类（见 isAbsentCustomerId）。
  */
 function extractCustomerId(data: unknown): string | undefined {
   if (data == null) return undefined;
-  if (typeof data === "string" || typeof data === "number") return String(data);
+  if (typeof data === "string" || typeof data === "number") {
+    return isAbsentCustomerId(data) ? undefined : String(data);
+  }
   if (typeof data === "object") {
     const v = (data as Record<string, unknown>).customerId;
-    if (v == null) return undefined;
+    if (isAbsentCustomerId(v)) return undefined;
     if (typeof v === "string" || typeof v === "number") return String(v);
   }
   return undefined;
@@ -128,12 +152,26 @@ export async function bindMemberHandler({ code, codeType }: BindMemberInput): Pr
         // （M3 的 B7 缺陷），完全可能哪天也把会员 ID、动态码原样带出来。出口脱敏虽然能兜住
         // 已知形态，但「不把不受控的外部文本落盘」比「落盘后再洗」少一整类风险。
         // 排查所需的信息量并没有损失：错误枚举 + 原文长度 + 企迈 code 足以区分是哪一类失败。
-        reason: `CustomerNotFound:len=${resp.message?.length ?? 0}:code=${resp.code ?? "none"}`,
+        // reason 分两类：NotAMember（接口成功但 customerId=0，人没注册）与 LookupFailed（接口本身失败）。
+        // 事后翻日志时这两类的处置完全不同——前者是产品问题（注册引导做得好不好），后者是故障。
+        reason: `${resp.ok ? "NotAMember" : "LookupFailed"}:len=${resp.message?.length ?? 0}:code=${resp.code ?? "none"}`,
         codeLast4,
         sessionKey: DEFAULT_SESSION_KEY,
         tool: "bind_member",
       });
-      return fail(new Error("绑定失败：无法用该标识找到会员，请确认后重试"));
+      // 话术分两种，因为顾客要做的事完全不同（2026-08-19 实测后拆开）：
+      //   · 接口成功但查不到（customerId=0）= **这个号还不是李茶会员** → 让他去注册，别让他重试
+      //     （原来那句「请确认后重试」会让顾客以为自己号报错了，反复重报同一个号，反复失败）；
+      //   · 接口本身失败 = 我们这边的问题 → 让他稍后再试，不要暗示他没注册。
+      const notAMember = resp.ok;
+      return fail(
+        new Error(
+          notAMember
+            ? "这个号还不是李茶的茶会员，所以没法帮你下单。" +
+              "去微信搜「李茶的茶」小程序注册一下（用同一个手机号，很快），注册好回来跟我说一声，我再帮你绑。"
+            : "绑定暂时没成功（查询会员信息时出了点问题，不是你的号有问题）。稍等一下再试一次。",
+        ),
+      );
     }
 
     // ⑤ 成功 → 绑定会话 → 审计 → 出参只含后四位。

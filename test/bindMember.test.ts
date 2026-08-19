@@ -36,7 +36,12 @@ function freshAuditLogger(): { logger: AccessAuditLogger; logPath: string } {
 // 如果先造出一个 JS number 字面量再序列化，精度早就丢了；只有原始文本里保持"未加引号的
 // 大数字"这个形态，才是 M1 实测的真实响应形态，也只有这样 protectIds 的字符串化兜底才有意义。
 const SUCCESS_BODY = '{"status":true,"code":0,"message":"ok","data":{"customerId":1234567890123456789}}';
+// 接口本身失败的形态（构造值）——测的是 LookupFailed 那条路径。
 const NOT_FOUND_BODY = '{"status":false,"code":40001,"message":"会员不存在"}';
+// ⚠️ 企迈**真实**的「这个号没注册过」形态（2026-08-19 实测，三个未注册号 + 同号重复查，稳定一致）：
+// 它是一个彻头彻尾的成功响应，只是 customerId 为 0。此前本文件只有上面那个构造的失败形态，
+// 于是「假装绑定成功」这个缺陷一直测不出来——测试假设的失败形态与接口真实行为不是一回事。
+const ZERO_CUSTOMER_BODY = '{"status":true,"code":0,"message":"请求成功","data":{"blttUserId":null,"customerId":0}}';
 
 function installFetchSpy(responses: string[]): { count: () => number; restore: () => void } {
   const original = globalThis.fetch;
@@ -136,6 +141,97 @@ test("U3-T1: phone 绑定把手机号存进会话态，但出参与 access-audit
   }
 });
 
+// ---------- 非会员绑定（2026-08-19 实测缺陷修复）----------
+// 缺陷原貌：企迈对未注册手机号返回 {"code":0,"status":true,"data":{"customerId":0}}——
+// 接口层面完全成功。旧代码 String(0)="0" 是非空字符串、`!customerId` 判断放行，于是
+// **绑定"成功"、会话绑到 customerId="0"**，后续单子挂到不存在的会员上，顾客在自己
+// 小程序里永远看不到那张单。这三条守住修复。
+
+test("U3-Z1: 未注册手机号（企迈返回 customerId:0，接口成功）→ 必须判为查无此人、会话不许留下绑定", async () => {
+  const sessionStore = new SessionStore();
+  setSessionStoreForTesting(sessionStore);
+  const { logger, logPath } = freshAuditLogger();
+  setAccessAuditLoggerForTesting(logger);
+  const spy = installFetchSpy([ZERO_CUSTOMER_BODY]);
+  try {
+    const result = await bindMemberHandler({ code: "13800001234", codeType: "phone" });
+
+    assert.strictEqual(result.isError, true, "customerId=0 必须判为失败——这是本缺陷的核心");
+    assert.strictEqual(sessionStore.getBinding(DEFAULT_SESSION_KEY), undefined, "会话不许留下任何绑定");
+    // 反面断言：绝不能出现「已绑定尾号 ***0」这种荒谬播报
+    assert.ok(!result.content[0].text.includes("***0"), "不许把 0 当成会员 ID 播报尾号");
+
+    const log = readFileSync(logPath, "utf8");
+    assert.ok(log.includes('"event":"bind_rejected"'), "应记一条 bind_rejected");
+    assert.ok(log.includes("NotAMember"), "reason 应标为 NotAMember（不是接口故障）");
+    assert.strictEqual(spy.count(), 1);
+  } finally {
+    spy.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+});
+
+test("U3-Z2: 「不是会员」与「接口故障」两条路径的话术必须不同——前者引导去注册，后者让稍后重试", async () => {
+  // 前半：不是会员
+  setSessionStoreForTesting(new SessionStore());
+  const fx1 = freshAuditLogger();
+  setAccessAuditLoggerForTesting(fx1.logger);
+  const spy1 = installFetchSpy([ZERO_CUSTOMER_BODY]);
+  let notMemberMsg = "";
+  try {
+    notMemberMsg = (await bindMemberHandler({ code: "13800001234", codeType: "phone" })).content[0].text;
+  } finally {
+    spy1.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+  assert.match(notMemberMsg, /还不是李茶的茶会员/, "非会员要说清「你还不是会员」");
+  assert.match(notMemberMsg, /小程序注册/, "非会员要给出下一步：去小程序注册");
+  assert.ok(!/重试|再试一次/.test(notMemberMsg), "非会员不许让他重试——重报同一个号只会再失败一次");
+
+  // 后半：接口故障
+  setSessionStoreForTesting(new SessionStore());
+  const fx2 = freshAuditLogger();
+  setAccessAuditLoggerForTesting(fx2.logger);
+  const spy2 = installFetchSpy([NOT_FOUND_BODY]);
+  let failMsg = "";
+  try {
+    failMsg = (await bindMemberHandler({ code: "13800001234", codeType: "phone" })).content[0].text;
+  } finally {
+    spy2.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+  assert.ok(!/还不是李茶的茶会员/.test(failMsg), "接口故障时不许暗示顾客没注册——那是甩锅给用户");
+  assert.match(failMsg, /再试/, "接口故障要让顾客稍后再试");
+  assert.ok(readFileSync(fx2.logPath, "utf8").includes("LookupFailed"), "reason 应标为 LookupFailed");
+});
+
+test("U3-Z3: customerId 的三种「空」形态都判为查无此人（数字 0 / 字符串 \"0\" / 空串）", async () => {
+  const bodies = [
+    ['{"status":true,"code":0,"data":{"customerId":0}}', "数字 0"],
+    ['{"status":true,"code":0,"data":{"customerId":"0"}}', '字符串 "0"'],
+    ['{"status":true,"code":0,"data":{"customerId":""}}', "空串"],
+  ] as const;
+  for (const [body, label] of bodies) {
+    const store = new SessionStore();
+    setSessionStoreForTesting(store);
+    const fx = freshAuditLogger();
+    setAccessAuditLoggerForTesting(fx.logger);
+    const spy = installFetchSpy([body]);
+    try {
+      const r = await bindMemberHandler({ code: "13800001234", codeType: "phone" });
+      assert.strictEqual(r.isError, true, `${label} 应判为查无此人`);
+      assert.strictEqual(store.getBinding(DEFAULT_SESSION_KEY), undefined, `${label} 不许留下绑定`);
+    } finally {
+      spy.restore();
+      setSessionStoreForTesting(null);
+      setAccessAuditLoggerForTesting(null);
+    }
+  }
+});
+
 test("U4: 已绑定后再次 bind（不同 code）→ 被拒，fetch 未被调用", async () => {
   const sessionStore = new SessionStore();
   sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: "1234567890123456789", boundAt: Date.now(), boundVia: "phone" });
@@ -212,7 +308,10 @@ test("U7: mock 4.2.2 返回查无此人 → 绑定失败、会话仍未绑定，
   try {
     const result1 = await bindMemberHandler({ code: "13800009999", codeType: "phone" });
     assert.strictEqual(result1.isError, true);
-    assert.ok(/绑定失败：无法用该标识找到会员，请确认后重试/.test(result1.content[0].text));
+    // 话术 2026-08-19 按失败类型拆开：本用例喂的是 status:false（接口本身失败）→
+    // 说「不是你的号有问题、稍等再试」，不许暗示顾客没注册（那类是 customerId=0，见 U3-Z2）。
+    assert.match(result1.content[0].text, /绑定暂时没成功/);
+    assert.ok(!/还不是李茶的茶会员/.test(result1.content[0].text), "接口故障不许甩锅说顾客没注册");
     assert.strictEqual(sessionStore.getBinding(DEFAULT_SESSION_KEY), undefined, "会话仍应未绑定");
 
     const result2 = await bindMemberHandler({ code: "13800001234", codeType: "phone" });
@@ -223,7 +322,7 @@ test("U7: mock 4.2.2 返回查无此人 → 绑定失败、会话仍未绑定，
 
     assert.strictEqual(spy.count(), 2, "应分别发出两次 fetch（第一次查无此人、第二次成功）");
     const log = readFileSync(logPath, "utf8");
-    assert.ok(log.includes("CustomerNotFound"));
+    assert.ok(log.includes("LookupFailed"), "本用例喂的是 status:false 形态 → 归 LookupFailed（NotAMember 是 customerId=0 那类）");
     assert.ok(log.includes('"event":"bind_success"'));
   } finally {
     spy.restore();

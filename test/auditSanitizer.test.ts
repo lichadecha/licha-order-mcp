@@ -195,7 +195,9 @@ test("U-S6: bind_member 查无此人 → 落盘 reason 只有枚举+长度+code�
 
     const { raw, obj } = lastLine(accessLogPath);
     assert.equal(obj.event, "bind_rejected");
-    assert.equal(obj.reason, `CustomerNotFound:len=${qmaiMessage.length}:code=40001`);
+    // 枚举名 2026-08-19 由 CustomerNotFound 拆成两类：本用例的响应是 status:false（接口本身失败）
+    // → LookupFailed；「接口成功但 customerId=0」那类是 NotAMember，两者处置完全不同。
+    assert.equal(obj.reason, `LookupFailed:len=${qmaiMessage.length}:code=40001`);
     assert.ok(!raw.includes("不存在"), "企迈 message 原文不得出现在落盘记录里");
     assert.ok(!raw.includes(FAKE_MEMBER_ID), "message 里夹带的会员 ID 自然也不会出现");
     assert.equal(obj.codeLast4, "***1234", "绑定标识仍然只留后四位");
