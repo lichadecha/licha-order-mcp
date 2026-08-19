@@ -89,6 +89,53 @@ test("U3: bind_member 成功 → 会话有绑定、出参只含后四位、acces
   }
 });
 
+// ---------- T1 手机号回填（2026-08-19，17 号执行包 T1）----------
+// 会话态多存了一个手机号，就多了一个能泄漏的地方。这条守的是「存了但不外露」：
+// 会话里有完整值（prepare_order 要拿它注入 mobile/reservePhone），出参与审计里只有尾号。
+// 另一半（发出去的请求体必须是完整值）在 m4ConfirmOrder.test.ts 的 T1 附 1。
+
+test("U3-T1: phone 绑定把手机号存进会话态，但出参与 access-audit 里只有尾号；card/dynamic_code 绑定根本没有 phone 这个键", async () => {
+  // —— 前半：手机号绑定 ——
+  const sessionStore = new SessionStore();
+  setSessionStoreForTesting(sessionStore);
+  const { logger, logPath } = freshAuditLogger();
+  setAccessAuditLoggerForTesting(logger);
+  const spy = installFetchSpy([SUCCESS_BODY]);
+  try {
+    const result = await bindMemberHandler({ code: "138 0000 1234", codeType: "phone" });
+    assert.strictEqual(result.isError, undefined, "应成功");
+
+    const binding = sessionStore.getBinding(DEFAULT_SESSION_KEY);
+    // 存的是**去空白后**的号：顾客口述/截屏来的号常夹空格，存原文会让后台收到带空格的电话。
+    assert.strictEqual(binding?.phone, "13800001234", "会话态应存下去空白后的完整手机号");
+
+    assert.ok(!result.content[0].text.includes("13800001234"), "bind 出参不许出现完整手机号");
+    assert.ok(!readFileSync(logPath, "utf8").includes("13800001234"), "access-audit 不许出现完整手机号");
+  } finally {
+    spy.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+
+  // —— 后半：非手机号形态，压根没有 phone 这个键（不是 undefined 值）——
+  const store2 = new SessionStore();
+  setSessionStoreForTesting(store2);
+  const fx2 = freshAuditLogger();
+  setAccessAuditLoggerForTesting(fx2.logger);
+  const spy2 = installFetchSpy([SUCCESS_BODY]);
+  try {
+    const r2 = await bindMemberHandler({ code: "1234567890", codeType: "dynamic_code" });
+    assert.strictEqual(r2.isError, undefined, "动态码绑定也应成功");
+    const b2 = store2.getBinding(DEFAULT_SESSION_KEY);
+    assert.ok(b2, "会话应已绑定");
+    assert.ok(!("phone" in (b2 as object)), "非 phone 形态不许出现 phone 键（哪怕值是 undefined）");
+  } finally {
+    spy2.restore();
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+});
+
 test("U4: 已绑定后再次 bind（不同 code）→ 被拒，fetch 未被调用", async () => {
   const sessionStore = new SessionStore();
   sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: "1234567890123456789", boundAt: Date.now(), boundVia: "phone" });

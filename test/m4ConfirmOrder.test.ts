@@ -14,9 +14,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { setReadAuditLogPathForTesting } from "../src/client.js";
 import { ORDER_GUARD } from "../src/constants.js";
 import { WriteGuard, setWriteGuardForTesting } from "../src/writeGuard.js";
@@ -32,6 +32,7 @@ process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
 process.env.QMAI_GRANT_CODE ??= "test-grant-code-0000000000";
 
 const FAKE_CUSTOMER_ID = "1234567890123456789"; // 19 位假会员 ID（真实会员 ID 绝不入库）
+const FAKE_PHONE = "13800001234"; // 假手机号（中段全零；真实手机号绝不入库，纪律同 §8-26）
 const STORE_ID = 503542; // 深圳湾万象城（公开门店编码，非识别值）
 const realFetch = globalThis.fetch;
 
@@ -163,9 +164,22 @@ function installFixture(clock?: () => number): Fixture {
   };
 }
 
+/** 手机号绑定的会话（默认）。假号中段全零，一眼假；脱敏正则要合法手机号形态才测得出来。 */
 function bindSession(): void {
   const store = new SessionStore();
-  store.bind(DEFAULT_SESSION_KEY, { customerId: FAKE_CUSTOMER_ID, boundAt: Date.now(), boundVia: "phone" });
+  store.bind(DEFAULT_SESSION_KEY, {
+    customerId: FAKE_CUSTOMER_ID,
+    boundAt: Date.now(),
+    boundVia: "phone",
+    phone: FAKE_PHONE,
+  });
+  setSessionStoreForTesting(store);
+}
+
+/** 非手机号绑定的会话（会员码/动态码形态）——拿不到手机号，用来验「没有就不带键」。 */
+function bindSessionWithoutPhone(boundVia: "card" | "dynamic_code" = "dynamic_code"): void {
+  const store = new SessionStore();
+  store.bind(DEFAULT_SESSION_KEY, { customerId: FAKE_CUSTOMER_ID, boundAt: Date.now(), boundVia });
   setSessionStoreForTesting(store);
 }
 
@@ -255,6 +269,9 @@ test("V2: 绑定后 prepare_order 成功 → 返回待确认单与令牌；登�
     assert.equal(fp.source, 18, "source 固定 18 其他三方渠道");
     assert.equal(fp.channelCode, "AI_AGENT", "channelCode 固定 AI_AGENT（2026-08-18 渠道归因探针实测坐实）");
     assert.equal(fp.scene, "AI_AGENT", "scene 固定 AI_AGENT，与 channelCode 同值双保险");
+    assert.equal(fp.member, true, "member 固定 true（本单必挂 userId，如实标注为会员单）");
+    assert.equal(fp.mobile, FAKE_PHONE, "mobile 取会话绑定的手机号（2026-08-19 后台四看：不传则「下单人」栏空）");
+    assert.equal(fp.reservePhone, FAKE_PHONE, "reservePhone 同号（映射后台「预留电话」栏）");
     assert.equal(fp.items.length, 1);
 
     const item = fp.items[0];
@@ -330,12 +347,17 @@ test("V3: prepare_order 组装的 finalParams 递归不含 isPre/preTime/isWaite
     };
     walk(lookup.order.finalParams);
 
-    // 顶层键就是全集，多一个都不行（防止将来有人顺手加字段）。2026-08-18 渠道归因补丁：
-    // channelCode/scene 常量注入后，全集从 5 个键扩到 7 个（新增两个，其余不变）。
+    // 顶层键就是全集，多一个都不行（防止将来有人顺手加字段）。演进留痕：
+    //   M4 定稿 5 个 → 2026-08-18 渠道归因补丁 +channelCode/scene = 7 个
+    //   → 2026-08-19 手机号回填补丁 +member/mobile/reservePhone = 10 个（手机号绑定的会话）。
+    // 非手机号绑定的会话少 mobile/reservePhone 两个键，由下面「T1 附 3」单独断言。
     assert.deepEqual(Object.keys(lookup.order.finalParams).sort(), [
       "channelCode",
       "items",
+      "member",
+      "mobile",
       "orderType",
+      "reservePhone",
       "scene",
       "source",
       "storeId",
@@ -409,6 +431,134 @@ test("V3 附 2: 登记的 finalParams 含 channelCode=AI_AGENT 且 scene=AI_AGEN
     const fp = lookup.order.finalParams as any;
     assert.equal(fp.channelCode, "AI_AGENT", "channelCode 必须固定为 AI_AGENT 常量，不接受入参");
     assert.equal(fp.scene, "AI_AGENT", "scene 必须固定为 AI_AGENT 常量，与 channelCode 同值双保险");
+  } finally {
+    router.restore();
+    fx.restore();
+  }
+});
+
+// ---------- T1 手机号回填（2026-08-19 老板后台四看实测后上车，17 号执行包 T1）----------
+//
+// 实测依据：企迈商户后台订单详情页的「下单人」「预留电话」两栏读的是 6.2.9 请求体的
+// mobile / reservePhone——不传就是空的（M6 第一枪两栏皆空、第二枪补传后两栏都有值）。
+// 同轮实测的反面结论：后台**搜索框按手机号搜不到**这张单，「能显示」修好了、「能检索」修不了。
+//
+// 这三条守的是三件不同的事，别合并：①发出去的必须是完整值（否则后台还是空的）
+// ②留在本机的必须是尾号（§8-26 硬纪律）③拿不到手机号时必须没有这两个键（不是空串）。
+
+test("T1 附 1: 写请求体原文含完整 mobile/reservePhone 与 member:true，而待确认单出参一个手机号字符都没有", async () => {
+  const fx = installFixture();
+  bindSession();
+  const GOODS = "1200000000000000017";
+  const router = installRouter({
+    [PATH_DETAIL]: goodsDetailFixture(GOODS, 2400),
+    [PATH_CREATE]: { status: true, code: 0, data: { orderNo: "D-M4-PHONE", payAmount: 24.0 } },
+    [PATH_DETAIL_ORDER]: {
+      status: true,
+      code: 0,
+      data: { orderNo: "D-M4-PHONE", userId: FAKE_CUSTOMER_ID, actualAmount: 2400, discountList: [] },
+    },
+  });
+  try {
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prepOut = jsonOf(prep);
+
+    // 出参面：待确认单是念给顾客听的，顾客不需要我们把他自己的号复述回去（连尾号都不给）。
+    assert.ok(!textOf(prep).includes(FAKE_PHONE), "待确认单出参不许出现完整手机号");
+    assert.ok(!/"mobile"|"reservePhone"/.test(textOf(prep)), "待确认单出参不许出现 mobile/reservePhone 字段名");
+
+    const placed = await placeOrderConfirmedHandler({ confirmToken: prepOut.confirmToken, confirmAmountYuan: 24.0 });
+    assert.equal(placed.isError ?? false, false, `全链路应成功：${textOf(placed)}`);
+    assert.equal(router.countOf(PATH_CREATE), 1, "写请求应恰好发出一次");
+
+    // 线上面：原文正则断言，确认序列化到线上的字符串里字面就有完整号（不是 JSON.parse 后才对得上）。
+    const sent = router.bodiesOf(PATH_CREATE)[0];
+    assert.match(sent, new RegExp(`"mobile":"${FAKE_PHONE}"`), '请求体原文必须含完整 "mobile"');
+    assert.match(sent, new RegExp(`"reservePhone":"${FAKE_PHONE}"`), '请求体原文必须含完整 "reservePhone"');
+    assert.match(sent, /"member":true/, '请求体原文必须含 "member":true');
+    const sentParams = JSON.parse(sent).params;
+    assert.equal(sentParams.mobile, FAKE_PHONE);
+    assert.equal(sentParams.reservePhone, FAKE_PHONE);
+    assert.equal(sentParams.member, true);
+
+    // 下单结果播报面：也不许把手机号带出来。
+    assert.ok(!textOf(placed).includes(FAKE_PHONE), "下单结果出参不许出现完整手机号");
+  } finally {
+    router.restore();
+    fx.restore();
+  }
+});
+
+test("T1 附 2: 走完整下单链路后，三本审计日志与 placed-orders.json 里零完整手机号（落盘只留尾号）", async () => {
+  const fx = installFixture();
+  bindSession();
+  const GOODS = "1200000000000000018";
+  const router = installRouter({
+    [PATH_DETAIL]: goodsDetailFixture(GOODS, 2400),
+    [PATH_CREATE]: { status: true, code: 0, data: { orderNo: "D-M4-PHONE-AUDIT", payAmount: 24.0 } },
+    [PATH_DETAIL_ORDER]: {
+      status: true,
+      code: 0,
+      data: { orderNo: "D-M4-PHONE-AUDIT", userId: FAKE_CUSTOMER_ID, actualAmount: 2400, discountList: [] },
+    },
+  });
+  try {
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const placed = await placeOrderConfirmedHandler({
+      confirmToken: jsonOf(prep).confirmToken,
+      confirmAmountYuan: 24.0,
+    });
+    assert.equal(placed.isError ?? false, false, `全链路应成功：${textOf(placed)}`);
+
+    // 阳性对照（§4.5 第 2 条）：先证明这套「读文件找手机号」的检查真能扫出已知存在的号，
+    // 再采信它对真实日志的「没找到」。不做这一步，下面三个 ok() 全过也说明不了任何事。
+    const controlPath = join(dirname(fx.writeAuditPath), "control.log");
+    writeFileSync(controlPath, `{"note":"${FAKE_PHONE}"}\n`);
+    assert.ok(readFileSync(controlPath, "utf8").includes(FAKE_PHONE), "阳性对照失败：连塞进去的手机号都读不出来");
+
+    for (const [name, path] of [
+      ["写审计", fx.writeAuditPath],
+      ["访问审计", fx.accessAuditPath],
+      ["幂等记录", join(dirname(fx.writeAuditPath), "placed-orders.json")],
+    ] as const) {
+      if (!existsSync(path)) continue; // 没产生该文件本身也是合规的（比如本用例不触发访问审计）
+      const text = readFileSync(path, "utf8");
+      assert.ok(!text.includes(FAKE_PHONE), `${name}（${path}）里出现了完整手机号——落盘纪律被破坏`);
+    }
+  } finally {
+    router.restore();
+    fx.restore();
+  }
+});
+
+test("T1 附 3: 会员码/动态码绑定拿不到手机号 → finalParams 不带 mobile/reservePhone 键（不是空串），member 照旧为 true", async () => {
+  const fx = installFixture();
+  bindSessionWithoutPhone("dynamic_code");
+  const GOODS = "1200000000000000019";
+  const router = installRouter({ [PATH_DETAIL]: goodsDetailFixture(GOODS, 2400) });
+  try {
+    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    assert.equal(r.isError ?? false, false, `prepare_order 应成功：${textOf(r)}`);
+    const lookup = fx.pendingStore.lookup(jsonOf(r).confirmToken);
+    assert.equal(lookup.status, "ok");
+    if (lookup.status !== "ok") return;
+    const fp = lookup.order.finalParams as Record<string, unknown>;
+
+    // 「没有这个键」和「键在但值是空串」是两回事：后者等于告诉企迈「这人没有电话」，
+    // 而且会进指纹计算、改变幂等口径。断言用 in 而不是取值判空，正是为了区分这两者。
+    assert.ok(!("mobile" in fp), "拿不到手机号时不许出现 mobile 键");
+    assert.ok(!("reservePhone" in fp), "拿不到手机号时不许出现 reservePhone 键");
+    assert.equal(fp.member, true, "member 与手机号无关，照旧为 true");
+    assert.deepEqual(Object.keys(fp).sort(), [
+      "channelCode",
+      "items",
+      "member",
+      "orderType",
+      "scene",
+      "source",
+      "storeId",
+      "userId",
+    ]);
   } finally {
     router.restore();
     fx.restore();

@@ -138,7 +138,16 @@ export async function bindMemberHandler({ code, codeType }: BindMemberInput): Pr
 
     // ⑤ 成功 → 绑定会话 → 审计 → 出参只含后四位。
     const boundAt = Date.now();
-    sessionStore.bind(DEFAULT_SESSION_KEY, { customerId, boundAt, boundVia: codeType });
+    // 手机号只在 codeType==="phone" 时才有（另两种形态拿到的是卡号/动态码，不是电话）。
+    // 用条件展开而不是 `phone: codeType === "phone" ? trimmedCode : undefined`——后者会在对象里
+    // 留下一个值为 undefined 的 phone 键，JSON.stringify 虽然会丢掉它，但 `"phone" in binding`
+    // 之类的判断会被它骗过去。没有就是没有这个键。
+    sessionStore.bind(DEFAULT_SESSION_KEY, {
+      customerId,
+      boundAt,
+      boundVia: codeType,
+      ...(codeType === "phone" ? { phone: trimmedCode } : {}),
+    });
     const customerIdLast4 = `***${customerId.slice(-4)}`;
     audit.record({
       event: "bind_success",

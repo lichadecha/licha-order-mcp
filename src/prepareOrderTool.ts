@@ -54,6 +54,16 @@ export const ORDER_SOURCE_THIRD_PARTY = 18;
  * 自由文本字段不产生副作用，故两个都传，代价为零。与 userId 一样属常量注入，不接受入参。
  */
 export const ORDER_CHANNEL_CODE = "AI_AGENT";
+/**
+ * 会员标记（doc168 `member`，boolean 选填）：本工具链下单必然挂着会话绑定的 userId——
+ * 也就是说这单**本来就是会员单**，`member: true` 只是把这个事实如实告诉企迈，不是我们额外主张什么。
+ *
+ * 为什么敢常量注入（先验后用）：M6 第二枪探针（2026-08-18）已带此字段真发过一单，
+ * 老板 2026-08-19 后台核对——支付总额 24 / 应付总额 24 / 优惠总额 0，与不带该字段的第一枪
+ * 一模一样，**没有触发任何会员价或优惠逻辑**。它影响的是企迈内部怎么归类这单，不影响算钱。
+ * 会员权益是否因此正常累积（积分等）仍是零付款口径下的盲区，挂在 §8-34 待机会性验证。
+ */
+export const ORDER_MEMBER_FLAG = true;
 
 /** 预约单/无需支付类字段黑名单：出现任意一个都要中止（M1 观察点 ⑥ 的第一层护栏）。 */
 const PREORDER_FORBIDDEN_KEYS = ["isPre", "preTime", "isWaiterCheck", "orderSubType"] as const;
@@ -316,6 +326,16 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
       // 与 userId 一样属常量注入、不接受入参。
       channelCode: ORDER_CHANNEL_CODE,
       scene: ORDER_CHANNEL_CODE,
+      // 会员标记：本单必挂 userId，如实填 true（先验后用，见 ORDER_MEMBER_FLAG 注释）。
+      member: ORDER_MEMBER_FLAG,
+      // 顾客手机号回填（2026-08-19 老板后台四看实测坐实，见 session.ts 的 SessionBinding.phone 注释）：
+      // 不传这两个字段，商户后台订单详情页的「下单人」「预留电话」两栏就是空的——门店拿到 Agent 单
+      // 联系不上顾客。mobile 与 reservePhone 传同一个号，各自映射后台两个不同栏位（两栏实测都有值）。
+      //
+      // 只有手机号绑定的会话有这个值；会员码/动态码绑定拿不到手机号，那就**不带这两个键**
+      // （而不是带空串——空串是「显式告诉企迈这人没电话」，与「我们不知道」是两回事，
+      // 而且空串会污染指纹口径）。与 userId/channelCode 一样属服务端注入，不接受入参。
+      ...(binding.phone ? { mobile: binding.phone, reservePhone: binding.phone } : {}),
     };
 
     // ⑤ 预约单字段静态自检（组装完成后必跑一次）。
