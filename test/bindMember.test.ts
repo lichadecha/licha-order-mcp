@@ -14,6 +14,8 @@ import { bindMemberHandler } from "../src/bindMemberTool.js";
 import { setReadAuditLogPathForTesting } from "../src/client.js";
 import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "../src/session.js";
 import { AccessAuditLogger, setAccessAuditLoggerForTesting } from "../src/accessAudit.js";
+import { PendingOrderStore, setPendingOrderStoreForTesting } from "../src/pendingOrders.js";
+import { WriteGuard, setWriteGuardForTesting, beijingTimeString } from "../src/writeGuard.js";
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
 process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
@@ -232,22 +234,41 @@ test("U3-Z3: customerId 的三种「空」形态都判为查无此人（数字 0
   }
 });
 
-test("U4: 已绑定后再次 bind（不同 code）→ 被拒，fetch 未被调用", async () => {
+// ---------- 换绑（2026-08-19 老板拍板「换人就解绑，别让用户这么麻烦」）----------
+// 行为变更：原 U4/U5 断言的是「已绑定后再绑一律被拒（连是不是同一人都不判，省一次调用）」。
+// 那条规矩配的是 SKILL 里「要换人请新开一个对话」这句话术——而它被实测证伪（MCP server 进程
+// 在 WorkBuddy 里常驻、跨对话复用，开新对话不换会话键，§8-41）。规矩既挡不住真正的风险
+// （手机号绑定本就无验证，第一次就能绑任何人的号，风险 2026-08-18 已盘清并接受），
+// 又把正常换人的顾客卡死，故改为：同一人幂等、换人则换绑。
+// 代价是每次重复绑定都多一次 4.2.2 只读调用——不调接口就不知道新号是不是同一个人。
+
+test("U4-R1: 已绑定后报另一个人的号 → 换绑成功，出参说清「从谁换成谁」，审计留 rebind_success", async () => {
   const sessionStore = new SessionStore();
-  sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: "1234567890123456789", boundAt: Date.now(), boundVia: "phone" });
+  const OLD_ID = "1111111111111111111";
+  sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: OLD_ID, boundAt: Date.now(), boundVia: "phone", phone: "13800001234" });
   setSessionStoreForTesting(sessionStore);
   const { logger, logPath } = freshAuditLogger();
   setAccessAuditLoggerForTesting(logger);
-  const spy = installFetchSpy([SUCCESS_BODY]);
+  const spy = installFetchSpy([SUCCESS_BODY]); // 返回 customerId 1234567890123456789（与 OLD_ID 不同）
   try {
     const result = await bindMemberHandler({ code: "13900002345", codeType: "phone" });
-    assert.strictEqual(result.isError, true);
-    assert.ok(/一个会话只能绑定一位会员/.test(result.content[0].text));
-    assert.ok(/6789/.test(result.content[0].text), "错误信息应含已绑定 customerId 后四位");
-    assert.strictEqual(spy.count(), 0, "fetch 不应被调用");
+    assert.strictEqual(result.isError, undefined, `换绑应成功：${result.content[0].text}`);
+    const parsed = JSON.parse(result.content[0].text);
+
+    assert.strictEqual(parsed.rebound, true, "出参要显式标出这是一次换绑");
+    assert.strictEqual(parsed.customerIdLast4, "***6789", "新绑定的是新会员");
+    assert.strictEqual(parsed.previousCustomerIdLast4, "***1111", "要说清换掉的是谁（只给尾号）");
+    assert.match(parsed.note, /已从\*\*\*1111换成\*\*\*6789/, "note 要让顾客一听就能纠错");
+
+    const binding = sessionStore.getBinding(DEFAULT_SESSION_KEY);
+    assert.strictEqual(binding?.customerId, "1234567890123456789", "会话态应已换成新会员");
+    assert.strictEqual(binding?.phone, "13900002345", "手机号也要跟着换（否则下单会带上一位顾客的电话）");
+
     const log = readFileSync(logPath, "utf8");
-    assert.ok(log.includes('"event":"bind_rejected"'));
-    assert.ok(log.includes("AlreadyBound"));
+    assert.ok(log.includes('"event":"rebind_success"'), "换人是审计上最该一眼看见的事，要有独立事件");
+    assert.ok(log.includes("PreviousCustomer:***1111"), "审计要记换掉的是谁");
+    assert.ok(!log.includes(OLD_ID) && !log.includes("13900002345"), "审计里不许出现任何完整识别值");
+    assert.strictEqual(spy.count(), 1, "换绑要真调一次 4.2.2——不调就不知道新号是不是同一个人");
   } finally {
     spy.restore();
     setSessionStoreForTesting(null);
@@ -255,20 +276,107 @@ test("U4: 已绑定后再次 bind（不同 code）→ 被拒，fetch 未被调�
   }
 });
 
-test("U5: 已绑定后再次 bind（相同 code）→ 同样被拒（一会话一次绑定，不判断是否同一人），fetch 未被调用", async () => {
+test("U4-R2: 换绑时作废前一位顾客还没确认的待确认单（换回来也不许复活）", async () => {
   const sessionStore = new SessionStore();
-  sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: "1234567890123456789", boundAt: Date.now(), boundVia: "phone" });
+  const OLD_ID = "1111111111111111111";
+  sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: OLD_ID, boundAt: Date.now(), boundVia: "phone" });
   setSessionStoreForTesting(sessionStore);
-  const { logger } = freshAuditLogger();
+  const pendingStore = new PendingOrderStore();
+  setPendingOrderStoreForTesting(pendingStore);
+  // 旧顾客有两张待确认单，另有一张属于第三人（不该被牵连作废）
+  pendingStore.register("tok-old-1", { finalParams: { userId: OLD_ID, storeId: 1 }, estimatedAmountFen: 2400 });
+  pendingStore.register("tok-old-2", { finalParams: { userId: OLD_ID, storeId: 1 }, estimatedAmountFen: 4800 });
+  pendingStore.register("tok-other", { finalParams: { userId: "2222222222222222222", storeId: 1 }, estimatedAmountFen: 1200 });
+  const { logger, logPath } = freshAuditLogger();
   setAccessAuditLoggerForTesting(logger);
   const spy = installFetchSpy([SUCCESS_BODY]);
   try {
-    const result = await bindMemberHandler({ code: "13800001234", codeType: "phone" }); // 与已绑定时用的假想 code 相同
-    assert.strictEqual(result.isError, true);
-    assert.ok(/一个会话只能绑定一位会员/.test(result.content[0].text));
-    assert.strictEqual(spy.count(), 0, "fetch 不应被调用——同 code 也不例外，规则是一会话一次绑定");
+    const result = await bindMemberHandler({ code: "13900002345", codeType: "phone" });
+    assert.strictEqual(result.isError, undefined);
+    const parsed = JSON.parse(result.content[0].text);
+    assert.strictEqual(parsed.discardedPendingOrders, 2, "旧顾客那两张单都要作废");
+    assert.match(parsed.note, /2 张单已作废/, "要告诉顾客旧单没了、得重新组");
+
+    assert.strictEqual(pendingStore.lookup("tok-old-1").status, "absent", "旧单必须查不到");
+    assert.strictEqual(pendingStore.lookup("tok-old-2").status, "absent", "旧单必须查不到");
+    assert.strictEqual(pendingStore.lookup("tok-other").status, "ok", "第三人的单不许被牵连");
+    assert.ok(readFileSync(logPath, "utf8").includes("DiscardedPendingOrders:2"), "作废数量要入审计");
   } finally {
     spy.restore();
+    setPendingOrderStoreForTesting(null);
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+});
+
+test("U5-R1: 同一个人又报一次号 → 幂等成功，状态一个字节都不改（不作废他正在确认的单）", async () => {
+  const sessionStore = new SessionStore();
+  const SAME_ID = "1234567890123456789"; // 与 SUCCESS_BODY 返回的一致
+  const boundAt = Date.now() - 60_000;
+  sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: SAME_ID, boundAt, boundVia: "card" });
+  setSessionStoreForTesting(sessionStore);
+  const pendingStore = new PendingOrderStore();
+  setPendingOrderStoreForTesting(pendingStore);
+  pendingStore.register("tok-mine", { finalParams: { userId: SAME_ID, storeId: 1 }, estimatedAmountFen: 2400 });
+  const { logger, logPath } = freshAuditLogger();
+  setAccessAuditLoggerForTesting(logger);
+  const spy = installFetchSpy([SUCCESS_BODY]);
+  try {
+    const result = await bindMemberHandler({ code: "13800001234", codeType: "phone" });
+    assert.strictEqual(result.isError, undefined, "同一个人重复报号不该报错");
+    const parsed = JSON.parse(result.content[0].text);
+    assert.strictEqual(parsed.rebound, undefined, "这不是换绑，不许标成换绑");
+    assert.strictEqual(parsed.boundVia, "card", "原绑定形态要保留（没换人就什么都不该改）");
+    assert.strictEqual(parsed.boundAt, beijingTimeString(boundAt), "绑定时间也不许被刷新");
+
+    assert.strictEqual(
+      pendingStore.lookup("tok-mine").status,
+      "ok",
+      "关键：顾客可能正对着这张待确认单说「就是我」——把它作废掉才是真添麻烦",
+    );
+    assert.ok(readFileSync(logPath, "utf8").includes("AlreadyBoundSamePerson"), "审计要能区分「同人重报」与首次绑定");
+  } finally {
+    spy.restore();
+    setPendingOrderStoreForTesting(null);
+    setSessionStoreForTesting(null);
+    setAccessAuditLoggerForTesting(null);
+  }
+});
+
+test("U5-R2: 有未决写请求时不许换人——否则那笔「成没成还不知道」的单就没人能核对了", async () => {
+  const sessionStore = new SessionStore();
+  const OLD_ID = "1111111111111111111";
+  sessionStore.bind(DEFAULT_SESSION_KEY, { customerId: OLD_ID, boundAt: Date.now(), boundVia: "phone" });
+  setSessionStoreForTesting(sessionStore);
+  const dir = mkdtempSync(join(tmpdir(), "licha-rebind-guard-"));
+  const guard = new WriteGuard({ auditLogPath: join(dir, "write-audit.log"), placedOrdersPath: join(dir, "placed.json") });
+  setWriteGuardForTesting(guard);
+  // 造一个「已发出、还没等到终态」的写请求（inflight 未销账）
+  guard.recordAudit({
+    path: "v3/newPattern/cateringApiserver/post/order/v1/create",
+    result: "inflight",
+    reason: "RequestAboutToBeSent",
+    tokenId: "ffffffffffffffffffffffffffffffff",
+    idempotencyKey: "a".repeat(64),
+    durationMs: 1,
+  });
+  const { logger, logPath } = freshAuditLogger();
+  setAccessAuditLoggerForTesting(logger);
+  const spy = installFetchSpy([SUCCESS_BODY]);
+  try {
+    const result = await bindMemberHandler({ code: "13900002345", codeType: "phone" });
+    assert.strictEqual(result.isError, true, "有未决写请求时换人必须被拒");
+    assert.match(result.content[0].text, /暂时不能换人/);
+    assert.match(result.content[0].text, /核对/, "要告诉顾客怎么解开：先把那一单核对掉");
+    assert.strictEqual(
+      sessionStore.getBinding(DEFAULT_SESSION_KEY)?.customerId,
+      OLD_ID,
+      "绑定必须保持在原来那位顾客身上——核对那笔未决单要用他的身份",
+    );
+    assert.ok(readFileSync(logPath, "utf8").includes("RebindBlockedByUnresolvedWrite"), "拒绝理由要入审计");
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
     setSessionStoreForTesting(null);
     setAccessAuditLoggerForTesting(null);
   }

@@ -32,7 +32,12 @@ export type AccessAuditEvent =
   // M4 新增：prepare_order 签发一次性确认令牌。记的是"这张单被确认过"这个访问控制事实
   // （谁、什么时候、多少钱、几行商品），不记商品明细——审计要能回答"有没有凭空冒出来的确认"，
   // 不需要回答"顾客点了什么"，后者属于订单数据，不该在审计日志里留副本。
-  | "token_issued";
+  | "token_issued"
+  // 2026-08-19 新增：会话从一位会员换绑到另一位（老板拍板「换人就解绑」）。
+  // 刻意与 bind_success 分开成独立事件，而不是给它加个 reason 了事——「换人」是审计上
+  // 最该一眼看见的事：谁把谁换掉了、连带作废了几张待确认单。混进 bind_success 里，
+  // 事后翻日志就得逐条读 reason 才能发现会话中途换过人。
+  | "rebind_success";
 
 export interface AccessAuditEntry {
   event: AccessAuditEvent;

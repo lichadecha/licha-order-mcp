@@ -3,16 +3,30 @@
 // 单元测试不能安全地直接 import 这个文件；处理逻辑拆到独立模块后，测试才能直接 import + mock fetch。
 //
 // 流程（顺序固定，不许变，理由见各步注释）：
-//   1. 已有绑定 → 直接拒绝，不发任何请求（一会话一次绑定，省调用且语义干净）。
-//   2. 入参格式预检 → 不合格不发请求，错误信息绝不回显 code 原值（M1 真发第二轮的教训）。
-//   3. callRead 4.2.2 查会员 ID。
-//   4. 响应解析（M1 实测形态 + 兜底分支，防止查无此人时崩溃）。
-//   5. 成功 → 绑定会话 → 审计 → 出参只含 customerId 后四位。
+//   1. 入参格式预检 → 不合格不发请求，错误信息绝不回显 code 原值（M1 真发第二轮的教训）。
+//   2. callRead 4.2.2 查会员 ID。
+//   3. 响应解析：customerId 为 0/空 = 这个号没注册过会员（2026-08-19 实测，见 isAbsentCustomerId）。
+//   4. 按「当前会话有没有人、是不是同一个人」分三条路：
+//        · 没人        → 正常绑定；
+//        · 同一个人    → 幂等成功，一个字节的状态都不改（顾客可能正在确认一张待确认单，别毁掉它）；
+//        · 换成另一个人 → 未决写请求闸门 → 作废旧顾客的待确认单 → 覆盖绑定 → 记 rebind 审计。
+//   5. 出参只含 customerId 后四位。
+//
+// 2026-08-19 行为变更（老板拍板「换人就解绑，别让用户这么麻烦」）：
+// 原先第 1 步是「已有绑定 → 直接拒绝，不发任何请求」（一会话一次绑定，连是不是同一人都不判，省一次调用）。
+// 那条规矩配的是「要换人得重开会话」这句话术——而这句话在真实宿主里做不到（MCP server 进程常驻、
+// 跨对话复用，开新对话不换会话键，§8-41）。结果它既挡不住真正的风险（手机号绑定本就无验证，
+// 第一次就能绑任何人的号，风险已于 2026-08-18 盘清并接受：最多查他人订单状态、往他人账上塞
+// 待付款单，无资金风险），又把正常换人的顾客卡死。
+// 代价是每次重复绑定都要多花一次 4.2.2 只读调用——因为不调接口就不知道新号是不是同一个人。
+// 基础类接口在免费额度内，这笔成本换掉一个卡死用户的规矩，值。
 
 import { callRead } from "./client.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
 import { beijingTimeString } from "./writeGuard.js";
-import { DEFAULT_SESSION_KEY, SessionAlreadyBound, getSessionStore, type BoundVia } from "./session.js";
+import { DEFAULT_SESSION_KEY, getSessionStore, type BoundVia } from "./session.js";
+import { getPendingOrderStore } from "./pendingOrders.js";
+import { getWriteGuard } from "./writeGuard.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -107,21 +121,7 @@ export async function bindMemberHandler({ code, codeType }: BindMemberInput): Pr
   const audit = getAccessAuditLogger();
 
   try {
-    // ① 已有绑定 → 直接拒绝，不发任何请求。
-    const existing = sessionStore.getBinding(DEFAULT_SESSION_KEY);
-    if (existing) {
-      audit.record({
-        event: "bind_rejected",
-        result: "rejected",
-        reason: "AlreadyBound",
-        customerIdLast4: `***${existing.customerId.slice(-4)}`,
-        sessionKey: DEFAULT_SESSION_KEY,
-        tool: "bind_member",
-      });
-      return fail(new SessionAlreadyBound(existing));
-    }
-
-    // ② 入参格式预检 → 不合格不发请求。
+    // ① 入参格式预检 → 不合格不发请求。
     const validated = validateCodeFormat(code, codeType);
     if (!validated.ok) {
       audit.record({
@@ -136,12 +136,12 @@ export async function bindMemberHandler({ code, codeType }: BindMemberInput): Pr
     const trimmedCode = validated.trimmed;
     const codeLast4 = `***${trimmedCode.slice(-4)}`;
 
-    // ③ callRead 4.2.2 会员标识查会员ID。
+    // ② callRead 4.2.2 会员标识查会员ID。
     const resp = await callRead<unknown>("v3/crm/customer/getCustomerIdByCode", {
       customerCode: { code: trimmedCode, type: CODE_TYPE_MAP[codeType] },
     });
 
-    // ④ 响应解析：拿不到 customerId 或 ok=false → 兜底分支，稳定不崩溃。
+    // ③ 响应解析：拿不到 customerId 或 ok=false → 兜底分支，稳定不崩溃。
     const customerId = resp.ok ? extractCustomerId(resp.data) : undefined;
     if (!resp.ok || !customerId) {
       audit.record({
@@ -174,22 +174,95 @@ export async function bindMemberHandler({ code, codeType }: BindMemberInput): Pr
       );
     }
 
-    // ⑤ 成功 → 绑定会话 → 审计 → 出参只含后四位。
-    const boundAt = Date.now();
-    // 手机号只在 codeType==="phone" 时才有（另两种形态拿到的是卡号/动态码，不是电话）。
+    // ④ 三条路：没人 / 同一个人 / 换成另一个人。
+    const customerIdLast4 = `***${customerId.slice(-4)}`;
+    const existing = sessionStore.getBinding(DEFAULT_SESSION_KEY);
+
+    // ④-a 同一个人又报了一次（顾客重复报号、模型多调一次）→ 幂等成功，**状态一个字节都不改**。
+    // 为什么不走换绑分支：换绑要作废待确认单，而这里根本没换人——顾客可能正对着一张
+    // 待确认单说「就是我，138…」，把他的单作废掉才是真的添麻烦。
+    if (existing && existing.customerId === customerId) {
+      audit.record({
+        event: "bind_success",
+        result: "allowed",
+        reason: "AlreadyBoundSamePerson",
+        codeLast4,
+        customerIdLast4,
+        sessionKey: DEFAULT_SESSION_KEY,
+        tool: "bind_member",
+      });
+      return ok({
+        bound: true,
+        customerIdLast4,
+        boundVia: existing.boundVia,
+        boundAt: beijingTimeString(existing.boundAt),
+        note: "本会话原本绑的就是这一位会员，无需重新绑定。",
+      });
+    }
+
+    // ④-b 换成另一个人之前，先过未决写请求闸门。
+    // 为什么必须拦：如果上一单「发出去了但结果未知」（网络异常/5xx/进程被杀在半途），
+    // 解开它的唯一办法是用**当时那个人的身份**去 my_orders / get_order_status 读回销账。
+    // 一换绑，那条核对通路就断了——未决状态会一直悬着，而 place_order 的第 ⑥ 步闸门是全局的，
+    // 新顾客同样下不了单。也就是说放行换绑并不能让新顾客用上，只是把问题埋起来。
+    if (existing) {
+      const guard = getWriteGuard();
+      if (guard.hasUnresolvedWrite()) {
+        const info = guard.describeUnresolvedWrites();
+        audit.record({
+          event: "bind_rejected",
+          result: "rejected",
+          reason: `RebindBlockedByUnresolvedWrite:unknown=${info.unknown}:inflight=${info.inflight}`,
+          codeLast4,
+          customerIdLast4: `***${existing.customerId.slice(-4)}`,
+          sessionKey: DEFAULT_SESSION_KEY,
+          tool: "bind_member",
+        });
+        return fail(
+          new Error(
+            `暂时不能换人：上一次下单请求的结果还没核对清楚（${info.total} 笔状态未知` +
+              `${info.earliestTime ? `，最早一笔发生在 ${info.earliestTime}` : ""}）。\n` +
+              `先用「我那单怎么样了」或「看看我最近的订单」把那一单核对掉，再换人——` +
+              `否则那笔单到底成没成就没人能确认了。`,
+          ),
+        );
+      }
+    }
+
+    // ④-c 落绑定。手机号只在 codeType==="phone" 时才有（另两种形态拿到的是卡号/动态码，不是电话）。
     // 用条件展开而不是 `phone: codeType === "phone" ? trimmedCode : undefined`——后者会在对象里
     // 留下一个值为 undefined 的 phone 键，JSON.stringify 虽然会丢掉它，但 `"phone" in binding`
     // 之类的判断会被它骗过去。没有就是没有这个键。
-    sessionStore.bind(DEFAULT_SESSION_KEY, {
+    const boundAt = Date.now();
+    const nextBinding = {
       customerId,
       boundAt,
       boundVia: codeType,
       ...(codeType === "phone" ? { phone: trimmedCode } : {}),
-    });
-    const customerIdLast4 = `***${customerId.slice(-4)}`;
+    };
+
+    if (!existing) {
+      sessionStore.bind(DEFAULT_SESSION_KEY, nextBinding);
+      audit.record({
+        event: "bind_success",
+        result: "allowed",
+        codeLast4,
+        customerIdLast4,
+        sessionKey: DEFAULT_SESSION_KEY,
+        tool: "bind_member",
+      });
+      return ok({ bound: true, customerIdLast4, boundVia: codeType, boundAt: beijingTimeString(boundAt) });
+    }
+
+    // 换人：先作废旧顾客的待确认单（见 PendingOrderStore.discardByUserId 注释），再覆盖绑定。
+    // 顺序很重要——先覆盖再作废的话，就得记着旧 userId 是谁，多一个出错的机会。
+    const discarded = getPendingOrderStore().discardByUserId(existing.customerId);
+    const previousLast4 = `***${existing.customerId.slice(-4)}`;
+    sessionStore.rebind(DEFAULT_SESSION_KEY, nextBinding);
     audit.record({
-      event: "bind_success",
+      event: "rebind_success",
       result: "allowed",
+      reason: `PreviousCustomer:${previousLast4}:DiscardedPendingOrders:${discarded}`,
       codeLast4,
       customerIdLast4,
       sessionKey: DEFAULT_SESSION_KEY,
@@ -200,6 +273,12 @@ export async function bindMemberHandler({ code, codeType }: BindMemberInput): Pr
       customerIdLast4,
       boundVia: codeType,
       boundAt: beijingTimeString(boundAt),
+      rebound: true,
+      previousCustomerIdLast4: previousLast4,
+      discardedPendingOrders: discarded,
+      note:
+        `已从${previousLast4}换成${customerIdLast4}。` +
+        (discarded > 0 ? `原来那位顾客还没确认的 ${discarded} 张单已作废，需要重新组单。` : ""),
     });
   } catch (e) {
     return fail(e);

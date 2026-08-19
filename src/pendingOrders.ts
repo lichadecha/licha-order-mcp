@@ -89,6 +89,28 @@ export class PendingOrderStore {
   }
 
   /** 物理清除全部已过期条目。register 时自动调用；也可由测试直接触发。 */
+  /**
+   * 作废某个会员名下的全部待确认单，返回作废条数。
+   *
+   * 什么时候用：会话换绑到另一位会员时（2026-08-19 老板拍板「换人就解绑」）。
+   *
+   * 为什么必须做，即便 place_order 已经挡得住：定稿 handler 的第 ⑤ 步会比对「登记单的 userId
+   * 是否等于当前会话绑定值」，换绑后旧令牌本来就下不了单。但**留着它是脏状态**——
+   * 万一又换回原来那位会员，那张早已被顾客忘掉的待确认单就"复活"了，5 分钟 TTL 内它还能下单。
+   * 「顾客确认过的单」和「顾客几分钟前确认、中间换了两个人、现在突然生效的单」不是一回事。
+   * 换人即作废，语义干净。
+   */
+  discardByUserId(userId: string): number {
+    let discarded = 0;
+    for (const [tokenId, order] of this.entries) {
+      if (String(order.finalParams.userId ?? "") === userId) {
+        this.entries.delete(tokenId);
+        discarded++;
+      }
+    }
+    return discarded;
+  }
+
   pruneExpired(): void {
     for (const [id, entry] of this.entries) {
       if (this.isExpired(entry)) this.entries.delete(id);

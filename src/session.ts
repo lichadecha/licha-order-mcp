@@ -80,6 +80,28 @@ export class SessionStore {
     this.bindings.set(sessionKey, binding);
   }
 
+  /**
+   * 换绑：覆盖该会话的既有绑定，返回被替换掉的旧绑定（原本没绑定则返回 undefined）。
+   *
+   * 与 bind 的分工（刻意做成两个方法，而不是给 bind 加一个布尔开关）：
+   *   · bind   = 「这个会话还没人，把人绑上」——已有绑定时抛错，永远不覆盖；
+   *   · rebind = 「明知有人，换成另一个」——调用方必须已经想清楚旧绑定该怎么处置。
+   * 方法名本身就是一道提醒：能覆盖身份的操作不该长得跟普通绑定一样。
+   *
+   * 2026-08-19 老板拍板「换人就解绑」后新增。原先的规矩是「绑定后不可切换，要换人得重开会话」——
+   * 那句话在真实宿主里做不到（MCP server 进程常驻、跨对话复用，开新对话不换会话键，见 §8-41），
+   * 于是它既挡不住真正的风险（手机号绑定本就无验证，第一次就能绑任何人的号，风险已于
+   * 2026-08-18 盘清并接受），又把正常换人的顾客卡死。
+   *
+   * 注意：本方法只管会话态。换绑连带的「作废旧顾客的待确认单」「未决写请求时不许换人」
+   * 由 bindMemberTool 负责——那是业务编排，不该埋在存储层。
+   */
+  rebind(sessionKey: string, binding: SessionBinding): SessionBinding | undefined {
+    const previous = this.bindings.get(sessionKey);
+    this.bindings.set(sessionKey, binding);
+    return previous;
+  }
+
   /** 返回该会话的绑定（若有），不存在返回 undefined。不抛错，供"允许未绑定"的调用方自行判断。 */
   getBinding(sessionKey: string): SessionBinding | undefined {
     return this.bindings.get(sessionKey);

@@ -14,9 +14,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+import { createHash } from "node:crypto";
 import { setReadAuditLogPathForTesting } from "../src/client.js";
 import { ORDER_GUARD } from "../src/constants.js";
 import { WriteGuard, setWriteGuardForTesting } from "../src/writeGuard.js";
@@ -182,6 +183,27 @@ function bindSessionWithoutPhone(boundVia: "card" | "dynamic_code" = "dynamic_co
   store.bind(DEFAULT_SESSION_KEY, { customerId: FAKE_CUSTOMER_ID, boundAt: Date.now(), boundVia });
   setSessionStoreForTesting(store);
 }
+
+/**
+ * 生产 logs/ 目录的哈希快照（文件名 + 内容 md5，按名排序）。判据体例与
+ * auditSanitizer.test.ts / handlerInputSanitizer.test.ts 完全一致——「测试不许碰生产 logs/」
+ * 这条红线在 M2/M3 各破过一次，全项目只该有一份判据。
+ */
+function snapshotProdLogs(): string {
+  const dir = join(process.cwd(), "logs");
+  if (!existsSync(dir)) return "<no-logs-dir>";
+  return readdirSync(dir)
+    .sort()
+    .map((f) => {
+      const p = join(dir, f);
+      if (!statSync(p).isFile()) return `${f}:<dir>`;
+      return `${f}:${createHash("md5").update(readFileSync(p)).digest("hex")}`;
+    })
+    .join("\n");
+}
+
+/** 模块加载时（任何用例跑之前）拍一张，文件末尾的红线自证用它比对。 */
+const PROD_LOGS_SNAPSHOT_AT_START = snapshotProdLogs();
 
 function textOf(r: { content: Array<{ type: "text"; text: string }> }): string {
   return r.content.map((c) => c.text).join("\n");
@@ -1101,14 +1123,17 @@ test("V12: 令牌 TTL 过期后，待确认单登记表在下一次登记时被�
 // ============================================================================
 // 红线自证：本文件跑完后，生产 logs/ 目录不该被碰过
 // ============================================================================
-test("红线自证：本测试文件全程零真实网络请求，且未在生产 logs/ 目录留下任何文件", () => {
+test("红线自证：本测试文件全程零真实网络请求，且生产 logs/ 一字未变", () => {
   // globalThis.fetch 在每条用例的 finally 里都恢复成 realFetch，这里确认没有残留的 mock。
   assert.equal(globalThis.fetch, realFetch, "mock fetch 应已全部恢复");
-  // 生产写审计/幂等文件不该因为本文件的执行而被创建（四件套注入全部指向临时目录）。
-  const prodWriteAudit = join(process.cwd(), "logs", "write-audit.log");
-  const prodPlaced = join(process.cwd(), "logs", "placed-orders.json");
-  const prodAccess = join(process.cwd(), "logs", "access-audit.log");
-  for (const p of [prodWriteAudit, prodPlaced, prodAccess]) {
-    assert.ok(!existsSync(p), `本轮测试不该创建生产日志文件：${p}`);
-  }
+  // 判据 2026-08-19 升级：原先断言的是「write-audit.log / placed-orders.json / access-audit.log
+  // 三个生产文件**不存在**」。那个判据依赖一个此后不再成立的前提——写侧从未真跑过。
+  // M6 真单一跑（老板 2026-08-19 实测，日志按 LICHA_LOG_DIR 钉在项目 logs/），三个文件就都真实存在了，
+  // 于是这条用例会永久变红，而它本该守的东西根本没被破坏。
+  //
+  // 换成哈希快照对比——这才是红线的原意：「测试不许**改动**生产 logs/」，
+  // 而不是「生产 logs/ 不许存在」。顺带比原判据更严：「不存在」只挡得住从无到有，
+  // 快照连「已有文件被追加一行」都挡得住。体例与 auditSanitizer.test.ts / handlerInputSanitizer.test.ts
+  // 的同类用例统一，全项目一份判据。
+  assert.equal(snapshotProdLogs(), PROD_LOGS_SNAPSHOT_AT_START, "本测试文件跑完后生产 logs/ 必须一字未变");
 });
