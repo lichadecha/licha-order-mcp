@@ -32,7 +32,12 @@ function installFetchSpy(): { count: () => number; restore: () => void } {
   };
 }
 
-test("T9: 重启后当日计数从写审计日志重建，第 6 单仍被拒", async () => {
+// T9 语义 2026-08-19 随两层护栏调整：本用例全程用同一个 userId（"u1"），撞的是
+// **按顾客**那层额度（maxOrdersPerDayPerCustomer）。改造前全局值是 5、循环 5 次刚好撞线；
+// 改造后全局提到 10，循环必须改成按顾客的上限，否则第 6 次就先被顾客维度拦住、
+// 断言「第 6 单应成功」当场失败——这正是本次改动的正确行为，不是回归。
+// 全局那层的重建由紧随其后的 T9b 覆盖（用多个不同 userId 撑满全局）。
+test("T9: 重启后当日「按顾客」计数从写审计日志重建，同一顾客第 6 单仍被拒", async () => {
   const dir = mkdtempSync(join(tmpdir(), "licha-wg-t9-"));
   const auditLogPath = join(dir, "write-audit.log");
   const placedOrdersPath = join(dir, "placed-orders.json");
@@ -42,13 +47,13 @@ test("T9: 重启后当日计数从写审计日志重建，第 6 单仍被拒", a
     // 第一个 guard 实例：跑满当日 5 单，全部走真实 callWrite 链路（只有 fetch 被 mock）。
     const guard1 = new WriteGuard({ auditLogPath, placedOrdersPath });
     setWriteGuardForTesting(guard1);
-    for (let i = 0; i < ORDER_GUARD.maxOrdersPerDay; i++) {
+    for (let i = 0; i < ORDER_GUARD.maxOrdersPerDayPerCustomer; i++) {
       const params = { storeId: 1, items: [{ goodsId: `g${i}`, skuId: "s", num: 1 }], orderType: 1, source: 18, userId: "u1" };
       const { tokenId } = guard1.issueConfirmToken(params);
       const r = await callWrite(WRITE_WHITELIST[0], params, { amountFen: 100, confirmToken: tokenId });
       assert.strictEqual(r.ok, true, `第 ${i + 1} 单应成功`);
     }
-    assert.strictEqual(spy.count(), ORDER_GUARD.maxOrdersPerDay);
+    assert.strictEqual(spy.count(), ORDER_GUARD.maxOrdersPerDayPerCustomer);
 
     // 模拟"进程重启"：不复用 guard1，构造一个全新的 WriteGuard 实例指向同一份审计日志。
     // 这就是本用例要证明的核心——计数不是从 guard1 的内存里继承来的，而是 guard2 自己重新读文件算出来的。
@@ -62,7 +67,66 @@ test("T9: 重启后当日计数从写审计日志重建，第 6 单仍被拒", a
       (err: unknown) => err instanceof WriteGuardRejected && /DailyLimitExceeded/.test((err as Error).message),
       "重启后的新实例应该仍然认为当日已达上限",
     );
-    assert.strictEqual(spy.count(), ORDER_GUARD.maxOrdersPerDay, "第 6 单不应真的发出请求——重启没能绕过护栏");
+    assert.strictEqual(
+      spy.count(),
+      ORDER_GUARD.maxOrdersPerDayPerCustomer,
+      "第 6 单不应真的发出请求——重启没能绕过护栏",
+    );
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
+  }
+});
+
+// T9b（2026-08-19 新增）：全局那层的重建。用**不同的 userId** 逐单下，每位顾客都不撞
+// 自己的 5 单额度，专门把全局 10 单撑满；重启后第 11 单必须被全局层拦住。
+// 为什么必须单独测：两层计数是两个 Map，重建时各走一遍——只测一层的话，
+// 另一层在重启后静默清零也发现不了（§8-24 踩过的正是这种「护栏看起来还在」）。
+test("T9b: 重启后当日「全局」计数从写审计日志重建，第 11 单被全局层拒", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "licha-wg-t9b-"));
+  const auditLogPath = join(dir, "write-audit.log");
+  const placedOrdersPath = join(dir, "placed-orders.json");
+
+  const spy = installFetchSpy();
+  try {
+    const guard1 = new WriteGuard({ auditLogPath, placedOrdersPath });
+    setWriteGuardForTesting(guard1);
+    // 每单换一位顾客 → 谁都没到 5 单，但全局 10 单被撑满。
+    for (let i = 0; i < ORDER_GUARD.maxOrdersPerDay; i++) {
+      const params = {
+        storeId: 1,
+        items: [{ goodsId: `gb${i}`, skuId: "s", num: 1 }],
+        orderType: 1,
+        source: 18,
+        userId: `cust-${i}`,
+      };
+      const { tokenId } = guard1.issueConfirmToken(params);
+      const r = await callWrite(WRITE_WHITELIST[0], params, { amountFen: 100, confirmToken: tokenId });
+      assert.strictEqual(r.ok, true, `第 ${i + 1} 单应成功（各顾客都没撞自己的额度）`);
+    }
+    assert.strictEqual(spy.count(), ORDER_GUARD.maxOrdersPerDay);
+
+    // 重启：全新实例读同一份日志
+    const guard2 = new WriteGuard({ auditLogPath, placedOrdersPath });
+    setWriteGuardForTesting(guard2);
+
+    // 第 11 单换一位**全新**顾客——他自己一单都没下过，只可能被全局层拦住。
+    const paramsN = {
+      storeId: 1,
+      items: [{ goodsId: "gb-fresh", skuId: "s", num: 1 }],
+      orderType: 1,
+      source: 18,
+      userId: "cust-brand-new",
+    };
+    const { tokenId: tokenN } = guard2.issueConfirmToken(paramsN);
+    await assert.rejects(
+      () => callWrite(WRITE_WHITELIST[0], paramsN, { amountFen: 100, confirmToken: tokenN }),
+      (err: unknown) =>
+        err instanceof WriteGuardRejected &&
+        /DailyLimitExceeded:global/.test((err as Error).message),
+      "重启后新实例应仍认为全局额度已满，且理由要指明是 global 那一层",
+    );
+    assert.strictEqual(spy.count(), ORDER_GUARD.maxOrdersPerDay, "第 11 单不应真的发出请求");
   } finally {
     spy.restore();
     setWriteGuardForTesting(null);

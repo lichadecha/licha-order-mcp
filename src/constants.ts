@@ -41,7 +41,17 @@ export const WRITE_WHITELIST: readonly string[] = [
 
 export const ORDER_GUARD = {
   maxAmountFen: 10000, // 单笔 ≤ ¥100
-  maxOrdersPerDay: 5, // 单日 ≤ 5 单（北京时间自然日）
+  // 单日笔数护栏改成**两层**（2026-08-19 老板拍板，§8-30 登记的三期项提前做）：
+  //   · maxOrdersPerDayPerCustomer —— **按顾客**计数，主护栏。防的是「有人冒用你的手机号，
+  //     往你账上批量塞待付款单打扰你」；数值取 5 是为了让**单顾客体验一点不变**
+  //     （改造前的全局值就是 5，一个人用的场景与改造前完全等价）。
+  //   · maxOrdersPerDay —— **全局**总闸，防的是另一件事：AI 对多个身份失控。
+  //     从 5 提到 10，否则换绑后两位顾客各自没到 5 单就先被全局闸拦住，
+  //     「按顾客独立计数」等于没生效。
+  // 两层任一撞线即拒，拒绝理由都以 DailyLimitExceeded 开头（后缀区分维度）——
+  // 前缀保持不变是硬约束：总工验收文件 m4AcceptanceGauntlet 的 G4 断言了这个前缀，那份文件一行不动。
+  maxOrdersPerDayPerCustomer: 5, // 每位顾客单日 ≤ 5 单（北京时间自然日）
+  maxOrdersPerDay: 10, // 全局单日 ≤ 10 单（试验期总闸）
   confirmTokenTtlMs: 5 * 60 * 1000, // 确认令牌 5 分钟
 } as const;
 

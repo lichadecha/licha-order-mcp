@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { callWrite, WriteGuardRejected } from "../src/client.js";
 import { WRITE_WHITELIST, ORDER_GUARD } from "../src/constants.js";
-import { WriteGuard, setWriteGuardForTesting, fingerprint } from "../src/writeGuard.js";
+import { customerCountKey, WriteGuard, setWriteGuardForTesting, fingerprint } from "../src/writeGuard.js";
 
 // 假凭证：仅供本文件内会真正发出 mock fetch 的用例使用（T8 的第一次调用、T11）。
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
@@ -168,6 +168,104 @@ test("T11: 白名单路径 + 合法令牌 + 金额合规 → callWrite 返回 mo
     assert.strictEqual(entry.orderNo, "D-MOCK-1");
     assert.strictEqual(entry.summary.estimatedAmountFen, 2400);
     assert.strictEqual(entry.summary.storeId, 503542);
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
+  }
+});
+
+// ============================================================================
+// 按顾客维度的频次护栏（2026-08-19 老板拍板：「回头想绑谁就绑谁，批量生成订单总会造成打扰」）
+// ============================================================================
+// 改造前：单日 ≤5 单是**全局**计数，不分人——冒用者往某人账上塞 5 单就把所有人的额度用光了，
+// 反过来说也挡不住「专门针对某一个人塞满 5 单」。改造后两层：每人 5 单 + 全局 10 单。
+// 这三条守的是三件不同的事，别合并。
+
+test("PC1: 两位顾客的额度互不占用——A 用满 5 单，B 的第 1 单照样能下", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "licha-pc1-"));
+  const guard = new WriteGuard({ auditLogPath: join(dir, "write-audit.log"), placedOrdersPath: join(dir, "placed.json") });
+  setWriteGuardForTesting(guard);
+  const spy = installFetchSpy();
+  try {
+    for (let i = 0; i < ORDER_GUARD.maxOrdersPerDayPerCustomer; i++) {
+      const params = { storeId: 1, items: [{ goodsId: `a${i}`, skuId: "s", num: 1 }], orderType: 1, source: 18, userId: "1111111111111111111" };
+      const { tokenId } = guard.issueConfirmToken(params);
+      assert.strictEqual((await callWrite(WRITE_WHITELIST[0], params, { amountFen: 100, confirmToken: tokenId })).ok, true);
+    }
+    // A 再下一单 → 撞自己的额度
+    const aMore = { storeId: 1, items: [{ goodsId: "a-more", skuId: "s", num: 1 }], orderType: 1, source: 18, userId: "1111111111111111111" };
+    const { tokenId: tA } = guard.issueConfirmToken(aMore);
+    await assert.rejects(
+      () => callWrite(WRITE_WHITELIST[0], aMore, { amountFen: 100, confirmToken: tA }),
+      (e: unknown) => e instanceof WriteGuardRejected && /DailyLimitExceeded:perCustomer/.test((e as Error).message),
+      "A 超出自己的额度，理由要指明是 perCustomer 那一层",
+    );
+
+    // B 是另一位顾客，一单都没下过 → **必须放行**。这是整个改造的意义：
+    // 改造前 A 用满 5 单就把全局额度吃光，B 会被误拒。
+    const bFirst = { storeId: 1, items: [{ goodsId: "b1", skuId: "s", num: 1 }], orderType: 1, source: 18, userId: "2222222222222222222" };
+    const { tokenId: tB } = guard.issueConfirmToken(bFirst);
+    assert.strictEqual(
+      (await callWrite(WRITE_WHITELIST[0], bFirst, { amountFen: 100, confirmToken: tB })).ok,
+      true,
+      "B 的额度不该被 A 占掉——改造前这里会被误拒",
+    );
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
+  }
+});
+
+test("PC2: 全局总闸仍然有效——各顾客都没撞自己的额度，但全局满了就拒，且理由指明 global", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "licha-pc2-"));
+  const guard = new WriteGuard({ auditLogPath: join(dir, "write-audit.log"), placedOrdersPath: join(dir, "placed.json") });
+  setWriteGuardForTesting(guard);
+  const spy = installFetchSpy();
+  try {
+    for (let i = 0; i < ORDER_GUARD.maxOrdersPerDay; i++) {
+      const params = { storeId: 1, items: [{ goodsId: `g${i}`, skuId: "s", num: 1 }], orderType: 1, source: 18, userId: `cust-${i}` };
+      const { tokenId } = guard.issueConfirmToken(params);
+      assert.strictEqual((await callWrite(WRITE_WHITELIST[0], params, { amountFen: 100, confirmToken: tokenId })).ok, true);
+    }
+    const fresh = { storeId: 1, items: [{ goodsId: "fresh", skuId: "s", num: 1 }], orderType: 1, source: 18, userId: "cust-fresh" };
+    const { tokenId } = guard.issueConfirmToken(fresh);
+    await assert.rejects(
+      () => callWrite(WRITE_WHITELIST[0], fresh, { amountFen: 100, confirmToken: tokenId }),
+      (e: unknown) => e instanceof WriteGuardRejected && /DailyLimitExceeded:global/.test((e as Error).message),
+      "全新顾客自己没下过单，只可能被全局层拦住",
+    );
+    assert.strictEqual(spy.count(), ORDER_GUARD.maxOrdersPerDay);
+  } finally {
+    spy.restore();
+    setWriteGuardForTesting(null);
+  }
+});
+
+test("PC3: 写审计里落的是不可逆哈希、不是会员 ID——按顾客计数不能靠泄露身份换来", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "licha-pc3-"));
+  const auditLogPath = join(dir, "write-audit.log");
+  const guard = new WriteGuard({ auditLogPath, placedOrdersPath: join(dir, "placed.json") });
+  setWriteGuardForTesting(guard);
+  const spy = installFetchSpy();
+  const REAL_LOOKING_ID = "1288634197238501377"; // 19 位，真实会员 ID 的形态
+  try {
+    const params = { storeId: 1, items: [{ goodsId: "x", skuId: "s", num: 1 }], orderType: 1, source: 18, userId: REAL_LOOKING_ID };
+    const { tokenId } = guard.issueConfirmToken(params);
+    assert.strictEqual((await callWrite(WRITE_WHITELIST[0], params, { amountFen: 100, confirmToken: tokenId })).ok, true);
+
+    const log = readFileSync(auditLogPath, "utf8");
+    assert.ok(!log.includes(REAL_LOOKING_ID), "审计日志不许出现完整会员 ID");
+    // 落的是 16 位 hex 哈希：既能区分顾客（尾四位会碰撞，哈希不会），又不可逆。
+    const line = JSON.parse(log.trim().split("\n").pop() as string);
+    assert.match(String(line.customerKey), /^[0-9a-f]{16}$/, "customerKey 应是 16 位 hex");
+    assert.strictEqual(line.customerKey, customerCountKey(REAL_LOOKING_ID), "应与 customerCountKey 算出的一致");
+
+    // 反向确认判据本身有分辨力：不同 ID 必须算出不同键，否则两位顾客会共用额度。
+    assert.notStrictEqual(customerCountKey("1111111111111111111"), customerCountKey("2222222222222222222"));
+    // 0 与空值不构成有效顾客身份（同 bindMemberTool.isAbsentCustomerId 的口径）
+    assert.strictEqual(customerCountKey(0), undefined);
+    assert.strictEqual(customerCountKey("0"), undefined);
+    assert.strictEqual(customerCountKey(null), undefined);
   } finally {
     spy.restore();
     setWriteGuardForTesting(null);

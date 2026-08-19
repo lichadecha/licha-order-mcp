@@ -5,7 +5,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { BASE_URL, ENABLE_ORDERING_ENV, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
 import { loadCredentials, sign, type Credentials } from "./auth.js";
-import { fingerprint, getWriteGuard, PHONE_RE, untrustedAuditValue, type WriteAuditSummary } from "./writeGuard.js";
+import { customerCountKey, fingerprint, getWriteGuard, PHONE_RE, untrustedAuditValue, type WriteAuditSummary } from "./writeGuard.js";
 import { logFilePath } from "./logPaths.js";
 
 export class ReadOnlyViolation extends Error {
@@ -265,10 +265,17 @@ export async function callWrite<T = unknown>(
   // 判据（同第三轮原则）：明文权看**来源**，不看长相。isLocallyIssued 查的是令牌仓库里
   // 有没有这条记录，记录只可能由 issueConfirmToken 写入——外部拼一串合格的 32 位 hex
   // （内嵌会员 ID 也照样能拼）进来必然判 false，只留尾四位。
+  // customerKey（2026-08-19）：顾客维度频次计数用的不可逆哈希，来源是 params.userId
+  // （由 prepare_order 从会话绑定注入，模型碰不到）。放进 auditBase 而不是只在某几条路径上加，
+  // 理由与 tokenId 明文判定同款：写通道的所有审计路径都从这个底座派生，加在这里等于一次性覆盖
+  // 「拒绝 / inflight / 成功 / 失败 / unknown」全部形态——重启后按顾客重建计数才不会漏记。
+  // 值为 undefined 时（无 userId / userId 为 0）审计里不出现该字段，护栏退回只查全局。
+  const customerKey = customerCountKey((params as Record<string, unknown>).userId);
   const auditBase = {
     path,
     tokenId: guard.isLocallyIssued(opts.confirmToken) ? opts.confirmToken : untrustedAuditValue(opts.confirmToken),
     summary,
+    ...(customerKey ? { customerKey } : {}),
   };
 
   // ⓪ 写能力开关兜底（M5 前置修复第 3 项 c）：env ≠ "1" 直接拒绝。
@@ -306,7 +313,8 @@ export async function callWrite<T = unknown>(
   }
 
   // ③ 频次护栏（北京时间自然日，启动时已从写审计日志重建，重启绕不过）
-  const dailyCheck = guard.checkDailyLimit();
+  // 2026-08-19 起是两层：先查这位顾客的额度（防冒用者往某人账上批量塞单），再查全局总闸。
+  const dailyCheck = guard.checkDailyLimit(customerKey);
   if (!dailyCheck.ok) {
     guard.recordAudit({ ...auditWithKey, result: "rejected", reason: dailyCheck.reason, durationMs: Date.now() - t0 });
     throw new WriteGuardRejected(dailyCheck.reason);

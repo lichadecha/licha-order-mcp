@@ -258,6 +258,7 @@ test("R6: AUDIT_PLAIN_KEYS 逐键喂格式不符的恶意值 → 全部脱敏；
     path: `v3/order/status?phone=${FAKE_PHONE}`, // 不是白名单成员（典型的 query 夹带形态）
     time: `随手写的时间 ${OTHER_MEMBER_ID}`, // 不是北京时间戳格式
     dateKey: OTHER_MEMBER_ID, // 不是 YYYY-MM-DD
+    customerKey: OTHER_MEMBER_ID, // 不是 16 位 hex（真值是 sha256(userId) 前 16 位）
   };
   // 覆盖完整性：白名单里每一个键都在探针里被测到，将来加键漏测会在这里失败。
   for (const key of AUDIT_PLAIN_KEYS) {

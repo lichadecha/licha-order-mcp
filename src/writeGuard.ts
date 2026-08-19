@@ -57,6 +57,21 @@ export function beijingTimeString(ts: number = Date.now()): string {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} +08:00`;
 }
 
+// ---------- 顾客维度计数键：sha256(userId) 前 16 hex ----------
+//
+// 为什么要哈希而不是直接用 userId：完整会员 ID 落盘违 §8-26 硬纪律。
+// 为什么不用尾四位：四位数字一万分之一就碰撞，两个不同顾客会共用同一份额度——护栏算错额度
+// 比没有护栏更糟（它看起来还在工作）。哈希唯一、不可逆、格式固定，三个要求一起满足。
+//
+// 传进来的 userId 可能是 number（大数 ID 在 JS 里已被字符串化，但不假设调用方一定做了）——
+// 统一 String() 后再哈希，避免 123 与 "123" 算出两个键。
+export function customerCountKey(userId: unknown): string | undefined {
+  if (userId == null) return undefined;
+  const s = String(userId).trim();
+  if (!s || s === "0") return undefined; // 0/空 = 没有有效顾客身份（见 bindMemberTool.isAbsentCustomerId）
+  return createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
 // ---------- 内容指纹：sha256(规范化 JSON) ----------
 // 规范化 = 递归按键排序，保证同一份内容无论字段书写顺序如何都得到同一个指纹。
 function sortKeysDeep(value: unknown): unknown {
@@ -146,7 +161,11 @@ export function maskDeep(value: unknown): unknown {
 // 现在的规则：命中白名单键 **且** 值符合该键的既定格式 → 原样保留；命中键但值不符格式
 // → 掉回普通 sanitizer（脱敏后落盘），绝不明文放行。格式判据全部来自实测/本地签发形态，
 // 见下方每条校验函数上的注释。
-export const AUDIT_PLAIN_KEYS = ["orderNo", "tokenId", "idempotencyKey", "resolvedKeys", "path", "time", "dateKey"] as const;
+// customerKey（2026-08-19 加）：顾客维度计数用的**不可逆哈希**，不是识别值。
+// 为什么不直接落 userId：那是完整会员 ID，落盘违 §8-26；为什么不落尾四位：
+// 四位数字一万分之一就碰撞，两个不同顾客会共用同一份额度——护栏会算错。
+// sha256 取前 16 hex 既唯一又不可逆，且格式校验能把它和别的东西区分开。
+export const AUDIT_PLAIN_KEYS = ["orderNo", "tokenId", "idempotencyKey", "resolvedKeys", "path", "time", "dateKey", "customerKey"] as const;
 export type AuditPlainKey = (typeof AUDIT_PLAIN_KEYS)[number];
 type PlainValueValidator = (value: unknown) => boolean;
 
@@ -185,6 +204,7 @@ const AUDIT_PLAIN_VALIDATOR_TABLE: Readonly<Record<AuditPlainKey, PlainValueVali
   path: (v) => isPlainString(v) && AUDIT_PLAIN_PATHS.has(v),
   time: (v) => isPlainString(v) && AUDIT_TIME_RE.test(v),
   dateKey: (v) => isPlainString(v) && AUDIT_DATE_KEY_RE.test(v),
+  customerKey: (v) => isPlainString(v) && /^[0-9a-f]{16}$/.test(v),
 };
 
 // 运行时查表故意用 Map 而不是直接对普通对象取属性：对象取属性会命中 Object 原型链——
@@ -341,6 +361,11 @@ export interface WriteAuditEntry {
   code?: number | string | null;
   /** 仅 result="resolved" 用：本次被解除未决状态的幂等键清单。重建时按它清账。 */
   resolvedKeys?: string[] | null;
+  /**
+   * 顾客维度频次计数键（2026-08-19）：`customerCountKey(userId)` 的结果，16 位 hex，不可逆。
+   * 缺省时该条记录只推进全局计数——不静默放行、也不误拒。
+   */
+  customerKey?: string;
   durationMs: number;
 }
 
@@ -354,8 +379,14 @@ export class WriteGuard {
   private tokens = new Map<string, TokenRecord>();
   private placedOrders = new Map<string, { orderNo: string; at: number }>();
   private dailyCounts = new Map<string, number>(); // beijingDateKey -> 当日已结算占额（allowed + unknown）
+  // `${dateKey}|${customerKey}` -> 该顾客当日已结算占额。与 dailyCounts 并行维护、同一个状态机推进，
+  // 两者不可能各自漂移（实时写入与重启重建都只走 applyAuditToState 这一条路）。
+  private customerDailyCounts = new Map<string, number>();
   /** 已落 inflight、还没等到任何终态的写请求：idempotencyKey -> 该请求所属北京时间自然日。 */
-  private unresolvedInflight = new Map<string, string>();
+  // idempotencyKey -> { dateKey, customerKey }。2026-08-19 从「只存 dateKey」扩成对象：
+  // 未决 inflight 同样占额度（代价发生在请求发出那一刻），按顾客计数时也必须算进对应顾客头上，
+  // 只存 dateKey 就没法归属到人。customerKey 可能缺失（历史日志、或调用方没传），缺失时只计全局。
+  private unresolvedInflight = new Map<string, { dateKey: string; customerKey?: string }>();
   /** 终态为「结果未知」的写请求：idempotencyKey -> 落账日与时间（给错误提示用）。 */
   private unknownWrites = new Map<string, { dateKey: string; time: string }>();
   private readonly clock: () => number;
@@ -477,14 +508,45 @@ export class WriteGuard {
    */
   currentDailyCount(dateKey: string = beijingDateKey(this.clock())): number {
     let count = this.dailyCounts.get(dateKey) ?? 0;
-    for (const d of this.unresolvedInflight.values()) if (d === dateKey) count++;
+    for (const v of this.unresolvedInflight.values()) if (v.dateKey === dateKey) count++;
     return count;
   }
 
-  checkDailyLimit(): { ok: true } | { ok: false; reason: string } {
-    const count = this.currentDailyCount();
-    if (count >= ORDER_GUARD.maxOrdersPerDay) {
-      return { ok: false, reason: `DailyLimitExceeded:${count}/${ORDER_GUARD.maxOrdersPerDay}` };
+  /** 某位顾客当日的已占额度（口径与全局完全一致：allowed + unknown + 未决 inflight）。 */
+  currentCustomerDailyCount(customerKey: string, dateKey: string = beijingDateKey(this.clock())): number {
+    let count = this.customerDailyCounts.get(`${dateKey}|${customerKey}`) ?? 0;
+    for (const v of this.unresolvedInflight.values()) {
+      if (v.dateKey === dateKey && v.customerKey === customerKey) count++;
+    }
+    return count;
+  }
+
+  /**
+   * 两层频次护栏（2026-08-19 老板拍板）：**先查顾客维度，再查全局**。
+   *
+   * 顺序不是随意的——顾客维度是主护栏（防冒用者往某人账上批量塞单），它先撞线时给出的
+   * 理由要能指认「是你这位顾客的额度用完了」，而不是含糊地说「今天单子太多了」。
+   *
+   * 两条 reason 都以 `DailyLimitExceeded` 开头：总工验收文件 m4AcceptanceGauntlet 的 G4
+   * 断言了这个前缀（`assert.match(..., /DailyLimitExceeded/)`），那份文件一行不动，
+   * 所以维度信息只能加在后缀上。这不是将就——前缀是「什么护栏拦的」，后缀是「哪一层拦的」，
+   * 本来就该这么分层。
+   *
+   * customerKey 缺省（调用方没传 / 历史链路）时只查全局，不静默放行也不误拒。
+   */
+  checkDailyLimit(customerKey?: string): { ok: true } | { ok: false; reason: string } {
+    if (customerKey) {
+      const perCustomer = this.currentCustomerDailyCount(customerKey);
+      if (perCustomer >= ORDER_GUARD.maxOrdersPerDayPerCustomer) {
+        return {
+          ok: false,
+          reason: `DailyLimitExceeded:perCustomer:${perCustomer}/${ORDER_GUARD.maxOrdersPerDayPerCustomer}`,
+        };
+      }
+    }
+    const global = this.currentDailyCount();
+    if (global >= ORDER_GUARD.maxOrdersPerDay) {
+      return { ok: false, reason: `DailyLimitExceeded:global:${global}/${ORDER_GUARD.maxOrdersPerDay}` };
     }
     return { ok: true };
   }
@@ -495,9 +557,13 @@ export class WriteGuard {
    * 同一个状态机 applyAuditToState，两条路径的口径不可能各自漂移）。保留为公开方法是给
    * 测试用的：把额度直接撑满来验证频次护栏，比伪造 5 条审计日志直观得多。
    */
-  incrementDailyCount(): void {
+  incrementDailyCount(customerKey?: string): void {
     const key = beijingDateKey(this.clock());
     this.dailyCounts.set(key, (this.dailyCounts.get(key) ?? 0) + 1);
+    if (customerKey) {
+      const ck = `${key}|${customerKey}`;
+      this.customerDailyCounts.set(ck, (this.customerDailyCounts.get(ck) ?? 0) + 1);
+    }
   }
 
   // ---------- 未决写请求（「已发出≠已成功」闸门） ----------
@@ -582,6 +648,11 @@ export class WriteGuard {
       orderNo: entry.orderNo ?? null,
       code: entry.code ?? null,
       ...(entry.resolvedKeys ? { resolvedKeys: entry.resolvedKeys } : {}),
+      // 顾客维度计数键。line 是**白名单式**构造（只复制这里显式列出的字段），
+      // 所以新增审计字段必须在此显式声明一次——2026-08-19 加 customerKey 时踩过：
+      // 只在调用方传了、没在这里复制，结果按顾客计数一条都没记上，G4 验收用例当场变红。
+      // 这个显式白名单不是麻烦，是它挡住了「意外字段悄悄流进审计日志」。
+      ...(entry.customerKey ? { customerKey: entry.customerKey } : {}),
       durationMs: entry.durationMs,
     };
     // 先推进内存状态机、再落盘：落盘是尽力而为（磁盘满/权限问题都不阻塞主链路），
@@ -611,6 +682,10 @@ export class WriteGuard {
     path?: string;
     idempotencyKey?: unknown;
     resolvedKeys?: unknown;
+    // 2026-08-19：顾客维度计数所需。历史日志里没有这个字段——那些记录只推进全局计数，
+    // 按顾客计数从 undefined 开始，不会把旧单算到任何人头上。这是刻意的取舍：
+    // 宁可按顾客计数偏松（旧单不占额度），也不要凭尾号猜归属把两个顾客的额度算混。
+    customerKey?: unknown;
   }): void {
     // resolved 不属于任何一次写请求，先处理掉（它的 path 只是占位）。
     if (line.result === "resolved") {
@@ -628,14 +703,21 @@ export class WriteGuard {
 
     const key = typeof line.idempotencyKey === "string" ? line.idempotencyKey : null;
     const dateKey = line.dateKey ?? (line.time ? beijingDateKey(Date.parse(line.time)) : undefined);
+    const customerKey = typeof line.customerKey === "string" && /^[0-9a-f]{16}$/.test(line.customerKey)
+      ? line.customerKey
+      : undefined;
     const addCount = (): void => {
       if (dateKey) this.dailyCounts.set(dateKey, (this.dailyCounts.get(dateKey) ?? 0) + 1);
+      if (dateKey && customerKey) {
+        const ck = `${dateKey}|${customerKey}`;
+        this.customerDailyCounts.set(ck, (this.customerDailyCounts.get(ck) ?? 0) + 1);
+      }
     };
 
     switch (line.result) {
       case "inflight":
         // 请求即将发出，先挂账。等到终态记录出现时再销账。
-        if (key && dateKey) this.unresolvedInflight.set(key, dateKey);
+        if (key && dateKey) this.unresolvedInflight.set(key, { dateKey, customerKey });
         break;
       case "allowed":
         if (key) this.unresolvedInflight.delete(key);
