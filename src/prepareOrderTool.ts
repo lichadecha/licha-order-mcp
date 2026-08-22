@@ -371,7 +371,10 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
         lineTotalYuan: l.lineTotalYuan,
       })),
       estimatedTotalYuan: yuan(estimatedAmountFen),
-      pickup: "堂食：到店在柜台报取餐号取杯（本店当前只开堂食）",
+      // 取餐话术只承诺确定存在的机制（老板 2026-08-22 拍板，§8-40 销项）：接口单有没有
+      // 「取餐号」从未实测过，说了顾客到店可能报不出来；小程序订单页是付款后必经的既有链路，
+      // 按它的提示走永远不会错。「报取餐号」的旧文案曾让模型照着念、被 §8-40 当成模型发挥登记。
+      pickup: "堂食（本店当前只开堂食）：付款后按小程序订单页的提示取餐",
       expiresInMinutes: ORDER_GUARD.confirmTokenTtlMs / 60000,
       note:
         "请把以上内容逐项念给顾客确认（门店、每杯商品与规格做法、杯数、总金额）。" +
