@@ -17,12 +17,26 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { setReadAuditLogPathForTesting } from "../src/client.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findUserIdField, placeOrderHandler } from "../src/placeOrderTool.js";
+import { findUserIdField, placeOrderConfirmedHandler } from "../src/placeOrderTool.js";
 import { WriteGuard, setWriteGuardForTesting } from "../src/writeGuard.js";
 import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "../src/session.js";
+import { AccessAuditLogger, setAccessAuditLoggerForTesting } from "../src/accessAudit.js";
+
+// 2026-08-19 T5-1 迁移的连带修复：定稿 handler 比旧 handler 多一条 callRead 路径
+// （第 ⑧ 步强制 6.1.9 读回）。旧 handler 不读回，所以本文件原先不需要注入只读审计路径；
+// 一改成定稿 handler，那条路径就活了——不注入就会往**生产** logs/audit.log 追加行，
+// 而「测试不许碰生产 logs/」是明确红线（本轮真的被 m4ConfirmOrder 的红线自证抓到了一次）。
+setReadAuditLogPathForTesting(join(mkdtempSync(join(tmpdir(), "licha-read-audit-")), "audit.log"));
+// 同一批连带修复（2026-08-19 T5-1）：定稿 handler 的第 ② 步（未绑定拒绝）会写 access 审计。
+// 本文件的用例正常都被第 ① 步 userId 黑名单先拦住、走不到 ②，所以这个缺口在常规测试下
+// **看不出来**——是做变异验证（临时摘掉 ① 的防御）时才暴露的：三条 unbound_call_rejected
+// 落进了生产 logs/access-audit.log。潜在缺口同样要补：万一日后有人调整了两步的顺序，
+// 常规测试就会开始污染生产日志，而那时未必有人盯着。
+setAccessAuditLoggerForTesting(new AccessAuditLogger({ logPath: join(mkdtempSync(join(tmpdir(), "licha-access-audit-guard-")), "access-audit.log") }));
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
 process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
@@ -92,11 +106,14 @@ test("orderParams 顶层塞 userId → 被拒，fetch 未被调用", async () =>
   setWriteGuardForTesting(freshGuard());
   const spy = installFetchSpy();
   try {
-    const result = await placeOrderHandler({
+    // 2026-08-19 T5-1 迁移：定稿入参只有 confirmToken + confirmAmountYuan 两个标量，
+    // 但第 ① 步 findUserIdField 扫的是**整个入参对象**——顶层塞 userId 同样命中。
+    // 类型断言只为把额外字段塞进去（将来有人顺手扩入参字段时，这道防御依然在）。
+    const result = await placeOrderConfirmedHandler({
       confirmToken: "irrelevant-userid-guard-blocks-first",
-      amountFen: 2400,
-      orderParams: { storeId: 503542, userId: "1234567890123456789", items: [{ goodsId: "g1", skuId: "s1", num: 1 }] },
-    });
+      confirmAmountYuan: 24.0,
+      userId: "1234567890123456789",
+    } as unknown as Parameters<typeof placeOrderConfirmedHandler>[0]);
     assert.strictEqual(result.isError, true, "应返回错误结果");
     assert.ok(/userId/.test(result.content[0].text), "错误信息应提到 userId");
     assert.ok(/会话态/.test(result.content[0].text), "错误信息应说明 userId 只能由会话态注入");
@@ -111,17 +128,17 @@ test("orderParams 嵌套层级塞 userId → 被拒，fetch 未被调用", async
   setWriteGuardForTesting(freshGuard());
   const spy = installFetchSpy();
   try {
-    const result = await placeOrderHandler({
+    const result = await placeOrderConfirmedHandler({
       confirmToken: "irrelevant-userid-guard-blocks-first",
-      amountFen: 2400,
-      orderParams: {
-        storeId: 503542,
-        items: [{ goodsId: "g1", skuId: "s1", num: 1, extra: { userId: "sneaky-nested-1234567890123456789" } }],
-      },
-    });
+      confirmAmountYuan: 24.0,
+      extra: { items: [{ goodsId: "g1", deep: { userId: "sneaky-nested-1234567890123456789" } }] },
+    } as unknown as Parameters<typeof placeOrderConfirmedHandler>[0]);
     assert.strictEqual(result.isError, true, "应返回错误结果");
     assert.ok(/userId/.test(result.content[0].text), "错误信息应提到 userId");
-    assert.ok(/items\[0\]\.extra\.userId/.test(result.content[0].text), "错误信息应带上命中路径，方便排查");
+    // 命中路径随迁移后的入参结构变化（原来塞在 orderParams.items[0].extra，现在塞在入参对象的
+    // extra.items[0].deep）——断言的**精神不变**：错误信息必须带上完整命中路径，否则排查时
+    // 只知道「有个 userId」却不知道它藏在哪一层。
+    assert.ok(/extra\.items\[0\]\.deep\.userId/.test(result.content[0].text), "错误信息应带上命中路径，方便排查");
     assert.strictEqual(spy.count(), 0, "fetch 不应被调用");
   } finally {
     spy.restore();
@@ -129,7 +146,7 @@ test("orderParams 嵌套层级塞 userId → 被拒，fetch 未被调用", async
   }
 });
 
-test("orderParams 不含 userId → 不会被这道关卡拦，会继续往下走到令牌校验（TokenNotFound）", async () => {
+test("入参不含 userId → 不会被这道关卡拦，会继续往下走到令牌环节（待确认单查无此单）", async () => {
   // M2 阶段没有任何工具能签发合法令牌，所以即使闯过了 userId 检查，也一定会在 callWrite 的
   // 令牌校验这一步被拒绝——这里验证的是"正常输入不会被 userId 黑名单误伤"，而不是完整成功路径。
   //
@@ -145,15 +162,21 @@ test("orderParams 不含 userId → 不会被这道关卡拦，会继续往下�
   setSessionStoreForTesting(sessionStore);
   const spy = installFetchSpy();
   try {
-    const result = await placeOrderHandler({
+    // 入参干净 → 这道关卡不拦，往下走到令牌环节（定稿第 ③ 步：待确认单登记表里没有这张单）。
+    const result = await placeOrderConfirmedHandler({
       confirmToken: "never-issued-token-id",
-      amountFen: 2400,
-      orderParams: { storeId: 503542, items: [{ goodsId: "g1", skuId: "s1", num: 1 }], orderType: 1, source: 18 },
+      confirmAmountYuan: 24.0,
     });
     assert.strictEqual(result.isError, true);
-    assert.ok(!/UserIdInOrderParams/.test(result.content[0].text), "不应该是被 userId 检查拒绝的");
+    assert.ok(!/UserIdInInput/.test(result.content[0].text), "不应该是被 userId 检查拒绝的（定稿枚举名 UserIdInInput）");
+    // 定稿第 ③ 步（待确认单登记表 lookup）给出的措辞，取代 M2 时期 callWrite 的 TokenNotFound——
+    // 拦截点前移了（不用等进 callWrite 就拒），但本用例要证明的东西没变：
+    // 干净入参不会被 userId 黑名单误伤，会一路走到令牌环节才被拦。
+    assert.match(result.content[0].text, /确认令牌无效|重新调用 prepare_order/);
     assert.ok(!/SessionNotBound|尚未绑定/.test(result.content[0].text), "不应该是被会话绑定检查拒绝的（本用例已注入绑定）");
-    assert.ok(/TokenNotFound/.test(result.content[0].text), "应该是被令牌校验拒绝的（M2 阶段没有合法令牌来源）");
+    // 这条原本断言 callWrite 的 TokenNotFound 枚举——定稿把拦截点前移到第 ③ 步的待确认单
+    // lookup，压根不进 callWrite，所以那个枚举不会再出现。上面那条 /确认令牌无效/ 已经
+    // 覆盖了「被令牌环节拦下」这个语义，这里删掉重复且已失效的枚举名断言。
     assert.strictEqual(spy.count(), 0, "fetch 不应被调用");
   } finally {
     spy.restore();

@@ -62,7 +62,7 @@ import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "..
 import { PendingOrderStore, setPendingOrderStoreForTesting } from "../src/pendingOrders.js";
 import { getOrderStatusHandler } from "../src/orderStatusTool.js";
 import { prepareOrderHandler } from "../src/prepareOrderTool.js";
-import { placeOrderConfirmedHandler, placeOrderHandler } from "../src/placeOrderTool.js";
+import { placeOrderConfirmedHandler } from "../src/placeOrderTool.js";
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
 process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
@@ -606,23 +606,25 @@ function minimalOrderParams(): Record<string, unknown> {
 }
 
 // ============================================================================
-// T1：伪装 token 直调旧导出 placeOrderHandler → UserIdInOrderParams 拒绝路径
+// T1：伪装 token 直调 place_order → UserIdInInput 拒绝路径
+// （2026-08-19 T5-1：旧 handler 已删，改打定稿 handler。脱敏语义完全相同——
+//  定稿第 ① 步同样走 untrustedAuditValue(confirmToken)，这条守的就是那处封口。）
 // ============================================================================
-test("T1: 伪装 token 直调旧 placeOrderHandler（orderParams 带 userId）→ 写审计只留尾号，fetch 零调用", async () => {
+test("T1: 伪装 token 直调 place_order（入参带 userId）→ 写审计只留尾号，fetch 零调用", async () => {
   assert.match(DISGUISED_TOKEN, /^[0-9a-f]{32}$/, "伪装值必须真的符合令牌格式，否则这条用例没意义");
   const { guard, auditLogPath } = freshWriteGuard();
   setWriteGuardForTesting(guard);
   const spy = installFetchSpy('{"status":true,"code":0,"data":{}}');
   try {
-    const result = await placeOrderHandler({
+    const result = await placeOrderConfirmedHandler({
       confirmToken: DISGUISED_TOKEN,
-      amountFen: 2400,
-      orderParams: { storeId: STORE_ID, userId: OTHER_MEMBER_ID },
-    });
-    assert.strictEqual(result.isError, true, "orderParams 带 userId 应被黑名单拒");
+      confirmAmountYuan: 24.0,
+      userId: OTHER_MEMBER_ID,
+    } as unknown as Parameters<typeof placeOrderConfirmedHandler>[0]);
+    assert.strictEqual(result.isError, true, "入参带 userId 应被黑名单拒");
     assert.strictEqual(spy.count(), 0, "🚨 这一步在 callWrite 之前，任何请求都不许发出");
     const { raw, obj } = lastLine(auditLogPath);
-    assert.match(obj.reason, /^UserIdInOrderParams:/, "确认命中的正是这条残留路径");
+    assert.match(obj.reason, /^UserIdInInput:/, "确认命中的正是 userId 黑名单这一步（定稿枚举名）");
     assert.ok(!raw.includes(DISGUISED_TOKEN), "落盘整行不得出现完整伪装 token");
     assert.ok(!raw.includes(OTHER_MEMBER_ID), "内嵌的完整会员 ID 同样不得出现");
     assert.strictEqual(obj.tokenId, "***3456", "未经任何本地验证的入参 token → 只留尾四位");
@@ -633,30 +635,32 @@ test("T1: 伪装 token 直调旧 placeOrderHandler（orderParams 带 userId）�
 });
 
 // ============================================================================
-// T2：伪装 token 直调旧 handler → 走进 callWrite 命中 TokenNotFound
+// T2：伪装 token 直调 place_order（入参干净）→ 被待确认单查询拦下
 // ============================================================================
-// 与 T1 的差别只在 orderParams 不带 userId：于是穿过黑名单、穿过绑定检查，一路走到
-// callWrite 的令牌四项校验。这条路径的审计由 auditBase 派生，验的是第 2 项那处封口。
-test("T2: 伪装 token 直调旧 placeOrderHandler → callWrite 判 TokenNotFound，审计只留尾号，fetch 零调用", async () => {
+// 与 T1 的差别只在入参不带 userId：于是穿过黑名单、穿过绑定检查，走到令牌环节。
+// 2026-08-19 T5-1 迁移后拦截点前移——定稿第 ③ 步的待确认单 lookup 就把它拦下了（PendingOrderNotFound），
+// 不再进 callWrite。**这条用例真正要验的东西没变**：未经本地验证的入参 token 在审计里只留尾四位。
+// 那正是 P-W2 第三轮定下的判据（明文权看来源不看长相：lookup=absent 比 expired 更不可信）。
+test("T2: 伪装 token 直调 place_order（入参干净）→ 待确认单查无此单被拒，审计只留尾号，fetch 零调用", async () => {
   setSessionStoreForTesting(boundSessionStore(BOUND_MEMBER_ID));
   const { guard, auditLogPath } = freshWriteGuard();
   setWriteGuardForTesting(guard);
   const spy = installFetchSpy('{"status":true,"code":0,"data":{}}');
   try {
-    const result = await placeOrderHandler({
+    const result = await placeOrderConfirmedHandler({
       confirmToken: DISGUISED_TOKEN,
-      amountFen: 2400,
-      orderParams: minimalOrderParams(),
+      confirmAmountYuan: 24.0,
     });
     assert.strictEqual(result.isError, true);
-    assert.match(result.content[0].text, /TokenNotFound/, "确认命中的是令牌四项校验的第一项");
+    assert.match(result.content[0].text, /确认令牌无效|重新调用 prepare_order/, "确认被令牌环节拦下");
     assert.strictEqual(spy.count(), 0, "🚨 令牌校验在 fetch 之前，请求不许发出");
     const { raw, obj } = lastLine(auditLogPath);
-    assert.strictEqual(obj.reason, "TokenNotFound");
+    assert.strictEqual(obj.reason, "PendingOrderNotFound");
     assert.ok(!raw.includes(DISGUISED_TOKEN), "落盘整行不得出现完整伪装 token");
     assert.ok(!raw.includes(OTHER_MEMBER_ID), "内嵌的完整会员 ID 同样不得出现");
     assert.strictEqual(obj.tokenId, "***3456");
-    assert.match(obj.idempotencyKey, /^[0-9a-f]{64}$/, "幂等键照旧完整（本地 sha256，不是识别值）");
+    // 拦截点前移到 callWrite 之前，所以这条记录没有幂等键（它是 callWrite 内才算的）。
+    assert.strictEqual(obj.idempotencyKey, null, "第 ③ 步拦下时还没进 callWrite，幂等键为 null");
   } finally {
     spy.restore();
     setSessionStoreForTesting(null);

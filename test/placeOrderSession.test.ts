@@ -7,13 +7,21 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { setReadAuditLogPathForTesting } from "../src/client.js";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { placeOrderHandler } from "../src/placeOrderTool.js";
+import { placeOrderConfirmedHandler } from "../src/placeOrderTool.js";
+import { PendingOrderStore, setPendingOrderStoreForTesting } from "../src/pendingOrders.js";
 import { WriteGuard, setWriteGuardForTesting } from "../src/writeGuard.js";
 import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "../src/session.js";
 import { AccessAuditLogger, setAccessAuditLoggerForTesting } from "../src/accessAudit.js";
+
+// 2026-08-19 T5-1 迁移的连带修复：定稿 handler 比旧 handler 多一条 callRead 路径
+// （第 ⑧ 步强制 6.1.9 读回）。旧 handler 不读回，所以本文件原先不需要注入只读审计路径；
+// 一改成定稿 handler，那条路径就活了——不注入就会往**生产** logs/audit.log 追加行，
+// 而「测试不许碰生产 logs/」是明确红线（本轮真的被 m4ConfirmOrder 的红线自证抓到了一次）。
+setReadAuditLogPathForTesting(join(mkdtempSync(join(tmpdir(), "licha-read-audit-")), "audit.log"));
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
 process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
@@ -75,10 +83,11 @@ test("U1: 未绑定调用 place_order → 被拒，fetch 未被调用，access-a
   setAccessAuditLoggerForTesting(logger);
   const spy = installFetchSpyNoCall();
   try {
-    const result = await placeOrderHandler({
+    // 2026-08-19 T5-1 迁移：改调定稿 handler。未绑定拦在第 ② 步、早于令牌查询，
+    // 所以令牌传什么都不影响——这正是本用例要证明的「身份缺失优先于一切」。
+    const result = await placeOrderConfirmedHandler({
       confirmToken: "irrelevant-because-unbound-blocks-first",
-      amountFen: 2400,
-      orderParams: { storeId: 503542, items: [{ goodsId: "g1", skuId: "s1", num: 1 }], orderType: 1, source: 18 },
+      confirmAmountYuan: 24.0,
     });
     assert.strictEqual(result.isError, true);
     assert.ok(/尚未绑定会员身份/.test(result.content[0].text));
@@ -94,6 +103,7 @@ test("U1: 未绑定调用 place_order → 被拒，fetch 未被调用，access-a
     setWriteGuardForTesting(null);
     setSessionStoreForTesting(null);
     setAccessAuditLoggerForTesting(null);
+    setPendingOrderStoreForTesting(null);
   }
 });
 
@@ -116,16 +126,24 @@ test("U11: 绑定后 place_order 全链路注入验证——发往企迈的请�
   };
   const expectedFinalParams = { ...orderParams, userId: BOUND_CUSTOMER_ID };
   const { tokenId } = guard.issueConfirmToken(expectedFinalParams);
+  // 2026-08-19 T5-1 迁移：定稿 handler 从待确认单登记表取 finalParams（不再由调用方透传），
+  // 所以这里要把同一份 finalParams 登记进去——「令牌 ↔ 登记单」这层绑定正是 M4 收窄入参的核心。
+  const pendingStore = new PendingOrderStore();
+  setPendingOrderStoreForTesting(pendingStore);
+  pendingStore.register(tokenId, { finalParams: expectedFinalParams, estimatedAmountFen: 2400 });
 
   const spy = installFetchSpyCapture(
     '{"status":true,"code":0,"message":"创建订单成功","data":{"orderNo":"D-MOCK-U11","payAmount":24.0,"needPay":1}}',
   );
   try {
-    const result = await placeOrderHandler({ confirmToken: tokenId, amountFen: 2400, orderParams });
+    const result = await placeOrderConfirmedHandler({ confirmToken: tokenId, confirmAmountYuan: 24.0 });
     assert.strictEqual(result.isError, undefined, `应成功：${result.content[0]?.text}`);
 
     const calls = spy.calls();
-    assert.strictEqual(calls.length, 1, "应恰好发出一次 mock fetch（零真实网络请求）");
+    // 定稿 handler 成功后会**强制 6.1.9 读回**（施工令 §8 第 16 条：查已取消订单返回空 data，
+    // 读回必须在订单活着时立刻做）。所以这里是 2 次：第 1 次写下单、第 2 次读回。
+    // 旧 handler 不读回、原断言是 1 次——这处从 1 改成 2 不是放宽，是新链路多了一步必要动作。
+    assert.strictEqual(calls.length, 2, "应恰好两次 mock fetch：写下单 + 强制读回（零真实网络请求）");
     const sentBody = calls[0].body;
     // userId 是 19 位大数：client.ts 的 restoreIdsForSend 会把它从请求体 JSON 文本里的
     // 引号字符串还原成不带引号的数字形式（v6 实测服务端要求数字形式），所以在原始请求体文本里
@@ -147,5 +165,6 @@ test("U11: 绑定后 place_order 全链路注入验证——发往企迈的请�
     setWriteGuardForTesting(null);
     setSessionStoreForTesting(null);
     setAccessAuditLoggerForTesting(null);
+    setPendingOrderStoreForTesting(null);
   }
 });

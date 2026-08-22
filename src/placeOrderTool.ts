@@ -68,62 +68,20 @@ export function findUserIdField(value: unknown, path = ""): string | null {
   return null;
 }
 
-export interface PlaceOrderInput {
-  confirmToken: string;
-  amountFen: number;
-  orderParams: Record<string, unknown>;
-}
-
-export async function placeOrderHandler({ confirmToken, amountFen, orderParams }: PlaceOrderInput): Promise<TextResult> {
-  try {
-    const userIdPath = findUserIdField(orderParams);
-    if (userIdPath) {
-      // 这一步的拒绝发生在 callWrite 之前——没有白名单/护栏可言，但依然是一次"写路径上的
-      // 异常尝试"，值得留痕，所以直接写审计（reason 里带上命中路径，方便事后排查是谁传的）。
-      getWriteGuard().recordAudit({
-        path: WRITE_WHITELIST[0],
-        result: "rejected",
-        reason: `UserIdInOrderParams:${userIdPath}`,
-        // P-W2 第四轮微补丁：总工局部解除本函数的冻结，只改这一行。这一步在 callWrite 之前，
-        // 令牌未经任何本地验证（连仓库都没查），是纯入参 → 只留尾四位。
-        // callWrite 内部的审计路径不用管：那边的 auditBase 已是明文授予权的唯一判定点。
-        tokenId: untrustedAuditValue(confirmToken),
-        idempotencyKey: null,
-        durationMs: 0,
-      });
-      throw new Error(
-        `orderParams 不能包含 userId 字段（命中路径：${userIdPath}）：userId 只能由会话态注入（M3 架构硬规矩），不接受调用方传入`,
-      );
-    }
-
-    // ② M3 新增：未绑定会员身份 → 直接拒绝，不进 callWrite、不发请求。
-    // 这一步记 access 审计而非 write 审计——身份缺失是访问控制事件；write-audit 语义
-    // 保持为「进入写通道后的护栏事件」，两类事件不混在一个日志文件里。
-    const binding = getSessionStore().getBinding(DEFAULT_SESSION_KEY);
-    if (!binding) {
-      getAccessAuditLogger().record({
-        event: "unbound_call_rejected",
-        result: "rejected",
-        reason: "SessionNotBound",
-        sessionKey: DEFAULT_SESSION_KEY,
-        tool: "place_order",
-      });
-      return fail(new Error("本会话尚未绑定会员身份，请先用 bind_member 绑定后再下单"));
-    }
-
-    // ③ userId 只能由会话态注入的物理落地：orderParams 本身不许带 userId（上面已挡），
-    // 这里把绑定得到的 customerId 直接拼进最终发往 callWrite 的参数对象。
-    // 给 M4 的提醒：确认令牌与幂等键的指纹在 callWrite 内是对 finalParams（含这里注入的
-    // userId）计算的——M4 的 prepare_order 签发令牌时必须对同样「注入 userId 后的最终
-    // params」算指纹，两侧的指纹才能对得上，verifyToken 的 TokenFingerprintMismatch 判据
-    // 才不会被误伤。
-    const finalParams = { ...orderParams, userId: binding.customerId };
-    const result = await callWrite(WRITE_WHITELIST[0], finalParams, { amountFen, confirmToken });
-    return ok(result);
-  } catch (e) {
-    return fail(e);
-  }
-}
+// ---------------------------------------------------------------------------
+// 旧 place_order handler（M2/M3 骨架，入参 orderParams 完整透传）已于 2026-08-19 删除。
+//
+// 它在 M4 定稿后本就不再被注册（模型看不见、生产不可达），只为承载三条 M3 验收用例而留
+// 在仓库里，登记为 §8-22 的 M6 收官清理项。M6 通过后按 17 号执行包 T5-1 执行清理：
+// 那三条（B5a/B5b/B6）已按语义等价映射改写为调用定稿 handler，其余引用它的用例
+// （placeOrderSession U1/U11、placeOrderUserIdGuard 三条集成、handlerInputSanitizer T1/T2）
+// 同样迁移完毕，findUserIdField 的四条纯单测原样保留（定稿第 ① 步仍在用这个函数）。
+//
+// 迁移时踩到的一处连带、值得留给后来人：**定稿 handler 比旧 handler 多一条 callRead 路径**
+// （第 ⑧ 步强制 6.1.9 读回）。旧 handler 不读回，所以那些测试原先无需注入只读审计路径；
+// 一改成定稿 handler，那条路径就活了——两个文件因此往生产 logs/audit.log 追加了记录，
+// 被 m4ConfirmOrder 的红线自证当场抓住。迁移从来不只是换个函数名，要跟着看新链路多做了什么。
+// ---------------------------------------------------------------------------
 
 // ============================================================================
 // M4 定稿：两阶段确认下单 + 强制读回

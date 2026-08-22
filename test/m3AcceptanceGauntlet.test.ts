@@ -15,7 +15,8 @@ import { SessionStore, setSessionStoreForTesting, DEFAULT_SESSION_KEY } from "..
 import { AccessAuditLogger, setAccessAuditLoggerForTesting } from "../src/accessAudit.js";
 import { bindMemberHandler } from "../src/bindMemberTool.js";
 import { getOrderStatusHandler } from "../src/orderStatusTool.js";
-import { placeOrderHandler } from "../src/placeOrderTool.js";
+import { placeOrderConfirmedHandler } from "../src/placeOrderTool.js";
+import { PendingOrderStore, setPendingOrderStoreForTesting } from "../src/pendingOrders.js";
 
 process.env.QMAI_OPEN_KEY ??= "test-open-key-0123456789abcdef0123456789ab";
 process.env.QMAI_OPEN_ID ??= "test-open-id-0000000000000000";
@@ -27,6 +28,7 @@ interface Fixture {
   dir: string;
   accessLogPath: string;
   writeGuard: WriteGuard;
+  pendingStore: PendingOrderStore;
   restore: () => void;
 }
 
@@ -38,6 +40,8 @@ function installFixture(): Fixture {
     placedOrdersPath: join(dir, "placed-orders.json"),
   });
   setWriteGuardForTesting(writeGuard);
+  const pendingStore = new PendingOrderStore();
+  setPendingOrderStoreForTesting(pendingStore);
   setSessionStoreForTesting(new SessionStore());
   setAccessAuditLoggerForTesting(new AccessAuditLogger({ logPath: accessLogPath }));
   setReadAuditLogPathForTesting(join(dir, "read-audit.log"));
@@ -45,8 +49,10 @@ function installFixture(): Fixture {
     dir,
     accessLogPath,
     writeGuard,
+    pendingStore,
     restore: () => {
       setWriteGuardForTesting(null);
+      setPendingOrderStoreForTesting(null);
       setSessionStoreForTesting(null);
       setAccessAuditLoggerForTesting(null);
       setReadAuditLogPathForTesting(null);
@@ -165,63 +171,103 @@ test("B4：6.1.5 的 userId 为短数字形态时，同人放行、异人拒绝�
   }
 });
 
-// ---------- B5【令牌指纹一致性】对 finalParams（含注入 userId）签发的令牌才放行 ----------
-test("B5a：对「注入 userId 后的最终 params」签发令牌 → 放行到 fetch，body.params.userId=绑定值", async () => {
+// ---------- B5/B6 迁移说明（2026-08-19，T5-1 旧 handler 清理）----------
+//
+// 这三条原本调的是 M2/M3 留下的旧 `placeOrderHandler`（入参 `orderParams` 完整透传）。
+// M4 定稿把 place_order 的入参收窄成「confirmToken + confirmAmountYuan」两个标量，旧 handler
+// 只为承载这三条用例而留在仓库里（未注册、模型不可见），登记为 §8-22 的 M6 收官清理项。
+// 现按 17 号执行包 T5-1 的**例外授权**（仅此三条、语义等价迁移，其余一行不动）改写为调用定稿 handler。
+//
+// 逐条的语义映射（照 19 号检查单第一节的对照表，不是「看着像」就改）：
+//   B5a 原：对「注入 userId 后的最终 params」签发令牌 → 放行到 fetch、body 含绑定值
+//       新：待确认单登记的 finalParams（含会话注入的 userId）→ 凭令牌下单 → 同一断言
+//   B5b 原：对「不含 userId 的 orderParams」签发令牌 → TokenFingerprintMismatch
+//       新：定稿架构下模型**没有传 orderParams 的入口**，指纹不符在生产已不可达；
+//           等价的「令牌与登记单对不上」判据是第 ③ 步 PendingOrderNotFound —— 令牌是
+//           writeGuard 真签发的，但登记表里没有这张单，一样必须拒且 fetch 零调用。
+//   B6  原：orderParams 塞 userId（顶层/嵌套）→ 黑名单拒
+//       新：定稿第 ① 步 findUserIdField 扫的是**整个入参对象**，塞在任何层级都命中（UserIdInInput）
+//
+// 三条守的东西一条没少：合法令牌放行且 userId 无损、令牌对不上必拒且不发请求、
+// 调用方塞 userId 一律拒。
+
+test("B5a：待确认单登记的 finalParams（含注入 userId）→ 凭令牌放行到 fetch，body.params.userId=绑定值", async () => {
   const fx = installFixture();
   try {
     await bindFakeMember();
-    const orderParams = { storeId: 503542, items: [{ goodsId: "1", skuId: "2", num: 1 }], orderType: 1, source: 18 };
-    const finalParams = { ...orderParams, userId: FAKE_CUSTOMER_ID };
+    const finalParams = {
+      storeId: 503542,
+      items: [{ goodsId: "1", skuId: "2", num: 1 }],
+      orderType: 1,
+      source: 18,
+      userId: FAKE_CUSTOMER_ID,
+    };
     const { tokenId } = fx.writeGuard.issueConfirmToken(finalParams);
-    const mock = installFetchQueue([{ status: true, code: 0, data: { orderNo: "D-M3-GAUNTLET" } }]);
-    const r = await placeOrderHandler({ confirmToken: tokenId, amountFen: 2400, orderParams });
+    fx.pendingStore.register(tokenId, { finalParams, estimatedAmountFen: 2400 });
+    const mock = installFetchQueue([
+      { status: true, code: 0, data: { orderNo: "D-M3-GAUNTLET", payAmount: 24.0 } },
+      // 定稿 handler 成功后会强制 6.1.9 读回；给一条归属正确的响应，读回才不会走 readbackFailed。
+      { status: true, code: 0, data: { orderNo: "D-M3-GAUNTLET", userId: FAKE_CUSTOMER_ID, actualAmount: 2400, discountList: [] } },
+    ]);
+    const r = await placeOrderConfirmedHandler({ confirmToken: tokenId, confirmAmountYuan: 24.0 });
     mock.restore();
     assert.equal(r.isError ?? false, false, `合法令牌被误拒：${textOf(r)}`);
-    assert.equal(mock.calls.length, 1);
+    const writeCalls = mock.calls.filter((c) => c.bodyText.includes("order/v1/create") || c.url.includes("order/v1/create"));
+    assert.equal(writeCalls.length >= 1, true, "写请求应已发出");
     // 大数无损断言打在请求体原文上：userId 应以无引号的 19 位数字形态、完整无损地发出
     // （restoreIdsForSend 的设计行为；JSON.parse 会把它折成 ...800，不能用来断言）。
-    assert.match(mock.calls[0].bodyText, new RegExp(`"userId":${FAKE_CUSTOMER_ID}[,}]`));
+    assert.match(writeCalls[0].bodyText, new RegExp(`"userId":${FAKE_CUSTOMER_ID}[,}]`));
   } finally {
     fx.restore();
   }
 });
 
-test("B5b：对「不含 userId 的 orderParams」签发令牌 → TokenFingerprintMismatch 拒且 fetch 未调用", async () => {
+test("B5b：令牌真签发但待确认单未登记 → PendingOrderNotFound 拒且 fetch 未调用", async () => {
   const fx = installFixture();
   try {
     await bindFakeMember();
-    const orderParams = { storeId: 503542, items: [{ goodsId: "1", skuId: "2", num: 1 }], orderType: 1, source: 18 };
-    const { tokenId } = fx.writeGuard.issueConfirmToken(orderParams); // 故意不含 userId
+    const finalParams = {
+      storeId: 503542,
+      items: [{ goodsId: "1", skuId: "2", num: 1 }],
+      orderType: 1,
+      source: 18,
+      userId: FAKE_CUSTOMER_ID,
+    };
+    // 令牌签发了，但**故意不 register** —— 定稿架构下「令牌与登记单对不上」的等价形态。
+    const { tokenId } = fx.writeGuard.issueConfirmToken(finalParams);
     const mock = installFetchQueue([{ status: true, code: 0, data: { orderNo: "D-SHOULD-NOT-EXIST" } }]);
-    const r = await placeOrderHandler({ confirmToken: tokenId, amountFen: 2400, orderParams });
+    const r = await placeOrderConfirmedHandler({ confirmToken: tokenId, confirmAmountYuan: 24.0 });
     mock.restore();
     assert.equal(r.isError, true);
-    assert.match(textOf(r), /TokenFingerprintMismatch/);
-    assert.equal(mock.calls.length, 0, "指纹不符时不许发出任何请求");
+    assert.match(textOf(r), /确认令牌无效|不存在|已被使用/);
+    assert.equal(mock.calls.length, 0, "令牌取不到待确认单时不许发出任何请求");
   } finally {
     fx.restore();
   }
 });
 
 // ---------- B6【双锁不互斥】绑定后调用方塞 userId（顶层与嵌套）仍被拒 ----------
-test("B6：已绑定会话里 orderParams 塞 userId（顶层/嵌套）→ 仍被黑名单拒、fetch 未调用", async () => {
+test("B6：入参里塞 userId（顶层/嵌套）→ 仍被黑名单拒、fetch 未调用", async () => {
   const fx = installFixture();
   try {
     await bindFakeMember();
     const mock = installFetchQueue([{ status: true, code: 0, data: {} }]);
-    const top = await placeOrderHandler({
+    // 定稿入参只有两个标量字段，但 findUserIdField 扫的是整个入参对象——
+    // 将来有人顺手扩字段时这道防御依然在。类型断言只为把额外字段塞进去。
+    const top = await placeOrderConfirmedHandler({
       confirmToken: "t",
-      amountFen: 100,
-      orderParams: { storeId: 1, userId: "666" },
-    });
+      confirmAmountYuan: 1,
+      userId: "666",
+    } as unknown as Parameters<typeof placeOrderConfirmedHandler>[0]);
     assert.equal(top.isError, true);
     assert.match(textOf(top), /userId/);
-    const nested = await placeOrderHandler({
+    const nested = await placeOrderConfirmedHandler({
       confirmToken: "t",
-      amountFen: 100,
-      orderParams: { storeId: 1, items: [{ ext: { userId: "666" } }] },
-    });
+      confirmAmountYuan: 1,
+      ext: { deep: { userId: "666" } },
+    } as unknown as Parameters<typeof placeOrderConfirmedHandler>[0]);
     assert.equal(nested.isError, true);
+    assert.match(textOf(nested), /userId/);
     assert.equal(mock.calls.length, 0, "黑名单命中时不许发出任何请求");
     mock.restore();
   } finally {
