@@ -1,0 +1,809 @@
+// M2 写侧护栏与幂等基础设施：确认令牌仓库、金额/频次护栏、本地幂等去重、写审计日志。
+//
+// 背景（施工令 § 3.1 / § 8 第 4 条）：doc168 全文已查证企迈侧无任何幂等字段——
+// 「幂等」/outTradeNo/thirdOrderNo/requestId/tradeNo/clientToken 全 0 命中，uniqueId 只是商品行标识。
+// 结论：重复下单只能靠本地保证，没有服务端兜底，不许假装有。
+//
+// M2 阶段只建这套基础设施本身（令牌签发/校验、幂等表、护栏判据、审计落盘）；
+// 工具层什么时候签发令牌、什么时候校验，是 M4（prepare_order / place_order 完整逻辑）的事。
+//
+// 红线：本文件任何函数都不发起网络请求，只做本地判断与本地文件读写。
+
+import { createHash, randomBytes } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { ORDER_GUARD, READONLY_WHITELIST, READONLY_WHITELIST_PHASE2, WRITE_WHITELIST } from "./constants.js";
+import { logFilePath } from "./logPaths.js";
+
+// ---------- 默认路径（生产用；测试请通过构造参数注入临时路径，见 setWriteGuardForTesting） ----------
+// 不再按「编译产物往上两级」推算（§ 8 第 24 条：那个写法已让 audit.log 分裂成两本，
+// 而写审计日志同时是频次护栏的持久化载体，路径一漂护栏就被静默清零）。
+// 由 logPaths 统一解析：LICHA_LOG_DIR 优先，缺省锚定 package.json 所在目录下的 logs/。
+// 保留为函数而不是常量：环境变量在进程启动后才设置也照样生效，测试也不必绕模块级缓存。
+export function writeAuditLogPath(): string {
+  return logFilePath("write-audit.log");
+}
+export function placedOrdersPath(): string {
+  return logFilePath("placed-orders.json");
+}
+
+// ---------- 北京时间（自然日判定与审计时间戳一律用它，不用本机时区） ----------
+function beijingParts(ts: number): { year: string; month: string; day: string; hour: string; minute: string; second: string } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(ts));
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
+  let hour = get("hour");
+  if (hour === "24") hour = "00"; // 部分 ICU 实现午夜会给 "24"，纠正为 "00"
+  return { year: get("year"), month: get("month"), day: get("day"), hour, minute: get("minute"), second: get("second") };
+}
+
+/** 北京时间自然日 key，如 "2026-08-17"。频次护栏与日志重建都按它分组。 */
+export function beijingDateKey(ts: number = Date.now()): string {
+  const p = beijingParts(ts);
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+/** 人类可读北京时间字符串，写进审计日志。 */
+export function beijingTimeString(ts: number = Date.now()): string {
+  const p = beijingParts(ts);
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} +08:00`;
+}
+
+// ---------- 顾客维度计数键：sha256(userId) 前 16 hex ----------
+//
+// 为什么要哈希而不是直接用 userId：完整会员 ID 落盘违 §8-26 硬纪律。
+// 为什么不用尾四位：四位数字一万分之一就碰撞，两个不同顾客会共用同一份额度——护栏算错额度
+// 比没有护栏更糟（它看起来还在工作）。哈希唯一、不可逆、格式固定，三个要求一起满足。
+//
+// 传进来的 userId 可能是 number（大数 ID 在 JS 里已被字符串化，但不假设调用方一定做了）——
+// 统一 String() 后再哈希，避免 123 与 "123" 算出两个键。
+export function customerCountKey(userId: unknown): string | undefined {
+  if (userId == null) return undefined;
+  const s = String(userId).trim();
+  if (!s || s === "0") return undefined; // 0/空 = 没有有效顾客身份（见 bindMemberTool.isAbsentCustomerId）
+  return createHash("sha256").update(s).digest("hex").slice(0, 16);
+}
+
+// ---------- 内容指纹：sha256(规范化 JSON) ----------
+// 规范化 = 递归按键排序，保证同一份内容无论字段书写顺序如何都得到同一个指纹。
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      out[k] = sortKeysDeep((value as Record<string, unknown>)[k]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** 对规范化后的内容做 sha256 指纹。令牌指纹与幂等键共用同一套算法（同样的下单内容 = 同一个指纹）。 */
+export function fingerprint(content: unknown): string {
+  return createHash("sha256").update(JSON.stringify(sortKeysDeep(content)), "utf8").digest("hex");
+}
+
+// ---------- 脱敏：识别值（手机号等）一律只留后四位，凭证类字段名直接摘除 ----------
+// 覆盖三种书写形态：纯 11 位（1开头）、86 前缀（不带+）、+86 前缀、0086 前缀。
+// 总工验收裁决顺手扩展项：国家码形态一并纳入，不必再扩大到其他识别值类型。
+export const PHONE_RE = /^(?:\+?86|0086)?1\d{10}$/;
+// 凭证类字段名：命中即整字段丢弃，不管值是什么（比 grep 关键字更早一步，防止任何形式的凭证落盘）。
+const CREDENTIAL_KEY_RE = /openkey|opentoken|grantcode|openid|password|secret/i;
+
+// 手机号「嵌入式」正则：maskValue 用它在任意字符串值内部就地替换嵌入的手机号——不要求整个
+// 字符串恰好就是手机号。总工验收裁决（M3 B7 修复）：企迈接口的 message 字段可能把手机号嵌在
+// 一句话里（如"手机号13800001234不存在"），PHONE_RE 的整串匹配（^...$）接不住这种情形，会
+// 导致完整号码经由 reason 一类字段落进审计日志。
+//
+// 负向断言 (?<!\d) / (?!\d) 是防误伤的关键：像订单号 D00281924556183175168 这种长数字串，
+// 中段可能偶然长得像一个 11 位手机号，但它的前后仍然是数字——负向断言据此把这类"被更长数字
+// 串包裹的子串"排除在外，只有号码前后确实不是数字（汉字、标点、字符串首尾）时才判定为真实
+// 嵌入号码。第二位限定 [3-9] 额外贴合真实手机号段（13x-19x），减少误判面。
+//
+// 对纯 11 位 / 86 前缀 / +86 前缀 / 0086 前缀这几种整串形态，本正则的匹配行为与 PHONE_RE
+// 一致（是其超集），不引入行为倒退；PHONE_RE 本身保留不动，client.ts 的 summarizeWriteParams
+// 仍用它做整串检测，两处判据不必也不应该合并成一个。
+const PHONE_EMBED_RE = /(?<!\d)(?:\+?86|0086)?1[3-9]\d{9}(?!\d)/g;
+
+function maskValue(v: unknown): unknown {
+  if (typeof v !== "string") return v;
+  return v.replace(PHONE_EMBED_RE, (m) => `***${m.slice(-4)}`);
+}
+
+// export：M3 的 accessAudit.ts 复用同一份脱敏实现，不许复制粘贴第二份（见该文件头部注释）。
+export function maskDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskDeep);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (CREDENTIAL_KEY_RE.test(k)) continue; // 凭证字段名：整条丢弃
+      out[k] = maskDeep(v);
+    }
+    return out;
+  }
+  return maskValue(value);
+}
+
+// ---------- 统一出口脱敏 sink（M5 前置修复第 3 项，施工令 § 8 第 25 条） ----------
+//
+// maskDeep 只认两类东西：凭证类字段名、手机号形态的字符串。Codex 审计的实物探针打穿了它——
+// 会员 ID（19 位纯数字）、动态码、40+ 位高熵串放在**任意普通字段**里都能原样落盘；数字类型的
+// 手机号（number 而不是 string）也穿透；写审计的顶层 reason 当时压根没过 maskDeep。
+//
+// 修法不是再补几个字段名，而是把判据从「哪些字段危险」翻转成「哪些字段确定安全」：
+// 落盘前整条记录过一遍 sanitizeAuditRecord，**默认全脱敏**，只有白名单里的字段保留完整值。
+// 这样将来任何人往审计记录里加新字段，默认都是安全的一侧——漏一个字段名的代价从「泄露」
+// 变成「多打几个星号」。
+//
+// 白名单成员逐个都有非它不可的理由（不是"看着不敏感"就放）：
+//   orderNo         —— 订单号是排查与核对的唯一抓手，脱敏了整本审计就没用了；它不是识别值，
+//                      拿到订单号也查不到人（6.1.5/6.1.9 都要 userId 才给数据）。
+//   tokenId         —— 随机 16 字节 hex，本地签发、5 分钟即焚，不含任何身份信息。
+//   idempotencyKey  —— 本地 sha256 指纹，不可逆，是幂等与频次重建的连接键。
+//   resolvedKeys    —— 就是一组 idempotencyKey（未决销账靠它按键清账，脱敏了重建就对不上，
+//                      「已发出≠已成功」闸门会在重启后错误地一直挂着）。
+//   path/time/dateKey —— 接口路径与时间戳，审计的骨架字段。
+//
+// P-W2 收尾补丁（2026-08-18）：白名单从「只看字段名」升级为「字段名 + 值格式」双校验。
+// 被推翻的假设是「叫这个名字的字段，值就一定是那个安全形态」——实测穿透口证明它不成立：
+// orderNo / confirmToken 这类字段的值直接来自**调用方入参**，把假手机号当 orderNo 调一次
+// get_order_status，ownership 拒绝路径就会把这个完整识别值经由白名单原样落盘。白名单原本
+// 想放行的是「我们自己生成的骨架字段」，实际放行的是「叫这个名字的任意外部输入」。
+//
+// 现在的规则：命中白名单键 **且** 值符合该键的既定格式 → 原样保留；命中键但值不符格式
+// → 掉回普通 sanitizer（脱敏后落盘），绝不明文放行。格式判据全部来自实测/本地签发形态，
+// 见下方每条校验函数上的注释。
+// customerKey（2026-08-19 加）：顾客维度计数用的**不可逆哈希**，不是识别值。
+// 为什么不直接落 userId：那是完整会员 ID，落盘违 §8-26；为什么不落尾四位：
+// 四位数字一万分之一就碰撞，两个不同顾客会共用同一份额度——护栏会算错。
+// sha256 取前 16 hex 既唯一又不可逆，且格式校验能把它和别的东西区分开。
+export const AUDIT_PLAIN_KEYS = ["orderNo", "tokenId", "idempotencyKey", "resolvedKeys", "path", "time", "dateKey", "customerKey"] as const;
+export type AuditPlainKey = (typeof AUDIT_PLAIN_KEYS)[number];
+type PlainValueValidator = (value: unknown) => boolean;
+
+// 订单号：实测样本 D + 20 位数字（如 D0028192455618317xxxx），16-24 位留余量应对企迈改号长。
+const ORDER_NO_RE = /^D\d{16,24}$/;
+// 令牌 ID：本地 randomBytes(16).toString("hex") 的签发形态 = 32 位小写 hex。
+const TOKEN_ID_RE = /^[0-9a-f]{32}$/;
+// 幂等键：本地 sha256(规范化 JSON) = 64 位小写 hex（见 fingerprint）。
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+// 审计时间戳：beijingTimeString 的固定输出形态。
+const AUDIT_TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \+08:00$/;
+// 自然日 key：beijingDateKey 的固定输出形态。
+const AUDIT_DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// 接口路径：只认三份硬编码白名单的成员。path 字段虽然一直由我们自己填，但它是「审计里
+// 唯一会原样落盘的路径类字段」，钉死成员判定顺手把「将来有人把 URL/query 塞进 path」这条
+// 路也堵上（query 里带 phone= 是最常见的泄露形态）。
+const AUDIT_PLAIN_PATHS: ReadonlySet<string> = new Set<string>([
+  ...READONLY_WHITELIST,
+  ...READONLY_WHITELIST_PHASE2,
+  ...WRITE_WHITELIST,
+]);
+
+const isPlainString = (v: unknown): v is string => typeof v === "string";
+
+// 键 → 值格式校验函数。
+// 编译期闸门：AUDIT_PLAIN_KEYS 是 as const 元组，本表类型是 Record<AuditPlainKey, ...>——
+// 往元组里加一个键却忘了配校验函数，tsc 立刻报「缺少属性」，编译不过。这是本补丁要求的
+// 「新增白名单键不给校验函数直接报错」的第一道闸（第二道见下方启动期自检）。
+const AUDIT_PLAIN_VALIDATOR_TABLE: Readonly<Record<AuditPlainKey, PlainValueValidator>> = {
+  orderNo: (v) => isPlainString(v) && ORDER_NO_RE.test(v),
+  tokenId: (v) => isPlainString(v) && TOKEN_ID_RE.test(v),
+  idempotencyKey: (v) => isPlainString(v) && SHA256_HEX_RE.test(v),
+  // resolvedKeys 是一组 idempotencyKey：必须是数组、且每个元素都是 sha256 形态。
+  // 有一个元素不合格就整棵子树掉回 sanitizer——半信半疑的数组不值得为它开一半的口子。
+  resolvedKeys: (v) => Array.isArray(v) && v.length > 0 && v.every((x) => isPlainString(x) && SHA256_HEX_RE.test(x)),
+  path: (v) => isPlainString(v) && AUDIT_PLAIN_PATHS.has(v),
+  time: (v) => isPlainString(v) && AUDIT_TIME_RE.test(v),
+  dateKey: (v) => isPlainString(v) && AUDIT_DATE_KEY_RE.test(v),
+  customerKey: (v) => isPlainString(v) && /^[0-9a-f]{16}$/.test(v),
+};
+
+// 运行时查表故意用 Map 而不是直接对普通对象取属性：对象取属性会命中 Object 原型链——
+// 一条名为 "toString" / "constructor" 的字段能取到 Object.prototype 上的同名函数，
+// 于是「有校验函数」判定为真，该字段被明文放行。这是把白名单从 Set 改成键值表时新开的
+// 一个穿透口，用 Map（无原型链）从结构上堵掉，不靠记性。
+const AUDIT_PLAIN_VALIDATORS: ReadonlyMap<string, PlainValueValidator> = new Map<string, PlainValueValidator>(
+  Object.entries(AUDIT_PLAIN_VALIDATOR_TABLE),
+);
+
+// 启动期闸门（第二道）：模块一 import 就核对「每个白名单键都配了校验函数」，缺一个直接抛错。
+// 为什么编译期之外还要这一道：dist/ 里跑的是编译后的 JS，纯 JS 调用方、或有人把 AUDIT_PLAIN_KEYS
+// 的类型放宽成 string[]，编译期闸门就绕过去了；那种情况下宁可进程起不来，也不接受一个
+// 「有名字、没校验」的字段静默明文落盘。
+for (const key of AUDIT_PLAIN_KEYS) {
+  if (!AUDIT_PLAIN_VALIDATORS.has(key)) {
+    throw new Error(
+      `审计白名单键 "${key}" 缺少值格式校验函数：新增白名单键必须同时在 AUDIT_PLAIN_VALIDATOR_TABLE 登记校验，` +
+        `否则该键会变成明文放行的穿透口（P-W2 收尾补丁的设计前提）。`,
+    );
+  }
+}
+
+// 40 位以上高熵字母数字串（token/密钥/长哈希形态）。
+const LONG_ENTROPY_RE = /(?<![0-9A-Za-z])[0-9A-Za-z]{40,}(?![0-9A-Za-z])/g;
+// 15 位以上连续数字串（企迈的 19 位雪花 ID、会员 ID、动态码都在这个形态里）。
+// 断言只看**数字侧**：前后不是数字就算一段独立长数字，字母紧贴照样脱敏。
+//
+// 为什么不再豁免字母侧（P-W2 第二轮微补丁，2026-08-18 总工探针裁决）：原先写成
+// (?<![0-9A-Za-z]) 是为了保住文本里的订单号（D0028… 的数字段紧跟字母 D），但这个豁免
+// 是按「字母贴长数字 = 订单号」这个猜测开的，实测被打穿——reason 文本「探针ID1234567890123456789」
+// 里的会员 ID 就紧贴字母，完整落盘。「字母贴识别值」是真实可达形态（企迈英文键名回显是
+// 最常见的一种），拿一个猜测去换一个确定的泄露口不划算。
+//
+// 订单号的审计价值不靠这个豁免承接，靠白名单：orderNo 字段过「字段名 + 值格式」双校验后
+// 完整落盘（见 AUDIT_PLAIN_KEYS / R4 用例）。自由文本里的订单号遮成 D***5168 形态仍能
+// 认出是哪一类事件、并回到 orderNo 字段取全值，排查链不断。
+const LONG_DIGITS_RE = /(?<!\d)\d{15,}(?!\d)/g;
+// 数字类型的手机号形态（number 而不是 string——JSON 里 13800001234 写成数字照样是手机号）。
+const PHONE_NUMERIC_RE = /^1[3-9]\d{9}$/;
+
+function maskLongTokens(s: string): string {
+  return s.replace(LONG_ENTROPY_RE, (m) => `***${m.slice(-4)}`).replace(LONG_DIGITS_RE, (m) => `***${m.slice(-4)}`);
+}
+
+/** 数字值的脱敏：11 位手机号形态、或 15 位以上的长数字，转成 "***后四位" 字符串。 */
+function maskNumber(v: number): unknown {
+  if (!Number.isFinite(v) || !Number.isInteger(v)) return v;
+  const digits = String(Math.abs(v));
+  if (PHONE_NUMERIC_RE.test(digits) || digits.length >= 15) return `***${digits.slice(-4)}`;
+  return v;
+}
+
+function sanitizeNode(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeNode);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (CREDENTIAL_KEY_RE.test(k)) continue; // 凭证字段名：整条丢弃（同 maskDeep）
+      // 双校验：命中白名单键**且**值符合该键格式 → 整棵子树原样保留；
+      // 命中键但值不符格式（典型：orderNo 位置塞了手机号）→ 掉回 sanitizeNode 脱敏。
+      const validate = AUDIT_PLAIN_VALIDATORS.get(k);
+      out[k] = validate !== undefined && validate(v) ? v : sanitizeNode(v);
+    }
+    return out;
+  }
+  if (typeof value === "number") return maskNumber(value);
+  if (typeof value === "string") return maskLongTokens(maskValue(value) as string);
+  return value;
+}
+
+/**
+ * 审计落盘的唯一出口脱敏：整条记录（含顶层 reason）过一遍。
+ * 规则 = maskDeep 的两条（凭证字段名删除 + 嵌入式手机号）叠加三条新的：
+ *   ① 15 位以上连续数字串只留后四位；② 40 位以上高熵字母数字串只留后四位；
+ *   ③ 数字类型的 11 位手机号 / 15 位以上长数字同样脱敏。
+ * 白名单字段（见 AUDIT_PLAIN_KEYS）例外——但例外要过「字段名 + 值格式」双校验：
+ * 值不符合该键既定格式的（例如 orderNo 位置塞了手机号），照普通字段脱敏，不给明文放行。
+ */
+export function sanitizeAuditRecord(value: unknown): unknown {
+  return sanitizeNode(value);
+}
+
+// ---------- 来源判定：明文权由「值从哪儿来」授予（P-W2 第三轮微补丁，2026-08-18） ----------
+//
+// Codex 微验打穿的是上面那层白名单的**格式校验**：19 位假会员 ID 补个 D 前缀就凑成 D+20 位、
+// 变形成 32 位 hex 就冒充令牌 ID，格式全对，于是完整落盘。根因不在正则写得松——
+// 「值长得像不像」永远无法回答「这值是不是识别值」，因为攻击者控制着值的长相。
+//
+// 能回答的问题只有一个：**这个值是谁给的**。
+//   · 我们自己生成的（本地签发的令牌、企迈响应回传的订单号）→ 不可能是伪装的识别值，可留全值；
+//   · 调用方入参里来的（模型/攻击者填的 orderNo、confirmToken）→ 长相说明不了任何事，只留尾号。
+// 所以明文权改由调用点的**来源判定**授予：调用点最清楚这个值刚才是从哪儿拿到的，把那个知识
+// 用一个函数调用表达出来，比在落盘出口猜值的性质可靠一个量级。
+//
+// 分层不重叠、各管一段（两层都要留）：
+//   ① 来源层（本函数，在调用点）—— 决定该不该给明文，是主判据；
+//   ② 格式层（AUDIT_PLAIN_KEYS 白名单，在落盘出口）—— 兜底：将来某个调用点忘了做来源判定，
+//      至少裸识别值（不符合格式的）进不来。兜底层挡不住合法形态伪装，这是它的已知边界，
+//      不是缺陷——它的职责本来就是"最后一道网"，不是"唯一一道网"。
+/**
+ * 来源未证实的识别值位（调用方入参）→ 审计里只留尾四位。
+ *
+ * 用在「这个值来自调用方、且当前场景下身份/归属尚未证实」的审计字段上（典型：拒绝路径的
+ * orderNo、lookup=absent 的 confirmToken）。不足四位时整体遮蔽——尾四位对短值等于全值。
+ * 空值/空串统一归一成 null，与各调用点原来的 `x || null` 写法行为一致。
+ */
+export function untrustedAuditValue(value: string | null | undefined): string | null {
+  if (value == null || value === "") return null;
+  return value.length <= 4 ? "***" : `***${value.slice(-4)}`;
+}
+
+// ---------- 确认令牌 ----------
+interface TokenRecord {
+  tokenId: string;
+  fp: string;
+  issuedAt: number;
+  used: boolean;
+}
+
+export type TokenVerifyFailure = "TokenNotFound" | "TokenExpired" | "TokenAlreadyUsed" | "TokenFingerprintMismatch";
+
+export type TokenVerifyResult = { ok: true; record: TokenRecord } | { ok: false; reason: TokenVerifyFailure };
+
+// ---------- 写审计条目 ----------
+export interface WriteAuditSummary {
+  storeId?: unknown;
+  itemCount?: number;
+  totalQuantity?: number;
+  estimatedAmountFen?: number;
+  [k: string]: unknown;
+}
+
+/**
+ * 写审计的五种结果（施工令 § 3.1 第 5 条补充：「已发出」不等于「已成功」）：
+ *   - inflight：请求**即将真实发出**，在 fetch 之前先落盘。进程在这之后崩溃、日志里就只剩这一条，
+ *     重启重建时它会被识别为「未决」——保守地当作「可能已经在企迈侧建了单」处理。
+ *   - allowed：企迈明确回话说这单成了。
+ *   - rejected：明确没发生（护栏在发出前拦下，或企迈明确回话说这单没成）。
+ *   - unknown：**结果未知**——网络异常或 HTTP 5xx。企迈侧可能已经建单，也可能没有，本地无从判断。
+ *     这一态过去被记成 rejected，等于把「可能已成功」谎报成「失败」，是本次修复的核心缺口。
+ *   - resolved：人（模型）已经用 6.1.5/6.1.6 真实读回核对过企迈侧的订单，未决状态在此解除。
+ */
+export type WriteAuditResult = "allowed" | "rejected" | "inflight" | "unknown" | "resolved";
+
+export interface WriteAuditEntry {
+  path: string;
+  result: WriteAuditResult;
+  reason?: string;
+  tokenId?: string | null;
+  idempotencyKey?: string | null;
+  summary?: WriteAuditSummary;
+  orderNo?: string | null;
+  code?: number | string | null;
+  /** 仅 result="resolved" 用：本次被解除未决状态的幂等键清单。重建时按它清账。 */
+  resolvedKeys?: string[] | null;
+  /**
+   * 顾客维度频次计数键（2026-08-19）：`customerCountKey(userId)` 的结果，16 位 hex，不可逆。
+   * 缺省时该条记录只推进全局计数——不静默放行、也不误拒。
+   */
+  customerKey?: string;
+  durationMs: number;
+}
+
+interface WriteGuardOptions {
+  clock?: () => number;
+  auditLogPath?: string;
+  placedOrdersPath?: string;
+}
+
+export class WriteGuard {
+  private tokens = new Map<string, TokenRecord>();
+  private placedOrders = new Map<string, { orderNo: string; at: number }>();
+  private dailyCounts = new Map<string, number>(); // beijingDateKey -> 当日已结算占额（allowed + unknown）
+  // `${dateKey}|${customerKey}` -> 该顾客当日已结算占额。与 dailyCounts 并行维护、同一个状态机推进，
+  // 两者不可能各自漂移（实时写入与重启重建都只走 applyAuditToState 这一条路）。
+  private customerDailyCounts = new Map<string, number>();
+  /** 已落 inflight、还没等到任何终态的写请求：idempotencyKey -> 该请求所属北京时间自然日。 */
+  // idempotencyKey -> { dateKey, customerKey }。2026-08-19 从「只存 dateKey」扩成对象：
+  // 未决 inflight 同样占额度（代价发生在请求发出那一刻），按顾客计数时也必须算进对应顾客头上，
+  // 只存 dateKey 就没法归属到人。customerKey 可能缺失（历史日志、或调用方没传），缺失时只计全局。
+  private unresolvedInflight = new Map<string, { dateKey: string; customerKey?: string }>();
+  /** 终态为「结果未知」的写请求：idempotencyKey -> 落账日与时间（给错误提示用）。 */
+  private unknownWrites = new Map<string, { dateKey: string; time: string }>();
+  private readonly clock: () => number;
+  private readonly auditLogPath: string;
+  private readonly placedOrdersPath: string;
+
+  constructor(opts?: WriteGuardOptions) {
+    this.clock = opts?.clock ?? Date.now;
+    this.auditLogPath = opts?.auditLogPath ?? writeAuditLogPath();
+    this.placedOrdersPath = opts?.placedOrdersPath ?? placedOrdersPath();
+    this.loadPlacedOrders();
+    // T9 关键：当日计数不能只放内存——启动时（含"进程重启"这个场景）必须从写审计日志重建，
+    // 否则重启一次就能把频次护栏清零绕过。
+    this.rebuildDailyCountsFromAudit();
+  }
+
+  // ---------- 确认令牌：签发 / 校验 / 消耗 ----------
+
+  /** 签发一次性确认令牌：随机 ID + 单内容 sha256 指纹 + 签发时间戳。M4 由 prepare_order 调用。 */
+  issueConfirmToken(content: unknown): { tokenId: string; issuedAt: number } {
+    this.pruneExpiredTokens(); // 顺手做惰性清理，见 pruneExpiredTokens 注释
+    const tokenId = randomBytes(16).toString("hex");
+    const issuedAt = this.clock();
+    this.tokens.set(tokenId, { tokenId, fp: fingerprint(content), issuedAt, used: false });
+    return { tokenId, issuedAt };
+  }
+
+  /**
+   * 惰性清理：已过期或已用过的令牌记录不再可能通过 verifyToken，留在内存里没有意义。
+   * 不用定时器，改在每次签发新令牌时顺手扫一遍——量级小（单日 ≤5 单）时这几乎零成本，
+   * 且避免了"要不要另起一个定时器/要不要在进程退出时清理它"这类多余的生命周期管理问题。
+   * 只清"已过期"的（不管有没有用过——过期后无论如何都通不过校验了），
+   * 保留"未过期但已用过"的记录不清，是为了让 TTL 窗口内的重放仍然能被 TokenAlreadyUsed
+   * 明确报出来，而不是退化成看起来更模糊的 TokenNotFound。
+   */
+  private pruneExpiredTokens(): void {
+    const now = this.clock();
+    for (const [id, rec] of this.tokens) {
+      if (now - rec.issuedAt > ORDER_GUARD.confirmTokenTtlMs) {
+        this.tokens.delete(id);
+      }
+    }
+  }
+
+  /**
+   * 四项校验，任一不过即拒：存在 → 未过期 → 未被用过 → 指纹与本次入参一致。
+   * 顺序刻意把"与内容无关"的检查（存在/过期/已用）放在"与内容相关"的指纹比对之前，
+   * 这样"重放同一个已用令牌"命中的是 TokenAlreadyUsed，"拿别的内容套用一个未用令牌"命中的才是
+   * TokenFingerprintMismatch——两种失败模式在审计里能被明确区分，不会被彼此掩盖。
+   * 校验通过不在这里消耗令牌，消耗动作交给 consumeToken（用后即焚：调用方应在真正发出请求前调用）。
+   */
+  verifyToken(tokenId: string, content: unknown): TokenVerifyResult {
+    const rec = this.tokens.get(tokenId);
+    if (!rec) return { ok: false, reason: "TokenNotFound" };
+    if (this.clock() - rec.issuedAt > ORDER_GUARD.confirmTokenTtlMs) return { ok: false, reason: "TokenExpired" };
+    if (rec.used) return { ok: false, reason: "TokenAlreadyUsed" };
+    if (rec.fp !== fingerprint(content)) return { ok: false, reason: "TokenFingerprintMismatch" };
+    return { ok: true, record: rec };
+  }
+
+  /** 用后即焚：标记令牌已使用。即便后续真实请求失败，同一令牌也不可再用（要重试须重新走确认流程）。 */
+  consumeToken(record: TokenRecord): void {
+    record.used = true;
+  }
+
+  /**
+   * 这个令牌 ID 是不是**本地签发**的（P-W2 第四轮微补丁，2026-08-18）。
+   *
+   * 用途只有一个：给审计的「明文授予权」提供来源判据（见 client.ts callWrite 的 auditBase）。
+   * 判据就是令牌仓库里有没有这条记录——记录只可能由 issueConfirmToken 写入，
+   * 调用方无从伪造：外部拿一串自己拼的 32 位 hex 进来，这里必然返回 false。
+   * 这正是第三轮定下的原则在写侧的落点：明文权由「值是谁给的」授予，不由「长得像不像」授予。
+   *
+   * 三种状态的返回值（与 verifyToken 的四项校验刻意解耦——本函数只回答来源，不回答可用性）：
+   *   · 未过期、未用过 → true（正常下单路径）；
+   *   · 未过期、已用过 → true（pruneExpiredTokens 刻意保留这类记录，见其注释）。
+   *     TokenAlreadyUsed 的重放审计因此仍能留全值——「哪张令牌被重放了」是真实排查需求；
+   *   · 已过期 → false（记录已被惰性 prune 掉，或还没被扫到但按取舍一律不给明文）。
+   *
+   * 已过期令牌返回 false、审计只留尾号，是沿用第三轮「absent 吞掉已 prune 真令牌」的既定取舍：
+   * 过期令牌怎么都下不了单、已无排查价值，而「宁可多打星号」是本轮翻转判据时定下的方向。
+   * 代价是过期令牌的审计行只剩尾四位；不接受的替代方案是为了这点排查便利，
+   * 让「仓库里查不到」这个唯一可靠的来源判据变得含糊。
+   */
+  isLocallyIssued(tokenId: string): boolean {
+    return this.tokens.has(tokenId);
+  }
+
+  // ---------- 幂等 ----------
+
+  /**
+   * 幂等键命中过往已下单记录 → true。
+   * 幂等键由调用方（client.ts 的 callWrite）用 fingerprint({ params, tokenId }) 算出——
+   * 不是单纯 fingerprint(params)。这里不重复定义算法，只负责查表，
+   * 具体理由见 client.ts callWrite 里 idempotencyKey 那段注释（总工验收裁决 M2 追加修复）。
+   */
+  isDuplicate(key: string): boolean {
+    return this.placedOrders.has(key);
+  }
+
+  /** 记录一次成功下单，供后续同内容重复请求命中幂等拒绝。持久化到 placed-orders.json。 */
+  recordPlacedOrder(key: string, orderNo: string): void {
+    this.placedOrders.set(key, { orderNo, at: this.clock() });
+    this.persistPlacedOrders();
+  }
+
+  // ---------- 频次（北京时间自然日） ----------
+
+  /**
+   * 当日已占额度（施工令 § 3.1 第 5 条补充②的保守口径）：
+   *   已结算占额（allowed + unknown）+ 当日未决 inflight 数。
+   *
+   * 三类都占额度的理由是同一条：**代价发生在请求发出那一刻，不是成功那一刻**。
+   *   - allowed：确实建了单，占额度天经地义；
+   *   - unknown（网络异常 / 5xx）：企迈侧可能已经建单，本地无从判断——不占额度就等于
+   *     把「单日 ≤5 单」偷偷放宽成「单日 ≤5 次**成功**」，异常越多闸门越松，方向正好反了；
+   *   - 未决 inflight（落了 inflight 却没等到任何终态，典型是进程在请求途中被杀）：性质同 unknown。
+   * 明确被拒的（护栏拦下、企迈回话说没成）不占额度——那是「明确没发生」，不是「不知道」。
+   */
+  currentDailyCount(dateKey: string = beijingDateKey(this.clock())): number {
+    let count = this.dailyCounts.get(dateKey) ?? 0;
+    for (const v of this.unresolvedInflight.values()) if (v.dateKey === dateKey) count++;
+    return count;
+  }
+
+  /** 某位顾客当日的已占额度（口径与全局完全一致：allowed + unknown + 未决 inflight）。 */
+  currentCustomerDailyCount(customerKey: string, dateKey: string = beijingDateKey(this.clock())): number {
+    let count = this.customerDailyCounts.get(`${dateKey}|${customerKey}`) ?? 0;
+    for (const v of this.unresolvedInflight.values()) {
+      if (v.dateKey === dateKey && v.customerKey === customerKey) count++;
+    }
+    return count;
+  }
+
+  /**
+   * 两层频次护栏（2026-08-19 老板拍板）：**先查顾客维度，再查全局**。
+   *
+   * 顺序不是随意的——顾客维度是主护栏（防冒用者往某人账上批量塞单），它先撞线时给出的
+   * 理由要能指认「是你这位顾客的额度用完了」，而不是含糊地说「今天单子太多了」。
+   *
+   * 两条 reason 都以 `DailyLimitExceeded` 开头：总工验收文件 m4AcceptanceGauntlet 的 G4
+   * 断言了这个前缀（`assert.match(..., /DailyLimitExceeded/)`），那份文件一行不动，
+   * 所以维度信息只能加在后缀上。这不是将就——前缀是「什么护栏拦的」，后缀是「哪一层拦的」，
+   * 本来就该这么分层。
+   *
+   * customerKey 缺省（调用方没传 / 历史链路）时只查全局，不静默放行也不误拒。
+   */
+  checkDailyLimit(customerKey?: string): { ok: true } | { ok: false; reason: string } {
+    if (customerKey) {
+      const perCustomer = this.currentCustomerDailyCount(customerKey);
+      if (perCustomer >= ORDER_GUARD.maxOrdersPerDayPerCustomer) {
+        return {
+          ok: false,
+          reason: `DailyLimitExceeded:perCustomer:${perCustomer}/${ORDER_GUARD.maxOrdersPerDayPerCustomer}`,
+        };
+      }
+    }
+    const global = this.currentDailyCount();
+    if (global >= ORDER_GUARD.maxOrdersPerDay) {
+      return { ok: false, reason: `DailyLimitExceeded:global:${global}/${ORDER_GUARD.maxOrdersPerDay}` };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 手工把当日「已结算占额」+1。
+   * 生产链路不再调用它——占额度的推进已经统一收进 recordAudit（实时写入与重启重建共用
+   * 同一个状态机 applyAuditToState，两条路径的口径不可能各自漂移）。保留为公开方法是给
+   * 测试用的：把额度直接撑满来验证频次护栏，比伪造 5 条审计日志直观得多。
+   */
+  incrementDailyCount(customerKey?: string): void {
+    const key = beijingDateKey(this.clock());
+    this.dailyCounts.set(key, (this.dailyCounts.get(key) ?? 0) + 1);
+    if (customerKey) {
+      const ck = `${key}|${customerKey}`;
+      this.customerDailyCounts.set(ck, (this.customerDailyCounts.get(ck) ?? 0) + 1);
+    }
+  }
+
+  // ---------- 未决写请求（「已发出≠已成功」闸门） ----------
+
+  /**
+   * 存在「结果未知」或「未决 inflight」的写请求 → true。
+   * place_order 在真正发请求之前用它做前置闸门：上一单到底成没成都还没弄清楚，
+   * 这时候放行新下单就是在赌——赌输的代价是顾客被扣两次钱。
+   *
+   * 刻意不按自然日限定：昨晚那条状态未知的写请求，今天照样可能对应企迈侧一张真实存在的单。
+   * 额度计数按日分组（那是「今天还能下几单」），未决闸门不按日分组（那是「有没有账没算清」）。
+   */
+  hasUnresolvedWrite(): boolean {
+    return this.unknownWrites.size > 0 || this.unresolvedInflight.size > 0;
+  }
+
+  /** 未决写请求的摘要，给拒绝提示与审计 reason 用（不含任何识别值）。 */
+  describeUnresolvedWrites(): { total: number; unknown: number; inflight: number; earliestTime: string | null } {
+    const times = [...this.unknownWrites.values()].map((v) => v.time).filter((t) => Boolean(t)).sort();
+    return {
+      total: this.unknownWrites.size + this.unresolvedInflight.size,
+      unknown: this.unknownWrites.size,
+      inflight: this.unresolvedInflight.size,
+      earliestTime: times[0] ?? null,
+    };
+  }
+
+  /**
+   * 解除未决状态：写一条 result="resolved" 审计并清账，返回被解除的条数。
+   *
+   * 谁能调用它是这道闸门的关键设计（总工请复核）：**只有 my_orders / get_order_status 在
+   * 真正拿到企迈返回的订单数据之后才调**——不给模型开一个「我说核对完了」就能解除的 MCP 工具。
+   * 解除的凭据因此是一次真实发生的读回，而不是模型的一句自述；模型物理上无法凭空解除闸门。
+   *
+   * 已经占用的额度不退还：核对的结论是「这单到底有没有成」，不是「这次请求有没有发出」——
+   * 请求确确实实发出过。不退还同时也堵死了「靠反复触发异常再解除来多下几单」这条路。
+   */
+  resolveUnresolvedWrites(opts: { via: string; checkedOrderCount: number }): number {
+    const keys = [...this.unresolvedInflight.keys(), ...this.unknownWrites.keys()];
+    if (keys.length === 0) return 0;
+    this.recordAudit({
+      path: WRITE_WHITELIST[0],
+      result: "resolved",
+      reason: `ResolvedBy:${opts.via}:checkedOrders=${opts.checkedOrderCount}`,
+      idempotencyKey: null,
+      resolvedKeys: keys,
+      durationMs: 0,
+    });
+    return keys.length;
+  }
+
+  // ---------- 金额 ----------
+
+  checkAmount(amountFen: number): { ok: true } | { ok: false; reason: string } {
+    if (!Number.isFinite(amountFen) || amountFen <= 0) {
+      return { ok: false, reason: `InvalidAmount:${amountFen}` };
+    }
+    if (amountFen > ORDER_GUARD.maxAmountFen) {
+      return { ok: false, reason: `AmountExceeded:${amountFen}>${ORDER_GUARD.maxAmountFen}` };
+    }
+    return { ok: true };
+  }
+
+  // ---------- 审计落盘 ----------
+
+  /**
+   * 写一条审计记录（JSON Lines，一行一条）。凭证字段名整条摘除、识别值只留后四位、
+   * 摘要字段本身就是白名单式（storeId/itemCount/totalQuantity/estimatedAmountFen），
+   * 不接受调用方把完整 params 塞进 summary。
+   */
+  recordAudit(entry: WriteAuditEntry): void {
+    const now = this.clock();
+    const line = {
+      time: beijingTimeString(now),
+      dateKey: beijingDateKey(now),
+      path: entry.path,
+      result: entry.result,
+      reason: entry.reason ?? null,
+      tokenId: entry.tokenId ?? null,
+      idempotencyKey: entry.idempotencyKey ?? null,
+      summary: entry.summary,
+      orderNo: entry.orderNo ?? null,
+      code: entry.code ?? null,
+      ...(entry.resolvedKeys ? { resolvedKeys: entry.resolvedKeys } : {}),
+      // 顾客维度计数键。line 是**白名单式**构造（只复制这里显式列出的字段），
+      // 所以新增审计字段必须在此显式声明一次——2026-08-19 加 customerKey 时踩过：
+      // 只在调用方传了、没在这里复制，结果按顾客计数一条都没记上，G4 验收用例当场变红。
+      // 这个显式白名单不是麻烦，是它挡住了「意外字段悄悄流进审计日志」。
+      ...(entry.customerKey ? { customerKey: entry.customerKey } : {}),
+      durationMs: entry.durationMs,
+    };
+    // 先推进内存状态机、再落盘：落盘是尽力而为（磁盘满/权限问题都不阻塞主链路），
+    // 而额度与未决闸门是护栏本身，不能因为写日志失败就不生效。
+    this.applyAuditToState(line);
+    try {
+      mkdirSync(dirname(this.auditLogPath), { recursive: true });
+      // 统一出口脱敏：整条记录（含顶层 reason）而不是只有 summary——顶层 reason 会拼接
+      // 命中路径、错误枚举一类外部来源的文本，Codex 审计实证它是可穿透的落盘口（§ 8 第 25 条）。
+      appendFileSync(this.auditLogPath, `${JSON.stringify(sanitizeAuditRecord(line))}\n`);
+    } catch {
+      // 审计写入失败不阻塞主链路判定（拒绝/放行的决定已经在 recordAudit 调用之前做出）。
+    }
+  }
+
+  /**
+   * 审计记录 → 内存状态（当日占额 + 未决集合）的唯一推进入口。
+   *
+   * 实时写入（recordAudit）与重启重建（rebuildDailyCountsFromAudit）**共用这一个函数**，
+   * 输入都是「一条审计记录的 JSON 形态」。这是刻意的：两条路径若各写一份口径，日后改动
+   * 必然一处改一处漏，而漏掉的那一处正好是重启场景——护栏被静默清零的经典姿势。
+   */
+  private applyAuditToState(line: {
+    result?: string;
+    dateKey?: string;
+    time?: string;
+    path?: string;
+    idempotencyKey?: unknown;
+    resolvedKeys?: unknown;
+    // 2026-08-19：顾客维度计数所需。历史日志里没有这个字段——那些记录只推进全局计数，
+    // 按顾客计数从 undefined 开始，不会把旧单算到任何人头上。这是刻意的取舍：
+    // 宁可按顾客计数偏松（旧单不占额度），也不要凭尾号猜归属把两个顾客的额度算混。
+    customerKey?: unknown;
+  }): void {
+    // resolved 不属于任何一次写请求，先处理掉（它的 path 只是占位）。
+    if (line.result === "resolved") {
+      const keys = Array.isArray(line.resolvedKeys) ? line.resolvedKeys : [];
+      for (const k of keys) {
+        if (typeof k !== "string") continue;
+        this.unresolvedInflight.delete(k);
+        this.unknownWrites.delete(k);
+      }
+      return;
+    }
+
+    // 其余四态只认写白名单内的路径（沿用 M2 起的重建口径，防止别的记录混进来影响护栏）。
+    if (typeof line.path !== "string" || !WRITE_WHITELIST.includes(line.path)) return;
+
+    const key = typeof line.idempotencyKey === "string" ? line.idempotencyKey : null;
+    const dateKey = line.dateKey ?? (line.time ? beijingDateKey(Date.parse(line.time)) : undefined);
+    const customerKey = typeof line.customerKey === "string" && /^[0-9a-f]{16}$/.test(line.customerKey)
+      ? line.customerKey
+      : undefined;
+    const addCount = (): void => {
+      if (dateKey) this.dailyCounts.set(dateKey, (this.dailyCounts.get(dateKey) ?? 0) + 1);
+      if (dateKey && customerKey) {
+        const ck = `${dateKey}|${customerKey}`;
+        this.customerDailyCounts.set(ck, (this.customerDailyCounts.get(ck) ?? 0) + 1);
+      }
+    };
+
+    switch (line.result) {
+      case "inflight":
+        // 请求即将发出，先挂账。等到终态记录出现时再销账。
+        if (key && dateKey) this.unresolvedInflight.set(key, { dateKey, customerKey });
+        break;
+      case "allowed":
+        if (key) this.unresolvedInflight.delete(key);
+        addCount();
+        break;
+      case "unknown":
+        if (key) {
+          this.unresolvedInflight.delete(key); // inflight 的终态到了，从「未决 inflight」转成「结果未知」
+          this.unknownWrites.set(key, { dateKey: dateKey ?? "", time: line.time ?? "" });
+        }
+        addCount();
+        break;
+      case "rejected":
+        // 明确没发生：护栏在发出前拦下，或企迈明确回话说这单没成。销账、不占额度。
+        if (key) this.unresolvedInflight.delete(key);
+        break;
+    }
+  }
+
+  // ---------- 持久化：placed-orders.json ----------
+
+  private loadPlacedOrders(): void {
+    try {
+      if (!existsSync(this.placedOrdersPath)) return;
+      const raw = JSON.parse(readFileSync(this.placedOrdersPath, "utf8")) as Record<
+        string,
+        { orderNo: string; at: number }
+      >;
+      for (const [k, v] of Object.entries(raw)) this.placedOrders.set(k, v);
+    } catch {
+      // 文件不存在或损坏：视为空记录，不阻塞启动（频次护栏靠审计日志重建，幂等靠这份文件——
+      // 两者是独立的两道防线，其中一道文件损坏不代表全部失守）。
+    }
+  }
+
+  private persistPlacedOrders(): void {
+    try {
+      mkdirSync(dirname(this.placedOrdersPath), { recursive: true });
+      const obj: Record<string, { orderNo: string; at: number }> = {};
+      for (const [k, v] of this.placedOrders) obj[k] = v;
+      writeFileSync(this.placedOrdersPath, JSON.stringify(obj, null, 2));
+    } catch {
+      // 同上：不阻塞主链路。
+    }
+  }
+
+  // ---------- 重启后重建当日计数（T9） ----------
+
+  private rebuildDailyCountsFromAudit(): void {
+    try {
+      if (!existsSync(this.auditLogPath)) return;
+      const text = readFileSync(this.auditLogPath, "utf8");
+      // 严格按文件顺序回放（inflight → 终态 → resolved 的先后关系就是靠这个顺序表达的），
+      // 逐条喂给与实时写入完全相同的状态机。历史日志里只有 allowed/rejected 两态，
+      // 回放结果与改造前一字不差——旧证据链不被本次改造推翻。
+      for (const raw of text.split("\n")) {
+        const line = raw.trim();
+        if (!line) continue;
+        let obj: Record<string, unknown>;
+        try {
+          obj = JSON.parse(line) as Record<string, unknown>;
+        } catch {
+          continue; // 单行损坏不影响其余行的重建
+        }
+        this.applyAuditToState(obj as Parameters<WriteGuard["applyAuditToState"]>[0]);
+      }
+    } catch {
+      // 审计日志本身读不到：新装机场景（文件不存在已在 existsSync 短路），
+      // 真正的"文件存在但读取中途出错"极少见，此处保守地不让异常阻塞构造函数。
+    }
+  }
+}
+
+// ---------- 单例（生产用） ----------
+let singleton: WriteGuard | null = null;
+
+export function getWriteGuard(): WriteGuard {
+  if (!singleton) singleton = new WriteGuard();
+  return singleton;
+}
+
+/**
+ * 仅供测试使用：注入一个自定义 WriteGuard 实例（通常指向临时目录的审计/幂等文件路径），
+ * 让 callWrite 内部的 getWriteGuard() 转而返回它。传 null 清除注入、恢复生产单例。
+ * 这样单元测试之间互不污染，也不会把测试数据写进真实的 logs/ 目录。
+ */
+export function setWriteGuardForTesting(guard: WriteGuard | null): void {
+  singleton = guard;
+}

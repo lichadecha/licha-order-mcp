@@ -11,6 +11,15 @@ const STORE_ID = 503542; // 深圳湾万象城
 const LANHUANG_GOODS_ID = "1123942469096853505"; // 兰皇金观音奶茶（v6 无损锚点）
 const PRACTICES = ["少冰（400ml)", "70%-L阿拉伯糖"]; // 0 元做法（smokeOrder 同锚）
 const EXPECT_TOOLS = ["find_store", "get_menu", "get_item_detail", "preview_order"];
+// M4：写工具上线后「工具数=4」的写死断言在开启态必然失败（施工令 § 8 第 19 条已登记为技术债，
+// 不是回归）。改成双态断言——本脚本按自己进程里的 LICHA_ENABLE_ORDERING 决定期望值，
+// 两种模式下分别跑都能过：
+//   未设置  → 4 个（一期四只读），且一个二期工具都不许出现（公开仓只读形象的协议层自证）
+//   =1     → 9 个（四只读 + prepare_order/place_order/bind_member/get_order_status/my_orders）
+// 注意：脚本后续步骤只调用一期四个只读工具，开启态也绝不调用任何写工具——本脚本永不下单。
+const PHASE2_TOOLS = ["prepare_order", "place_order", "bind_member", "get_order_status", "my_orders"];
+const ORDERING_ENABLED = process.env.LICHA_ENABLE_ORDERING === "1";
+const EXPECT_ALL_TOOLS = ORDERING_ENABLED ? [...EXPECT_TOOLS, ...PHASE2_TOOLS] : EXPECT_TOOLS;
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`断言失败：${msg}`);
@@ -46,9 +55,19 @@ async function main(): Promise<void> {
 
   const listed = await client.listTools();
   const names = listed.tools.map((t) => t.name).sort();
-  for (const want of EXPECT_TOOLS) assert(names.includes(want), `缺少工具 ${want}`);
-  assert(names.length === EXPECT_TOOLS.length, `工具数量 ${names.length} ≠ ${EXPECT_TOOLS.length}`);
-  console.log(`② tools/list 四工具注册 ✓（${names.join(" / ")}）`);
+  for (const want of EXPECT_ALL_TOOLS) assert(names.includes(want), `缺少工具 ${want}`);
+  assert(
+    names.length === EXPECT_ALL_TOOLS.length,
+    `工具数量 ${names.length} ≠ ${EXPECT_ALL_TOOLS.length}（LICHA_ENABLE_ORDERING=${ORDERING_ENABLED ? "1" : "未设置"}）`,
+  );
+  if (!ORDERING_ENABLED) {
+    for (const forbidden of PHASE2_TOOLS) {
+      assert(!names.includes(forbidden), `开关未设置时不该出现二期工具 ${forbidden}`);
+    }
+  }
+  console.log(
+    `② tools/list ${names.length} 个工具注册 ✓（${ORDERING_ENABLED ? "二期已开启" : "仅一期只读"}：${names.join(" / ")}）`,
+  );
 
   const store = parseToolJson(await client.callTool({ name: "find_store", arguments: { query: "深圳湾" } }));
   assert(store.matched === true && store.store.storeId === String(STORE_ID),
