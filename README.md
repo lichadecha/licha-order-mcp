@@ -1,7 +1,8 @@
 # licha-order-mcp
 
-李茶的茶 · 企迈只读 MCP Server（一期）。让 AI 在对话里找店、看菜单、组单、算预估价。
-一期物理禁写：不产生真订单、不碰钱、不读经营数据。
+李茶的茶 · 企迈点单 MCP Server。让 AI 在对话里找店、看菜单、组单算价；**开启下单能力后**还能帮顾客真实下单，付款始终在李茶小程序由顾客自己完成。
+
+**默认安装 = 只读**：不装开关就和一期完全一样，不产生任何订单、不碰钱、不读经营数据。
 
 ## 用户怎么用
 
@@ -20,7 +21,7 @@
 ```json
 "licha-order-mcp": {
   "command": "npx",
-  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.1"]
+  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.5.0"]
 }
 ```
 
@@ -30,7 +31,7 @@
 
 要求 Node ≥ 18；首次运行自动构建（prepare → tsc）。npx 找不到时换 Node 安装目录下的绝对路径。
 
-## 四个工具
+## 四个工具（默认只读形态）
 
 | 工具 | 用途 |
 | --- | --- |
@@ -38,6 +39,8 @@
 | get_menu | 看菜单：无 keyword 返回分类，有 keyword 返回商品列表 |
 | get_item_detail | 点单卡片：规格、做法（温度/糖度）、加料、是否估清 |
 | preview_order | 组单算预估总价（本地累加，实际金额以门店收银台/订单为准） |
+
+设置环境变量 `LICHA_ENABLE_ORDERING=1` 后另注册 5 个下单相关工具（bind_member / prepare_order / place_order / get_order_status / my_orders），安全约束见下方「安全边界」。
 
 ## 安装（WorkBuddy / 任意 MCP 客户端）
 
@@ -48,13 +51,13 @@ mcpServers 配置：
   "mcpServers": {
     "licha-order-mcp": {
       "command": "npx",
-      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.3.1"]
+      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.5.0"]
     }
   }
 }
 ```
 
-安装命令固定指向版本标签（`#v0.3.1`），不追踪最新提交；升级时以新版 README 给出的标签为准。
+安装命令固定指向版本标签（`#v0.5.0`），不追踪最新提交；升级时以新版 README 给出的标签为准。
 
 要求 Node 不低于 18；首次安装会自动构建（prepare 钩子跑 tsc）。
 
@@ -70,9 +73,12 @@ mcpServers 配置：
 
 ## 安全边界
 
-- 只读白名单硬编码在 src/constants.ts：仅 7 条门店/菜单/详情/算价路径，写接口在 client 层物理断路（ReadOnlyViolation）。
+- 默认不注册任何写工具（`LICHA_ENABLE_ORDERING=1` 才注册），未开启时 `tools/list` 只有 4 个只读工具，写通道物理不可达。
+- 开启后写白名单硬编码只有 1 条（创建订单），白名单外一律物理断路。
+- 下单必经两阶段确认：AI 先把待确认单念给顾客 → 顾客确认 → 才提交；下单参数由服务端组装登记，AI 手里只有一个 5 分钟一次性令牌，改不了单的内容。
+- 单笔 ≤¥100、单日每顾客 ≤5 单 / 全局 ≤10 单硬护栏；**永不代付**——付款一律由顾客在李茶小程序完成。
+- 三本审计日志（读/写/访问）分离，识别值只留尾号。
 - 出参只投影公开字段（店名/地址/营业状态/商品价格），不输出店长联系方式、成本等经营字段。
-- 审计日志 logs/audit.log 只记路径/时间/成败，不记参数与凭证。
 
 ## 复验
 
