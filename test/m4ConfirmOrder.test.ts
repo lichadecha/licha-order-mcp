@@ -44,6 +44,8 @@ const PATH_DETAIL_ORDER = "v3/order/standard/cyOrderDetail";
 const PATH_ORDER_LIST = "v3/order/userAppointTimeOrderList";
 
 // ---------- 商品详情 fixture：19 位大数 ID，覆盖 SKU / 做法两组 / 加料 ----------
+// 温度组是 isRequired:1 的必选组 → G4 起，省略它就是「必选做法没选」，确认门直接拒、零令牌。
+// 所以本文件每处 prepare_order 调用都显式传温度值（除了 V6：它先撞金额上限，压的是那道门）。
 function goodsDetailFixture(goodsId: string, salePriceFen = 2400): Record<string, unknown> {
   return {
     status: true,
@@ -351,7 +353,7 @@ test("V3: prepare_order 组装的 finalParams 递归不含 isPre/preTime/isWaite
   const GOODS = "1200000000000000003";
   const router = installRouter({ [PATH_DETAIL]: goodsDetailFixture(GOODS) });
   try {
-    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const out = jsonOf(r);
     const lookup = fx.pendingStore.lookup(out.confirmToken);
     assert.equal(lookup.status, "ok");
@@ -445,7 +447,7 @@ test("V3 附 2: 登记的 finalParams 含 channelCode=AI_AGENT 且 scene=AI_AGEN
   const GOODS = "1200000000000000015";
   const router = installRouter({ [PATH_DETAIL]: goodsDetailFixture(GOODS) });
   try {
-    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     assert.equal(r.isError ?? false, false, `prepare_order 应成功：${textOf(r)}`);
     const out = jsonOf(r);
     const lookup = fx.pendingStore.lookup(out.confirmToken);
@@ -483,7 +485,7 @@ test("T1 附 1: 写请求体原文含完整 mobile/reservePhone 与 member:true�
     },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const prepOut = jsonOf(prep);
 
     // 出参面：待确认单是念给顾客听的，顾客不需要我们把他自己的号复述回去（连尾号都不给）。
@@ -526,7 +528,7 @@ test("T1 附 2: 走完整下单链路后，三本审计日志与 placed-orders.j
     },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const placed = await placeOrderConfirmedHandler({
       confirmToken: jsonOf(prep).confirmToken,
       confirmAmountYuan: 24.0,
@@ -560,7 +562,7 @@ test("T1 附 3: 会员码/动态码绑定拿不到手机号 → finalParams 不�
   const GOODS = "1200000000000000019";
   const router = installRouter({ [PATH_DETAIL]: goodsDetailFixture(GOODS, 2400) });
   try {
-    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const r = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     assert.equal(r.isError ?? false, false, `prepare_order 应成功：${textOf(r)}`);
     const lookup = fx.pendingStore.lookup(jsonOf(r).confirmToken);
     assert.equal(lookup.status, "ok");
@@ -602,7 +604,7 @@ test('V3 附 3: 发往 6.2.9 的写请求体原文含 "channelCode":"AI_AGENT" �
     },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const prepOut = jsonOf(prep);
     const placed = await placeOrderConfirmedHandler({ confirmToken: prepOut.confirmToken, confirmAmountYuan: 24.0 });
     assert.equal(placed.isError ?? false, false, `全链路应成功：${textOf(placed)}`);
@@ -674,7 +676,7 @@ test("V5-②: 令牌过期（假时钟推进 5 分钟+）→ place_order 拒绝�
     [PATH_CREATE]: { status: true, code: 0, data: { orderNo: "D-SHOULD-NOT-EXIST" } },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const token = jsonOf(prep).confirmToken;
 
     now += ORDER_GUARD.confirmTokenTtlMs + 1; // 快进过 TTL
@@ -699,7 +701,7 @@ test("V5-③: 内容不符（复述金额与待确认单不一致）→ place_or
     [PATH_CREATE]: { status: true, code: 0, data: { orderNo: "D-SHOULD-NOT-EXIST" } },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const out = jsonOf(prep);
     assert.equal(out.estimatedTotalYuan, "24.00");
 
@@ -824,7 +826,7 @@ test("V7: 读回金额与预估差 ¥2（超 ¥1 阈值）→ 返回体带 warni
     },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const r = await placeOrderConfirmedHandler({ confirmToken: jsonOf(prep).confirmToken, confirmAmountYuan: 24 });
     const out = jsonOf(r);
 
@@ -854,7 +856,7 @@ test("V8: 6.1.9 读回返回空 data → 返回体 readbackFailed=true 且含 or
     [PATH_DETAIL_ORDER]: { status: true, code: 0, data: null }, // 实测形态：查已取消订单返回空 data
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const r = await placeOrderConfirmedHandler({ confirmToken: jsonOf(prep).confirmToken, confirmAmountYuan: 24 });
     assert.equal(r.isError ?? false, false, "读回失败不该被当成下单失败");
     const out = jsonOf(r);
@@ -887,7 +889,7 @@ test("V8 附: 6.1.9 的 actualAmount 返回 null → 按读回失败处理，绝
     },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: GOODS, practices: ["少冰（400ml)"], quantity: 1 }] });
     const r = await placeOrderConfirmedHandler({ confirmToken: jsonOf(prep).confirmToken, confirmAmountYuan: 24 });
     const out = jsonOf(r);
     assert.equal(out.placed, true);
@@ -1100,7 +1102,7 @@ test("V12: 令牌 TTL 过期后，待确认单登记表在下一次登记时被�
     [PATH_DETAIL]: [goodsDetailFixture("1200000000000000011"), goodsDetailFixture("1200000000000000012")],
   });
   try {
-    const prep1 = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000011", quantity: 1 }] });
+    const prep1 = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000011", practices: ["少冰（400ml)"], quantity: 1 }] });
     const token1 = jsonOf(prep1).confirmToken;
     assert.equal(fx.pendingStore.size(), 1);
     assert.equal(fx.pendingStore.lookup(token1).status, "ok");
@@ -1110,7 +1112,7 @@ test("V12: 令牌 TTL 过期后，待确认单登记表在下一次登记时被�
     assert.equal(fx.pendingStore.size(), 1, "清理由下一次登记触发，此刻记录尚在");
 
     // 再组一张新单 → register 顺手 pruneExpired，旧条目被物理清除
-    const prep2 = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000012", quantity: 1 }] });
+    const prep2 = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000012", practices: ["少冰（400ml)"], quantity: 1 }] });
     const token2 = jsonOf(prep2).confirmToken;
     assert.equal(fx.pendingStore.size(), 1, "过期条目已被清除，只剩新登记的这一张");
     assert.equal(fx.pendingStore.lookup(token1).status, "absent", "旧令牌的记录已被物理删除");

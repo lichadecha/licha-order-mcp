@@ -522,7 +522,7 @@ test("S4: 真实签发的令牌推进时钟至过期（lookup=expired）→ writ
   const fx = installFullFixture(() => now);
   const router = installRouter({ [PATH_DETAIL]: goodsDetailFixture("1200000000000000901") });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000901", quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000901", practices: ["少冰（400ml)"], quantity: 1 }] });
     const token = JSON.parse(prep.content[0].text).confirmToken as string;
     assert.match(token, /^[0-9a-f]{32}$/, "prepare_order 应签发 32 位 hex 令牌");
     assert.strictEqual(fx.pendingStore.lookup(token).status, "ok", "刚签发时应命中");
@@ -562,7 +562,7 @@ test("S5: 正常下单链路读回 ownership_mismatch（6.1.9 回显他人 userI
     },
   });
   try {
-    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000902", quantity: 1 }] });
+    const prep = await prepareOrderHandler({ storeId: STORE_ID, items: [{ goodsId: "1200000000000000902", practices: ["少冰（400ml)"], quantity: 1 }] });
     const token = JSON.parse(prep.content[0].text).confirmToken as string;
     const result = await placeOrderConfirmedHandler({ confirmToken: token, confirmAmountYuan: 24 });
     assert.strictEqual(result.isError ?? false, false, `下单本身应成功：${result.content[0].text}`);

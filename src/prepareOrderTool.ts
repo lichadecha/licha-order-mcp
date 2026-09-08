@@ -189,6 +189,35 @@ function resolveAttaches(detail: DetailRaw, names: string[]): AttachEntry[] {
 }
 
 /**
+ * 必选做法组的服务端校验（G4）。返回本行还缺哪些必选组（含该组可选值，用来点名问顾客）。
+ *
+ * 判据是详情里的 `isRequired === 1`（手册 3.1.x「是否必选分组」）。字段缺省视为**非必选**——
+ * 「没标记」和「必选」是两回事，把没标记当必选会把正常单全拒掉。
+ *
+ * 🚨 isDefault 不自动落默认（施工判断点，回执 §9 G4）：有些必选组的某个值带 `isDefault:1`，
+ * 那是企迈小程序 UI 的预选态，不是顾客的意愿。服务端替顾客把温度选成「少冰」，
+ * 顾客拿到的是一杯他没要的冰饮——这是真实损失，且事后无法辩解「是他自己选的」。
+ * 所以必选组一律要求显式传入，与 SKILL「必选项逐项问完」同口径。
+ *
+ * 为什么校验必须在这里而不是只写进 SKILL：SKILL 是给模型的嘱咐，嘱咐会被忽略；
+ * 21 号零网络探针实测过——必选温度组存在、practices 省略，照样签出令牌、做法为空。
+ * 门只能设在服务端。
+ */
+function missingRequiredPracticeGroups(detail: DetailRaw, chosenValueNames: string[]): Array<{ name: string; values: string[] }> {
+  const chosen = new Set(chosenValueNames);
+  const missing: Array<{ name: string; values: string[] }> = [];
+  for (const group of detail.sortedPracticeList ?? []) {
+    if (group.isRequired !== 1) continue;
+    const values = (group.practiceValueList ?? [])
+      .map((v) => v.practiceValue ?? "")
+      .filter((name) => name.length > 0);
+    if (values.some((name) => chosen.has(name))) continue;
+    missing.push({ name: group.practiceName ?? "做法", values });
+  }
+  return missing;
+}
+
+/**
  * 预约单防护 · 静态自检（M1 观察点 ⑥ 的第一层护栏，纯本地检查，不发任何请求）：
  * 递归确认最终参数里不出现 isPre / preTime / isWaiterCheck / orderSubType。
  * 这些字段会让订单变成 needPay=0 的无需支付预约单，直接进门店 POS 让门店白做一杯。
@@ -305,6 +334,20 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
           `单笔金额超上限：本单预估 ¥${yuan(estimatedAmountFen)}，上限 ¥${yuan(ORDER_GUARD.maxAmountFen)}。请减少商品后重新组单。`,
         ),
       );
+    }
+
+    // ③' 必选做法门（G4）：本轮详情里每个 isRequired 组都必须被选到，缺一个就拒、零令牌。
+    // 为什么放在金额护栏之后：两道门都在签令牌之前，顺序只决定顾客先听到哪句话——
+    // 金额超限是「这单根本下不了」，做法没选是「这单还差点信息」，先说前者更省事。
+    for (let i = 0; i < items.length; i++) {
+      const line = preview.lines[i];
+      const missing = missingRequiredPracticeGroups(requireFreshRaw(freshDetails, storeId, items[i].goodsId), line.practices);
+      if (missing.length > 0) {
+        const detail = missing
+          .map((g) => `${g.name}（可选：${g.values.length > 0 ? g.values.join(" / ") : "详情里没给可选值，请让顾客到店确认"}）`)
+          .join("；");
+        return fail(new Error(`组单失败：「${line.name}」还有必选做法没选：${detail}。请逐项问顾客后重新组单。`));
+      }
     }
 
     // ④ 组装 6.2.9 最终参数（全项目唯一一份）。ID 映射用第 ② 步那一次真读的原始详情——
