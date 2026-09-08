@@ -55,12 +55,21 @@ function fenToYuan(fen: number | undefined): string {
   return (fen / 100).toFixed(2);
 }
 
-// 脏数据过滤：0 元文案假商品（"40s萃取…"之类）按 价格>0 且 type 正常 剔除
+// 列表接口（3.1.11 / 3.1.16）不带估清字段，只有上下架 status 和库存；估清（clearStatus）只在 3.1.12
+// 详情里有，所以列表层只能挡下架，估清仍由点单卡片那一关拦。这句话随 items 一起返回，
+// 让 Agent 别把「列表里有」说成「已核实在售」（盲审 B06 / 24 号 A1）。
+const CLEAR_STATUS_NOTE = "列表不含当日估清状态，是否在售以 get_item_detail 点单卡片为准";
+
+// 脏数据过滤：0 元文案假商品（"40s萃取…"之类）按 价格>0 且 type 正常 剔除；
+// 2026-09-08（24 号 A1）追加：已下架（status=20，手册 3.1.11「10 上架 / 20 下架」）不进列表——
+// 老板 M6 实测「菜单搜得到、点单卡片才暴露已下架」白耗一轮对话（施工令 §8-38）。
+// status 缺省不算下架：「没标记」和「下架」是两回事（与 G4 isRequired 缺省口径一致）。
 function isRealGoods(g: GoodsRaw): boolean {
   const skuPrice = g.goodsSkuList?.[0]?.salePrice;
   const price = typeof skuPrice === "number" ? skuPrice : g.showPriceLow;
   const typeOk = g.type === undefined || g.type === 1 || g.type === 3;
-  return typeof price === "number" && price > 0 && typeOk;
+  const notOffShelf = g.status !== 20;
+  return typeof price === "number" && price > 0 && typeOk && notOffShelf;
 }
 
 function toMenuItem(g: GoodsRaw): MenuItem {
@@ -152,24 +161,26 @@ export async function getMenu(storeId: number, keyword?: string): Promise<GetMen
       via: "category",
       categoryName: catHit.categoryName,
       items,
-      ...(items.length === 0 ? { hint: `「${catHit.categoryName}」分类下暂无可点商品` } : {}),
+      hint: items.length === 0 ? `「${catHit.categoryName}」分类下暂无可点商品` : CLEAR_STATUS_NOTE,
     };
   }
 
   const raw = await searchGoods(storeId, q);
   const items = raw.filter(isRealGoods).map(toMenuItem);
-  let hint: string | undefined;
+  let hint: string;
   if (items.length === 0) {
     hint = `没找到「${q}」相关的商品，试试换个名字或问有什么系列`;
   } else if (raw.length >= 20) {
     // 实测：搜索接口默认上限 20 条（无分页字段），泛词结果会截断
-    hint = "搜索结果较多，可能只显示了前 20 条的一部分，说更具体的名字能找得更准";
+    hint = `搜索结果较多，可能只显示了前 20 条的一部分，说更具体的名字能找得更准；${CLEAR_STATUS_NOTE}`;
+  } else {
+    hint = CLEAR_STATUS_NOTE;
   }
   return {
     mode: "items",
     storeId: String(storeId),
     via: "search",
     items,
-    ...(hint ? { hint } : {}),
+    hint,
   };
 }
