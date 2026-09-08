@@ -273,10 +273,13 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
     // 请求在这一步之前不会发出。
     const lookup = getPendingOrderStore().lookup(confirmToken);
     if (lookup.status !== "ok") {
+      // 24 号 A3：第三种失败态「被替代」——顾客改过主意、重新组过单，这张是旧版。令牌确实是我们签发的，
+      // 与 expired 同样留全值。放在金额比对之前：同价改单时金额门拦不住它，这道门才是它的正确理由。
       getWriteGuard().recordAudit({
         path: WRITE_WHITELIST[0],
         result: "rejected",
-        reason: lookup.status === "expired" ? "PendingOrderExpired" : "PendingOrderNotFound",
+        reason:
+          lookup.status === "expired" ? "PendingOrderExpired" : lookup.status === "superseded" ? "PendingOrderSuperseded" : "PendingOrderNotFound",
         // 来源判定（P-W2 第三轮微补丁）：lookup 的两种失败态来源完全不同，明文权跟着来源走——
         //   · expired：登记表**确实签发过**这张令牌（只是过了 5 分钟），值是本地 randomBytes
         //     生成的，不可能是伪装的识别值 → 留全值，排查"哪张令牌超时了"要用它；
@@ -286,7 +289,7 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
         // 代价：已 prune 的真令牌也会被当作 absent 遮成尾号。可接受——prune 只在 register 时
         // 触发且只清过期条目，被清掉的令牌本来就已经过期、已无排查价值，而"宁可多打星号"
         // 正是本轮翻转判据时定下的取舍方向。
-        tokenId: lookup.status === "expired" ? confirmToken || null : untrustedAuditValue(confirmToken),
+        tokenId: lookup.status === "expired" || lookup.status === "superseded" ? confirmToken || null : untrustedAuditValue(confirmToken),
         idempotencyKey: null,
         durationMs: 0,
       });
@@ -294,7 +297,9 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
         new Error(
           lookup.status === "expired"
             ? "确认令牌已过期（有效期 5 分钟）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。"
-            : "确认令牌无效（不存在或已被使用过）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。",
+            : lookup.status === "superseded"
+              ? "这张待确认单已被更新的一版替代（顾客之后又重新组过单），不能再提交。请按最后念给顾客的那张确认；要用这一版就重新组单。"
+              : "确认令牌无效（不存在或已被使用过）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。",
         ),
       );
     }
@@ -373,6 +378,10 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
       amountFen: pending.estimatedAmountFen,
       confirmToken,
     });
+    // 24 号 A3：callWrite 正常返回 = 令牌已 consume（成败都算提交过）。标上之后，顾客「买完再买」
+    // 的新 prepare 不会把它作废，重放它仍是既有的 TokenAlreadyUsed。callWrite 抛错的路径不标——
+    // 抛在 consume 之前的（账本闸门）令牌还没用掉，之后重组单作废它是对的。
+    getPendingOrderStore().markSubmitted(confirmToken);
 
     if (!result.ok) {
       return fail(new Error(`下单失败：${result.error?.message ?? result.message ?? "未知错误"}（${result.error?.hint ?? "请稍后再试"}）`));

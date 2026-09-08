@@ -373,7 +373,9 @@ test("F4: 改主意重组后旧令牌+新金额 → ConfirmAmountMismatch 拒且
     // 模型拿错旧令牌、复述的是顾客刚确认的新金额 → 必须拦，且写请求零发出。
     const wrong = await placeOrderConfirmedHandler({ confirmToken: oldPrep.confirmToken, confirmAmountYuan: 36.0 });
     assert.equal(wrong.isError, true, "旧令牌+新金额应被拒");
-    assert.match(textOf(wrong), /复述金额与待确认单不一致/);
+    // 2026-09-08（24 号 A3）：旧令牌现在先被「被替代」门拦住（改主意重组单 = 旧版作废），
+    // 拦截理由变了、拦截事实不变：写请求仍然零次。
+    assert.match(textOf(wrong), /已被更新的一版替代|复述金额与待确认单不一致/);
     assert.equal(router2.countOf(PATH_CREATE), 0, "拦截时写请求一次都不许发出");
 
     // 拿对新令牌 → 正常成单。

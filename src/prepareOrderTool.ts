@@ -396,7 +396,8 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
 
     // ⑥ 签发一次性确认令牌 + 登记待确认单。
     const { tokenId } = getWriteGuard().issueConfirmToken(finalParams);
-    getPendingOrderStore().register(tokenId, { finalParams, estimatedAmountFen });
+    // 24 号 A3：登记时作废这位顾客之前还没提交的待确认单，条数回给 Agent 好告诉顾客「以这张为准」。
+    const supersededPendingOrders = getPendingOrderStore().register(tokenId, { finalParams, estimatedAmountFen });
 
     audit.record({
       event: "token_issued",
@@ -424,6 +425,12 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
         lineTotalYuan: l.lineTotalYuan,
       })),
       estimatedTotalYuan: yuan(estimatedAmountFen),
+      ...(supersededPendingOrders > 0
+        ? {
+            supersededPendingOrders,
+            supersedeNote: "顾客之前还没确认的那张待确认单已作废，只有这张能提交；别拿旧的 confirmToken。",
+          }
+        : {}),
       // 取餐话术只承诺确定存在的机制（老板 2026-08-22 拍板，§8-40 销项）：接口单有没有
       // 「取餐号」从未实测过，说了顾客到店可能报不出来；小程序订单页是付款后必经的既有链路，
       // 按它的提示走永远不会错。「报取餐号」的旧文案曾让模型照着念、被 §8-40 当成模型发挥登记。

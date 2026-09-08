@@ -34,10 +34,21 @@ export interface PendingOrder {
    * （两个时钟不同源），而且会让"过期拒绝"的用例假阳性通过。
    */
   issuedAt: number;
+  /**
+   * 24 号 A3：被哪张新单替代了。同一顾客重新组单（改温度 / 换商品 / 同价改法）时，前一版待确认单
+   * 在这里打上新令牌的 ID——不物理删除，是为了让 place_order 拿旧令牌来时能报出「被替代」这个
+   * 准确理由，而不是含糊的「查无此单」。盲审 B04：同价改单旧令牌照样能提交，系统没表达「这一版已作废」。
+   */
+  supersededBy?: string;
+  /**
+   * 24 号 A3：这张单已经真的走过 place_order 的写出口（令牌已被 consume）。register 不再作废它——
+   * 「买完再买」是独立的新购买，不是改主意；同时保住重放旧令牌时 TokenAlreadyUsed 这个既有理由。
+   */
+  submitted?: boolean;
 }
 
-/** 登记入参：不含 issuedAt——它由存储自己的时钟盖章，见 PendingOrder.issuedAt 的说明。 */
-export type PendingOrderInput = Omit<PendingOrder, "issuedAt">;
+/** 登记入参：不含 issuedAt / supersededBy / submitted——都由存储自己盖章。 */
+export type PendingOrderInput = Omit<PendingOrder, "issuedAt" | "supersededBy" | "submitted">;
 
 interface PendingOrderStoreOptions {
   clock?: () => number;
@@ -56,9 +67,32 @@ export class PendingOrderStore {
    * 不起定时器（省掉一整套生命周期管理），在"反正要写这张表"的时刻顺手扫一遍即可，
    * 单日 ≤5 单的量级下这几乎零成本。
    */
-  register(tokenId: string, order: PendingOrderInput): void {
+  register(tokenId: string, order: PendingOrderInput): number {
     this.pruneExpired();
+    // 24 号 A3：同一顾客名下、还没提交、也还没被替代的待确认单，全部标成「被这张替代」。
+    // 判断点（24 号 §9）：不按门店区分——SKILL 是「一单三步」串行对话，同一顾客并行两张独立待确认单
+    // 在对话流里不存在；改主意换店也是改主意。已提交的单不碰（那是「买完再买」）。
+    const userId = String(order.finalParams.userId ?? "");
+    let superseded = 0;
+    if (userId) {
+      for (const [id, entry] of this.entries) {
+        if (id === tokenId || entry.submitted || entry.supersededBy) continue;
+        if (String(entry.finalParams.userId ?? "") !== userId) continue;
+        entry.supersededBy = tokenId;
+        superseded++;
+      }
+    }
     this.entries.set(tokenId, { ...order, issuedAt: this.clock() });
+    return superseded;
+  }
+
+  /**
+   * 24 号 A3：place_order 的写出口跑过之后调用（不论企迈成败——令牌已被 consume 就算「提交过」）。
+   * 之后的 register 不再作废它；重放它仍走 callWrite 的 TokenAlreadyUsed，既有理由不被「被替代」盖住。
+   */
+  markSubmitted(tokenId: string): void {
+    const entry = this.entries.get(tokenId);
+    if (entry) entry.submitted = true;
   }
 
   /**
@@ -76,10 +110,14 @@ export class PendingOrderStore {
    * 过期条目在这里也不删除——清理统一由 pruneExpired 负责（register 时顺手触发），
    * 这样"过期"这个状态在被清理之前是稳定可报的，拒绝理由不会因为查询次数而变化。
    */
-  lookup(tokenId: string): { status: "ok"; order: PendingOrder } | { status: "expired" } | { status: "absent" } {
+  lookup(
+    tokenId: string,
+  ): { status: "ok"; order: PendingOrder } | { status: "expired" } | { status: "absent" } | { status: "superseded"; supersededBy: string } {
     const entry = this.entries.get(tokenId);
     if (!entry) return { status: "absent" };
     if (this.isExpired(entry)) return { status: "expired" };
+    // 24 号 A3：过期优先于被替代——「时间到了」是更早、更确定的事实；两者对顾客都是「重新组单」。
+    if (entry.supersededBy) return { status: "superseded", supersededBy: entry.supersededBy };
     return { status: "ok", order: entry };
   }
 
