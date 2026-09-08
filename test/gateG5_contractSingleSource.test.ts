@@ -12,7 +12,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -49,6 +50,9 @@ async function handshake(enableOrdering: string | undefined): Promise<HandshakeR
   } else {
     env.LICHA_ENABLE_ORDERING = enableOrdering;
   }
+  // 24 号 A4 之后 server 一启动就写一条 access-audit；spawn 出来的子进程必须把日志钉到
+  // 临时目录，否则会落进生产 logs/，打红其他文件里的「生产 logs 哈希快照不变」断言（§8-42）。
+  env.LICHA_LOG_DIR = mkdtempSync(join(tmpdir(), "licha-spawn-logs-"));
 
   const transport = new StdioClientTransport({ command: process.execPath, args: [SERVER_ENTRY], env });
   const client = new Client({ name: "licha-mcp-test-g5", version: "0.1.0" });

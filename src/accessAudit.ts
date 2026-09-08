@@ -37,7 +37,12 @@ export type AccessAuditEvent =
   // 刻意与 bind_success 分开成独立事件，而不是给它加个 reason 了事——「换人」是审计上
   // 最该一眼看见的事：谁把谁换掉了、连带作废了几张待确认单。混进 bind_success 里，
   // 事后翻日志就得逐条读 reason 才能发现会话中途换过人。
-  | "rebind_success";
+  | "rebind_success"
+  // 2026-09-08 新增（24 号 A4）：MCP 进程启动。会话绑定与待确认单都在进程内存里，宿主
+  // （WorkBuddy）回收 stdio 进程后它们随之清空，而宿主不落盘 stdio 进程的启停记录——
+  // 2026-09-08 侦察单那次「绑定成功 3 分钟后下单报未绑定」只能靠 bind_success 出现两次反推。
+  // 有了这一条，重启了几次、什么时候重启，直接数日志。reason 记 版本|pid|写开关。
+  | "server_started";
 
 export interface AccessAuditEntry {
   event: AccessAuditEvent;

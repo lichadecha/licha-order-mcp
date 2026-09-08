@@ -16,6 +16,7 @@ import { prepareOrderHandler } from "./prepareOrderTool.js";
 import { myOrdersHandler } from "./myOrdersTool.js";
 import { bindMemberHandler } from "./bindMemberTool.js";
 import { getOrderStatusHandler } from "./orderStatusTool.js";
+import { getAccessAuditLogger } from "./accessAudit.js";
 
 const SERVER_NAME = "licha-order-mcp";
 // 版本号单源：只认 package.json，不在代码里另抄一份。
@@ -267,6 +268,13 @@ if (ORDERING_ENABLED) {
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // 24 号 A4：启动留痕。写在 connect 之后——connect 成功才算「这个进程真的起来服务了」。
+  // record() 自带 try/catch，日志目录不可写也不阻塞启动（access-audit 一向是尽力而为）。
+  getAccessAuditLogger().record({
+    event: "server_started",
+    result: "allowed",
+    reason: `v${SERVER_VERSION}|pid=${process.pid}|ordering=${ORDERING_ENABLED ? 1 : 0}`,
+  });
   const writeNote = ORDERING_ENABLED
     ? " + prepare_order/place_order/bind_member/get_order_status/my_orders（二期已开启）"
     : "（二期工具未开启）";
