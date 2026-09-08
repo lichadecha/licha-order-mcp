@@ -279,6 +279,11 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
       return fail(e);
     }
 
+    // ①-b 账本健康闸门（G2）：账本恢复失败过就不许走下单流程，拦在**签令牌之前**。
+    // 理由同第 ③ 步的金额护栏前置：早失败早改口——让顾客听完一张念得很完整的待确认单、
+    // 说「就这个」，才被告知下不了单，是最差的交互。
+    getWriteGuard().assertLedgerHealthy();
+
     // ② 算价与商品校验：一期 previewOrder 是唯一算价来源（估清、规格、做法互斥的拦截都在里面）。
     const preview: PreviewResult = await previewOrder(storeId, items);
     if (!preview.ok || !preview.lines || !preview.totalYuan) {

@@ -394,6 +394,41 @@ interface WriteGuardOptions {
   placedOrdersPath?: string;
 }
 
+// ---------- G2：账本 fail-closed 的两个错误类（2026-09-08） ----------
+//
+// 为什么必须是「不许发单」而不是「记不上就算了」：这本账本不是日志，是护栏本身。
+// 未决闸门、当日额度、幂等去重三条防线全靠它在重启后恢复；写不进去就等于「请求发出过」
+// 这个事实没有任何地方记着——进程一重启，本地以为什么都没发生，而企迈侧可能躺着一张
+// 真实订单（21 号用 /dev/full、盲审用「把账本路径设成目录」都复现过：请求放行一次、
+// 活进程计数 1、重建后计数 0、未决 false）。
+//
+// 两个类分开是因为两件事的处置不同：写不进去（LedgerWriteFailed）由调用点在发请求前挡下；
+// 已存在的账本读不出来（LedgerUnavailable）是启动期就已确定的故障态，要挡住所有写工具。
+export class LedgerWriteFailed extends Error {
+  constructor(detail: string) {
+    super(`LedgerWriteFailed: 安全账本写入失败（${detail}）。本次请求未发出——账本记不上，就没有任何东西能证明这一单发生过。`);
+    this.name = "LedgerWriteFailed";
+  }
+}
+
+export class LedgerUnavailable extends Error {
+  constructor(fault: string) {
+    super(
+      `LedgerUnavailable: 安全账本不可用（${fault}）。已拒绝下单——` +
+        `未决闸门、当日额度、幂等去重都靠这本账本恢复，读不出它就等于没有护栏。` +
+        `请人工检查该文件，修复或移走后重启本服务；只读查询不受影响。`,
+    );
+    this.name = "LedgerUnavailable";
+  }
+}
+
+/** 把 fs 异常压成一行可读、不含敏感内容的原因（errno + 文件名，不带完整路径外的任何东西）。 */
+function describeFsError(e: unknown, filePath: string): string {
+  const code = (e as { code?: string })?.code;
+  const msg = e instanceof Error ? e.message : String(e);
+  return `${filePath}${code ? `：${code}` : ""}${code ? "" : `：${msg}`}`;
+}
+
 // ---------- 未决写请求条目（G1，2026-09-08） ----------
 //
 // 改造前内存里只留 `{ dateKey, customerKey }` / `{ dateKey, time }`，于是 resolveUnresolvedWrites
@@ -499,6 +534,15 @@ export class WriteGuard {
   private readonly clock: () => number;
   private readonly auditLogPath: string;
   private readonly placedOrdersPath: string;
+  /**
+   * 账本故障态（G2）：非空 = 这本账本的恢复没有成功，写工具一律不许放行。
+   *
+   * 改造前这些失败全被 catch 吞掉、按「新装机零账本」继续跑：账本是目录、权限不足、
+   * 日志某一行被截断，进程都照样起来，护栏看起来在、实际从零开始（22 号 F02）。
+   * 现在**记下来但不抛**——构造函数抛错会连只读工具一起打死，而只读没有任何风险；
+   * 拦在写路径上（assertLedgerHealthy）才是这道门要的位置。
+   */
+  private ledgerFault: string | null = null;
 
   constructor(opts?: WriteGuardOptions) {
     this.clock = opts?.clock ?? Date.now;
@@ -508,6 +552,29 @@ export class WriteGuard {
     // T9 关键：当日计数不能只放内存——启动时（含"进程重启"这个场景）必须从写审计日志重建，
     // 否则重启一次就能把频次护栏清零绕过。
     this.rebuildDailyCountsFromAudit();
+  }
+
+  // ---------- 账本健康态（G2） ----------
+
+  /** 账本故障原因；null = 恢复成功。给测试与错误提示用，不含凭证与识别值。 */
+  ledgerFaultReason(): string | null {
+    return this.ledgerFault;
+  }
+
+  /**
+   * 写路径的账本前置闸门：账本恢复失败过 → 抛 LedgerUnavailable，不许下单。
+   *
+   * 调用点有三处，从早到晚排：prepare_order 签令牌前（别让顾客听完一张单才被拒）、
+   * place_order 未决闸门前、callWrite 发请求前（离真实动作最近的那一道）。
+   * 三道都要，理由同 callWrite ⓪ 的写能力开关：写请求是不可撤销的现实动作。
+   */
+  assertLedgerHealthy(): void {
+    if (this.ledgerFault) throw new LedgerUnavailable(this.ledgerFault);
+  }
+
+  /** 记下账本故障（只记第一条——第一条才是根因，后面的多半是它的连带）。 */
+  private markLedgerFault(reason: string): void {
+    if (!this.ledgerFault) this.ledgerFault = reason;
   }
 
   // ---------- 确认令牌：签发 / 校验 / 消耗 ----------
@@ -830,6 +897,53 @@ export class WriteGuard {
    * 不接受调用方把完整 params 塞进 summary。
    */
   recordAudit(entry: WriteAuditEntry): void {
+    const line = this.buildAuditLine(entry);
+    // 先推进内存状态机、再落盘：落盘是尽力而为（磁盘满/权限问题都不阻塞主链路），
+    // 而额度与未决闸门是护栏本身，不能因为写日志失败就不生效。
+    // live=true：这条 inflight 是本进程实时写的，对应的请求此刻正在飞（见 PendingWriteEntry.live）。
+    this.applyAuditToState(line, { live: true });
+    try {
+      this.appendAuditLine(line);
+    } catch (e) {
+      // 审计写入失败不阻塞主链路判定（拒绝/放行的决定已经在 recordAudit 调用之前做出）。
+      // 但要记下故障：这一条记不上，账本就已经与现实不符了，**下一次**写请求必须被挡住
+      // （G2：见 assertLedgerHealthy）。改造前这里是空 catch，账本悄悄残缺、护栏照旧放行。
+      this.markLedgerFault(describeFsError(e, this.auditLogPath));
+    }
+  }
+
+  /**
+   * durable 落盘（G2）：**先写成盘、再推进内存**；写失败抛 LedgerWriteFailed，内存一个字节都不改。
+   *
+   * 与 recordAudit 的顺序刻意相反，因为两者服务的决定不同：
+   *   · recordAudit 用在「决定已经做完」的记录上（拒绝、终态），落盘失败不该反过来推翻决定；
+   *   · recordAudiDurable 用在「这条记录本身是放行的前提」的地方——callWrite 的 inflight。
+   *     那一行的全部价值是「进程若在请求途中被杀，磁盘上仍留着『有个请求发出去了』这个事实」。
+   *     它写不进去，这个价值就是零，此时唯一正确的动作是**不要发那个请求**。
+   *
+   * appendFileSync 返回时数据已经交给内核，不存在「还在缓冲区里就崩了」的窗口——
+   * 所以「写成了」这个确认是真的，不是尽力而为。
+   */
+  recordAuditDurable(entry: WriteAuditEntry): void {
+    const line = this.buildAuditLine(entry);
+    try {
+      this.appendAuditLine(line);
+    } catch (e) {
+      const detail = describeFsError(e, this.auditLogPath);
+      this.markLedgerFault(detail);
+      throw new LedgerWriteFailed(detail);
+    }
+    this.applyAuditToState(line, { live: true });
+  }
+
+  private appendAuditLine(line: Record<string, unknown>): void {
+    mkdirSync(dirname(this.auditLogPath), { recursive: true });
+    // 统一出口脱敏：整条记录（含顶层 reason）而不是只有 summary——顶层 reason 会拼接
+    // 命中路径、错误枚举一类外部来源的文本，Codex 审计实证它是可穿透的落盘口（§ 8 第 25 条）。
+    appendFileSync(this.auditLogPath, `${JSON.stringify(sanitizeAuditRecord(line))}\n`);
+  }
+
+  private buildAuditLine(entry: WriteAuditEntry): Record<string, unknown> {
     const now = this.clock();
     const line = {
       time: beijingTimeString(now),
@@ -850,18 +964,7 @@ export class WriteGuard {
       ...(entry.customerKey ? { customerKey: entry.customerKey } : {}),
       durationMs: entry.durationMs,
     };
-    // 先推进内存状态机、再落盘：落盘是尽力而为（磁盘满/权限问题都不阻塞主链路），
-    // 而额度与未决闸门是护栏本身，不能因为写日志失败就不生效。
-    // live=true：这条 inflight 是本进程实时写的，对应的请求此刻正在飞（见 PendingWriteEntry.live）。
-    this.applyAuditToState(line, { live: true });
-    try {
-      mkdirSync(dirname(this.auditLogPath), { recursive: true });
-      // 统一出口脱敏：整条记录（含顶层 reason）而不是只有 summary——顶层 reason 会拼接
-      // 命中路径、错误枚举一类外部来源的文本，Codex 审计实证它是可穿透的落盘口（§ 8 第 25 条）。
-      appendFileSync(this.auditLogPath, `${JSON.stringify(sanitizeAuditRecord(line))}\n`);
-    } catch {
-      // 审计写入失败不阻塞主链路判定（拒绝/放行的决定已经在 recordAudit 调用之前做出）。
-    }
+    return line;
   }
 
   /**
@@ -969,16 +1072,23 @@ export class WriteGuard {
   // ---------- 持久化：placed-orders.json ----------
 
   private loadPlacedOrders(): void {
+    // 文件不存在 = 新装机，这是唯一允许「按空账本继续」的情形（G2）。
+    if (!existsSync(this.placedOrdersPath)) return;
     try {
-      if (!existsSync(this.placedOrdersPath)) return;
       const raw = JSON.parse(readFileSync(this.placedOrdersPath, "utf8")) as Record<
         string,
         { orderNo: string; at: number }
       >;
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        this.markLedgerFault(`${this.placedOrdersPath}：内容不是幂等键映射对象`);
+        return;
+      }
       for (const [k, v] of Object.entries(raw)) this.placedOrders.set(k, v);
-    } catch {
-      // 文件不存在或损坏：视为空记录，不阻塞启动（频次护栏靠审计日志重建，幂等靠这份文件——
-      // 两者是独立的两道防线，其中一道文件损坏不代表全部失守）。
+    } catch (e) {
+      // 文件**存在但读不出来**（是个目录 / 权限不足 / JSON 损坏）→ 故障态，不许再下单。
+      // 改造前这里按空记录继续：幂等表凭空清零，同一份下单内容可以再下一遍，
+      // 而企迈侧没有任何幂等字段能兜底（§8-4）。
+      this.markLedgerFault(describeFsError(e, this.placedOrdersPath));
     }
   }
 
@@ -988,36 +1098,48 @@ export class WriteGuard {
       const obj: Record<string, { orderNo: string; at: number }> = {};
       for (const [k, v] of this.placedOrders) obj[k] = v;
       writeFileSync(this.placedOrdersPath, JSON.stringify(obj, null, 2));
-    } catch {
-      // 同上：不阻塞主链路。
+    } catch (e) {
+      // 这一步发生在下单**已经成功之后**，抛错会让上层误报「下单失败」并可能重下，
+      // 所以不抛；但幂等表没落盘 = 重启后这一单的去重防线不存在，属实打实的账本故障，
+      // 记下来让下一次写请求被 assertLedgerHealthy 挡住（G2 fail-closed 的方向）。
+      this.markLedgerFault(describeFsError(e, this.placedOrdersPath));
     }
   }
 
   // ---------- 重启后重建当日计数（T9） ----------
 
   private rebuildDailyCountsFromAudit(): void {
+    // 文件不存在 = 新装机（唯一允许按零账本继续的情形）。
+    if (!existsSync(this.auditLogPath)) return;
+    let text: string;
     try {
-      if (!existsSync(this.auditLogPath)) return;
-      const text = readFileSync(this.auditLogPath, "utf8");
-      // 严格按文件顺序回放（inflight → 终态 → resolved 的先后关系就是靠这个顺序表达的），
-      // 逐条喂给与实时写入完全相同的状态机。历史日志里只有 allowed/rejected 两态，
-      // 回放结果与改造前一字不差——旧证据链不被本次改造推翻。
-      for (const raw of text.split("\n")) {
-        const line = raw.trim();
-        if (!line) continue;
-        let obj: Record<string, unknown>;
-        try {
-          obj = JSON.parse(line) as Record<string, unknown>;
-        } catch {
-          continue; // 单行损坏不影响其余行的重建
-        }
-        // live=false：从日志重建的 inflight，那个请求早已随进程消亡，不可能还在飞——
-        // 它正是「可以、也必须靠一次真实读回来核对」的那一类未决。
-        this.applyAuditToState(obj as Parameters<WriteGuard["applyAuditToState"]>[0], { live: false });
+      text = readFileSync(this.auditLogPath, "utf8");
+    } catch (e) {
+      // 文件存在却读不出来（是个目录 / 权限不足）→ 故障态。改造前这里按零账本继续：
+      // 当日额度与未决闸门双双清零，而「重启就能绕过护栏」正是 T9 当初要堵的那件事。
+      this.markLedgerFault(describeFsError(e, this.auditLogPath));
+      return;
+    }
+    // 严格按文件顺序回放（inflight → 终态 → resolved 的先后关系就是靠这个顺序表达的），
+    // 逐条喂给与实时写入完全相同的状态机。历史日志里只有 allowed/rejected 两态，
+    // 回放结果与改造前一字不差——旧证据链不被本次改造推翻。
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        // 单行损坏 = 账本故障，**不是**可以跳过的小事（G2 总工裁决）：被截断的那一行
+        // 很可能正是一条 inflight（进程被杀在 append 中途，这恰恰是最需要它的场景），
+        // 跳过它就等于丢掉一笔未决——而丢掉未决的后果是顾客被扣两次钱。
+        this.markLedgerFault(`${this.auditLogPath}：第 ${i + 1} 行不是合法 JSON（可能被截断）`);
+        continue;
       }
-    } catch {
-      // 审计日志本身读不到：新装机场景（文件不存在已在 existsSync 短路），
-      // 真正的"文件存在但读取中途出错"极少见，此处保守地不让异常阻塞构造函数。
+      // live=false：从日志重建的 inflight，那个请求早已随进程消亡，不可能还在飞——
+      // 它正是「可以、也必须靠一次真实读回来核对」的那一类未决。
+      this.applyAuditToState(obj as Parameters<WriteGuard["applyAuditToState"]>[0], { live: false });
     }
   }
 }

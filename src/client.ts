@@ -287,6 +287,16 @@ export async function callWrite<T = unknown>(
     throw new WriteDisabled();
   }
 
+  // ⓪-b 账本健康闸门（G2）：这本账本恢复失败过 → 不许下单。
+  // 位置在开关之后、白名单之前：它挡的是「护栏的持久化载体坏了」，比任何单笔参数校验都更靠前。
+  // 记审计用尽力而为的 recordAudit（这条记录本身记不上也无所谓，决定已经做出了）。
+  try {
+    guard.assertLedgerHealthy();
+  } catch (e) {
+    guard.recordAudit({ ...auditBase, result: "rejected", reason: "LedgerUnavailable", idempotencyKey: null, durationMs: Date.now() - t0 });
+    throw e;
+  }
+
   // ① 写白名单——不在名单里，连指纹都不算，直接拒绝（先记审计、再抛错、请求不发出）。
   if (!WRITE_WHITELIST.includes(path)) {
     guard.recordAudit({ ...auditBase, result: "rejected", reason: "WriteNotAllowed", idempotencyKey: null, durationMs: Date.now() - t0 });
@@ -348,7 +358,13 @@ export async function callWrite<T = unknown>(
   // OOM、机器断电），日志里必须留下「有一个请求已经发出去了、结果不知道」这个事实，
   // 否则重启后本地会以为什么都没发生过，而企迈侧可能已经躺着一张真实订单。
   // appendFileSync 是同步落盘，返回时数据已经交给内核，不存在「还在缓冲区里就崩了」的窗口。
-  guard.recordAudit({ ...auditWithKey, result: "inflight", reason: "RequestAboutToBeSent", durationMs: Date.now() - t0 });
+  // G2：这一行改用 durable 落盘——**先写成盘、再推进内存、才发请求**。
+  // 改造前是「先改内存、再尽力落盘、异常吞掉」，于是账本不可写时请求照样发出去：
+  // 活进程里计数 1、未决 true，重启后计数 0、未决 false（21 号用 /dev/full 复现）。
+  // 那本该是最需要账本的时刻，恰恰是账本什么都没留下的时刻。
+  // 写不成 → LedgerWriteFailed 冒泡，fetch 一次都不会被调用；令牌已 consume 是既定语义
+  //（用后即焚），顾客重新走一次 prepare_order 即可。
+  guard.recordAuditDurable({ ...auditWithKey, result: "inflight", reason: "RequestAboutToBeSent", durationMs: Date.now() - t0 });
 
   try {
     await throttle();

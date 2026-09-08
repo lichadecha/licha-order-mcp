@@ -341,6 +341,11 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
     // 解除方式不是「模型说核对完了」，而是真的去 my_orders / get_order_status 走一次读回：
     // 那两个工具拿到企迈真实数据之后会自动销账（见 WriteGuard.resolveUnresolvedWrites 注释）。
     const guard = getWriteGuard();
+    // ⑥-a 账本健康闸门（G2）：排在未决闸门之前——未决闸门的判据本身就来自这本账本，
+    // 账本没恢复成功时 hasUnresolvedWrite() 返回的 false 是**不可信的 false**
+    // （22 号 F02：按零账本继续，于是「没有未决」）。先确认账本可信，再问它有没有未决。
+    guard.assertLedgerHealthy();
+
     if (guard.hasUnresolvedWrite()) {
       const pendingInfo = guard.describeUnresolvedWrites();
       guard.recordAudit({
