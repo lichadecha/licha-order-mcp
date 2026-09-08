@@ -17,18 +17,29 @@ interface SkuRaw {
 }
 
 interface PracticeGroupRaw {
+  practiceId?: string | number;
   practiceName?: string;
-  practiceValueList?: Array<{ practiceValue?: string; price?: number }>;
+  /** 是否必选分组（手册 3.1.x：1 必选）。缺省视为非必选——这是「没标记」，不是「必选」。 */
+  isRequired?: number;
+  practiceValueList?: Array<{ practiceValueId?: string | number; practiceValue?: string; price?: number; isDefault?: number }>;
 }
 
-interface DetailRaw {
+/**
+ * 商品详情的原始响应（getShopGoodsDetail 单条）。
+ *
+ * 为什么把它导出：ItemDetail 是给顾客看的投影（名字 + 价格），刻意丢掉了 practiceId /
+ * practiceValueId / attachGoodsId / isRequired 这些企迈内部字段——下单组装和必选做法校验
+ * 却必须用它们。导出原始类型，是为了让「本轮真读的那一次详情」能同时喂给算价与组装，
+ * 而不是各读一次（G3：两次读可能读到两个价格，签出去的确认单就两头不着）。
+ */
+export interface DetailRaw {
   goodsId: string | number;
   name: string;
   type?: number;
   status?: number;
   goodsSkuList?: SkuRaw[];
   sortedPracticeList?: PracticeGroupRaw[];
-  attachGoodsList?: Array<{ attachGoodsName?: string; attachGoodsPrice?: number }>;
+  attachGoodsList?: Array<{ attachGoodsId?: string | number; attachGoodsName?: string; attachGoodsPrice?: number }>;
   labelList?: Array<{ text?: string; labelTypeText?: string }>;
   categoryList?: Array<{ categoryName?: string }>;
 }
@@ -138,11 +149,17 @@ function toDetail(g: DetailRaw): ItemDetail {
   };
 }
 
-export async function getItemDetail(storeId: number, goodsId: string): Promise<ItemDetail> {
-  const key = `${storeId}:${goodsId}`;
-  const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < DETAIL_TTL_MS) return hit.detail;
-
+/**
+ * G3：绕过浏览缓存真读一次详情，投影与原始响应一起交出去。
+ *
+ * 为什么下单链路必须走这个入口：浏览缓存管的是「顾客翻菜单时别每次都打接口」，
+ * 5 分钟内它可能已经和门店实际对不上（缓存 ¥20、现价 ¥120）。确认单上的金额与可售状态
+ * 是要念给顾客、并直接变成真实订单的，只能来自本轮这一次真读。
+ * 返回 raw 是为了让同一次读的结果同时够用于算价、可售校验与下单 ID 映射——
+ * 少读一次是附带好处，真正的目的是「一张确认单只对着一个价格」。
+ * 读到的结果照旧写进缓存：浏览继续受益，缓存本身不废（任务书 G3「不许做」第一条）。
+ */
+export async function fetchItemDetailFresh(storeId: number, goodsId: string): Promise<{ detail: ItemDetail; raw: DetailRaw }> {
   const r = await call<DetailRaw[]>("v3/goods/item/getShopGoodsDetail", {
     storeId,
     goodsIds: [goodsId],
@@ -155,7 +172,16 @@ export async function getItemDetail(storeId: number, goodsId: string): Promise<I
   if (!Array.isArray(r.data) || r.data.length === 0) {
     throw new Error("商品详情查询失败：商品不存在或已下架（换个商品试试）");
   }
-  const detail = toDetail(r.data[0]);
-  cache.set(key, { at: Date.now(), detail });
-  return detail;
+  const raw = r.data[0];
+  const detail = toDetail(raw);
+  cache.set(`${storeId}:${goodsId}`, { at: Date.now(), detail });
+  return { detail, raw };
+}
+
+export async function getItemDetail(storeId: number, goodsId: string): Promise<ItemDetail> {
+  const key = `${storeId}:${goodsId}`;
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.at < DETAIL_TTL_MS) return hit.detail;
+
+  return (await fetchItemDetailFresh(storeId, goodsId)).detail;
 }

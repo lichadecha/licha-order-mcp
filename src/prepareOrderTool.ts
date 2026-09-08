@@ -20,8 +20,8 @@
 //    展示给顾客的金额用「元」（两位小数）。6.2.9 响应的 payAmount 是元、6.1.9 的 actualAmount
 //    是分——三处单位不同是实测坐实的，禁止复用同名字段的解析逻辑。
 
-import { callRead } from "./client.js";
-import { CHANNEL, ORDER_GUARD, STORES } from "./constants.js";
+import { ORDER_GUARD, STORES } from "./constants.js";
+import { fetchItemDetailFresh, type DetailRaw, type ItemDetail } from "./tools/getItemDetail.js";
 import { previewOrder, type OrderItemInput, type PreviewResult } from "./tools/previewOrder.js";
 import { getWriteGuard } from "./writeGuard.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
@@ -100,50 +100,20 @@ export interface OrderItemParams {
   attachList: AttachEntry[];
 }
 
-// ---------- 商品详情原始响应（只取组装 ID 需要的字段） ----------
-// 为什么不用 tools/getItemDetail.ts 的 ItemDetail：那份投影是给顾客看的（名字 + 价格），
-// 刻意丢掉了 practiceId / practiceValueId / attachGoodsId 这些企迈内部 ID——一期不需要它们，
-// 二期下单却必须传。一期四个工具文件是不许改的不变量，所以这里独立取一次原始响应做 ID 映射。
+// ---------- 商品详情原始响应（组装 ID 与必选做法校验都用它） ----------
+// 为什么不用 tools/getItemDetail.ts 的 ItemDetail 投影：那份投影是给顾客看的（名字 + 价格），
+// 刻意丢掉了 practiceId / practiceValueId / attachGoodsId / isRequired 这些企迈内部字段——
+// 一期不需要它们，二期下单却必须用。所以用同一次真读返回的 DetailRaw（tools/getItemDetail.ts 导出）。
+//
+// 🚨 G3：这里绝不再单独发一次详情请求。确认单的金额、可售状态、下单 ID 必须同出**一次**真读——
+// 分两次读不只是多花一次调用，而是两次可能读回两个价格：算价用了第一次的、下单参数用了第二次的，
+// 签给顾客的那张单就两头不着。本轮那一次真读由 prepareOrderHandler 持有（freshDetails）。
 // 注意：这里只做「名字 → ID」的查表，绝不重算价格——价格以 previewOrder 的结果为准。
-interface RawSku {
-  skuId?: string | number;
-  salePrice?: number;
-  clearStatus?: number;
-  specName?: string;
-  skuName?: string;
-}
-
-interface RawPracticeGroup {
-  practiceId?: string | number;
-  practiceName?: string;
-  practiceValueList?: Array<{ practiceValueId?: string | number; practiceValue?: string; price?: number }>;
-}
-
-interface RawDetail {
-  goodsId?: string | number;
-  name?: string;
-  goodsSkuList?: RawSku[];
-  sortedPracticeList?: RawPracticeGroup[];
-  attachGoodsList?: Array<{ attachGoodsId?: string | number; attachGoodsName?: string; attachGoodsPrice?: number }>;
-}
 
 function idOrUndefined(v: string | number | undefined): string | undefined {
   if (v == null) return undefined;
   const s = String(v);
   return s.length > 0 ? s : undefined;
-}
-
-async function fetchRawDetail(storeId: number, goodsId: string): Promise<RawDetail> {
-  const r = await callRead<RawDetail[]>("v3/goods/item/getShopGoodsDetail", {
-    storeId,
-    goodsIds: [goodsId],
-    ...CHANNEL,
-    includeProperties: ["SKU", "PRACTICE", "ATTACH", "LABEL", "CATEGORY"],
-  });
-  if (!r.ok || !Array.isArray(r.data) || r.data.length === 0) {
-    throw new Error(`组单失败：商品 ${goodsId} 的下单信息取不到（${r.error?.message ?? r.message ?? "商品不存在或已下架"}）`);
-  }
-  return r.data[0];
 }
 
 /**
@@ -154,7 +124,7 @@ async function fetchRawDetail(storeId: number, goodsId: string): Promise<RawDeta
  * 排在最前面，一旦某个 SKU 同时有 skuItemList 与 specName 且两者不同，多规格商品就会反查不到
  * skuId。两处口径不一致的后果不是报错，而是"组单时好时坏"，所以在这里钉死并写明原因。
  */
-function resolveSkuId(detail: RawDetail, specName: string, explicitSkuId?: string): string {
+function resolveSkuId(detail: DetailRaw, specName: string, explicitSkuId?: string): string {
   const skus = detail.goodsSkuList ?? [];
   if (explicitSkuId) {
     const hit = skus.find((s) => String(s.skuId ?? "") === explicitSkuId);
@@ -170,7 +140,7 @@ function resolveSkuId(detail: RawDetail, specName: string, explicitSkuId?: strin
 }
 
 /** 按做法值名找它所在的组与两个 ID。previewOrder 已校验过这些值名合法、同组不重复。 */
-function resolvePractices(detail: RawDetail, valueNames: string[]): PracticeEntry[] {
+function resolvePractices(detail: DetailRaw, valueNames: string[]): PracticeEntry[] {
   const out: PracticeEntry[] = [];
   for (const wanted of valueNames) {
     let hit: PracticeEntry | undefined;
@@ -198,7 +168,7 @@ function resolvePractices(detail: RawDetail, valueNames: string[]): PracticeEntr
 }
 
 /** 按加料名找 ID；同名重复出现按份数聚合成 num（previewOrder 的算价也是按出现次数累加，口径一致）。 */
-function resolveAttaches(detail: RawDetail, names: string[]): AttachEntry[] {
+function resolveAttaches(detail: DetailRaw, names: string[]): AttachEntry[] {
   const counts = new Map<string, number>();
   for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
 
@@ -254,6 +224,23 @@ function storeName(storeId: number): string | undefined {
   return STORES.find((s) => s.storeId === storeId)?.name;
 }
 
+/**
+ * 取本轮真读到的原始详情。preview.ok 意味着每一行都走过 detailProvider，所以正常路径必有；
+ * 取不到只可能是本文件将来被改坏（比如又在别处绕开 freshDetails 组装），
+ * 这时宁可组单失败也不能拿一份来源不明的详情去拼下单参数。
+ */
+function requireFreshRaw(
+  freshDetails: Map<string, { detail: ItemDetail; raw: DetailRaw }>,
+  storeId: number,
+  goodsId: string,
+): DetailRaw {
+  const hit = freshDetails.get(`${storeId}:${goodsId}`);
+  if (!hit) {
+    throw new Error(`组单失败：商品 ${goodsId} 的下单信息取不到（本轮详情缺失，请重新组单）`);
+  }
+  return hit.raw;
+}
+
 export interface PrepareOrderInput {
   storeId: number;
   items: OrderItemInput[];
@@ -285,7 +272,25 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
     getWriteGuard().assertLedgerHealthy();
 
     // ② 算价与商品校验：一期 previewOrder 是唯一算价来源（估清、规格、做法互斥的拦截都在里面）。
-    const preview: PreviewResult = await previewOrder(storeId, items);
+    //
+    // 🚨 G3 本轮真读：详情由本函数持有的 detailProvider 提供——每个 goodsId 在这一轮 prepare 里
+    // 绕过浏览缓存真读一次、只读一次，结果同时用于算价、可售校验（previewOrder 内部）和
+    // 第 ④ 步的 ID 映射。缓存里的旧价格从此进不了确认单：本轮价 ¥120 就按 ¥120 组单、
+    // 该撞金额上限就撞，绝不会拿 5 分钟前缓存的 ¥20 去签一张能提交的令牌。
+    // 顾客思考期间上游改价不在本门范围内（任务书 G3「不许做」第二条）——创建后的权威读回
+    // 与差额告警照旧兜那一段。
+    const freshDetails = new Map<string, { detail: ItemDetail; raw: DetailRaw }>();
+    const preview: PreviewResult = await previewOrder(storeId, items, {
+      detailProvider: async (s, goodsId) => {
+        const key = `${s}:${goodsId}`;
+        let hit = freshDetails.get(key);
+        if (!hit) {
+          hit = await fetchItemDetailFresh(s, goodsId);
+          freshDetails.set(key, hit);
+        }
+        return hit.detail;
+      },
+    });
     if (!preview.ok || !preview.lines || !preview.totalYuan) {
       return fail(new Error(`${preview.error?.message ?? "组单失败"}（${preview.error?.hint ?? "换一款试试"}）`));
     }
@@ -302,13 +307,13 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
       );
     }
 
-    // ④ 组装 6.2.9 最终参数（全项目唯一一份）。ID 映射按行取原始详情——
+    // ④ 组装 6.2.9 最终参数（全项目唯一一份）。ID 映射用第 ② 步那一次真读的原始详情——
     // previewOrder 已经确认了每一行的规格名/做法名/加料名都合法，这里只做"名字 → 企迈 ID"的反查。
     const orderItems: OrderItemParams[] = [];
     for (let i = 0; i < items.length; i++) {
       const line = preview.lines[i];
       const input = items[i];
-      const detail = await fetchRawDetail(storeId, input.goodsId);
+      const detail = requireFreshRaw(freshDetails, storeId, input.goodsId);
       orderItems.push({
         goodsId: input.goodsId,
         skuId: resolveSkuId(detail, line.specName, input.skuId),

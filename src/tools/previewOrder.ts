@@ -23,6 +23,15 @@ export interface OrderLine {
   lineTotalYuan: string;
 }
 
+export interface PreviewOptions {
+  /**
+   * 详情来源。省略即用带缓存的 getItemDetail（浏览链路：preview_order 工具行为不变）。
+   * 确认单链路（prepare_order）传本轮真读一次的详情源——算价用的那份详情，
+   * 必须和组装下单参数用的是同一份（G3）。
+   */
+  detailProvider?: (storeId: number, goodsId: string) => Promise<ItemDetail>;
+}
+
 export interface PreviewResult {
   ok: boolean;
   computedBy: "local";
@@ -44,10 +53,14 @@ function isFail(r: OrderLine | PreviewResult): r is PreviewResult {
 }
 
 // 单个商品行：详情 → 选 SKU → 匹配做法/加料 → 算单价（全程整数分）
-async function buildLine(storeId: number, item: OrderItemInput): Promise<OrderLine | PreviewResult> {
+async function buildLine(
+  storeId: number,
+  item: OrderItemInput,
+  fetchDetail: (storeId: number, goodsId: string) => Promise<ItemDetail>,
+): Promise<OrderLine | PreviewResult> {
   let detail: ItemDetail;
   try {
-    detail = await getItemDetail(storeId, item.goodsId);
+    detail = await fetchDetail(storeId, item.goodsId);
   } catch (e) {
     return fail(`商品查询失败：${(e as Error).message}`, "换个商品试试");
   }
@@ -120,7 +133,8 @@ async function buildLine(storeId: number, item: OrderItemInput): Promise<OrderLi
   };
 }
 
-export async function previewOrder(storeId: number, items: OrderItemInput[]): Promise<PreviewResult> {
+export async function previewOrder(storeId: number, items: OrderItemInput[], opts: PreviewOptions = {}): Promise<PreviewResult> {
+  const fetchDetail = opts.detailProvider ?? getItemDetail;
   if (!Array.isArray(items) || items.length === 0) {
     return fail("单子是空的", "先告诉我要点什么");
   }
@@ -130,7 +144,7 @@ export async function previewOrder(storeId: number, items: OrderItemInput[]): Pr
   const lines: OrderLine[] = [];
   let totalFen = 0;
   for (const item of items) {
-    const r = await buildLine(storeId, item);
+    const r = await buildLine(storeId, item, fetchDetail);
     if (isFail(r)) return r;
     lines.push(r);
     totalFen += Math.round(parseFloat(r.lineTotalYuan) * 100);

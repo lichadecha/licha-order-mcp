@@ -320,11 +320,12 @@ test("V2: 绑定后 prepare_order 成功 → 返回待确认单与令牌；登�
     assert.equal(a0.num, 1);
     assert.equal(a0.price, 0);
 
-    // 调用成本可预期：每个商品行恰好 2 次详情调用——previewOrder 内的 getItemDetail 一次
-    // （算价与估清校验），本文件的 ID 映射一次（取 practiceId/practiceValueId/attachGoodsId，
-    // 那些 ID 被一期的 ItemDetail 投影丢掉了、而一期四个工具文件是不许改的不变量）。
-    // 真实对话里模型通常已经调过 get_item_detail，getItemDetail 的 5 分钟缓存会把第一次省掉。
-    assert.equal(router.countOf(PATH_DETAIL), 2, "单商品行的详情调用应恰好 2 次");
+    // 调用成本可预期：每个商品行恰好 1 次详情调用（G3 起，原为 2 次）——
+    // 算价与估清校验、ID 映射（practiceId/practiceValueId/attachGoodsId）同出这一次真读。
+    // 改成 1 次不是为了省调用：读两次就可能读到两个价格，签给顾客的确认单会两头不着
+    // （盲审 B03：缓存 ¥20、本轮 ¥120，仍按 ¥20 签出可提交的令牌）。
+    // 这一次是绕过浏览缓存的真读——确认单的金额与可售状态只认本轮，缓存只服务浏览。
+    assert.equal(router.countOf(PATH_DETAIL), 1, "单商品行的详情调用应恰好 1 次（本轮真读一次，算价与 ID 映射共用）");
 
     // access-audit 记 token_issued，只记金额与行数、不记商品明细
     const entry = lastAuditEntry(fx.accessAuditPath);
