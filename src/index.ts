@@ -2,6 +2,7 @@
 // N7a MCP 协议接线：stdio server 注册四柜台工具（找店 / 菜单 / 点单卡片 / 算总价）。
 // stdout 纪律：stdout 是 MCP 协议通道，本进程禁止 console.log；日志一律 stderr。
 
+import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -17,7 +18,16 @@ import { bindMemberHandler } from "./bindMemberTool.js";
 import { getOrderStatusHandler } from "./orderStatusTool.js";
 
 const SERVER_NAME = "licha-order-mcp";
-const SERVER_VERSION = "0.3.1";
+// 版本号单源：只认 package.json，不在代码里另抄一份。
+// 抄一份的代价已经付过：硬编码的 "0.3.1" 跟着 package.json 升到 0.5.1 一路没人改，
+// 双态握手对外报的一直是 0.3.1，宿主看到的版本与安装的版本对不上。
+// 为什么用 createRequire 而不是 import json：真正被运行的是编译产物 dist/src/index.js
+// （bin 指向它，测试也 spawn 它），往上两级就是包根 —— package.json `files: ["dist"]`，
+// npx 装出来的形态同样成立。走 import + resolveJsonModule 会让 tsc 把 package.json
+// 复制进 dist，那又变成两份版本号。
+const { version: SERVER_VERSION } = createRequire(import.meta.url)("../../package.json") as {
+  version: string;
+};
 
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
@@ -197,11 +207,20 @@ if (ORDERING_ENABLED) {
     "bind_member",
     {
       title: "绑定会员身份",
+      // 描述与 SKILL.md「绑定会员」章节、bindMemberTool 的三条分支逐条对齐。
+      // 为什么盯着这段文本：注册描述与 SKILL 是同时发给 Agent 的两套指令，写法相左时
+      // Agent 收到的是矛盾要求。这里原先还写着「绑定后不可切换、换人重开会话」，
+      // 那是 2026-08-19 之前的规矩，代码早已改成直接换绑（见 bindMemberTool 头部注释）。
       description:
-        "绑定当前会话到一位李茶的茶会员，之后才能下单或查自己的订单。一个会话只能绑定一位会员，" +
-        "绑定后不可切换——要换人请重新开启会话。三种标识形态：phone=11 位手机号；" +
-        "card=实体卡号或会员码；dynamic_code=小程序「会员码」页面显示的动态码（每 30 秒刷新一次，" +
-        "需要请顾客当场打开小程序读出，这是对外默认推荐的形态）。",
+        "绑定当前会话到一位李茶的茶会员，之后才能下单或查自己的订单；只在顾客明确要下单时才绑定。" +
+        "默认用顾客注册会员的手机号（codeType=phone）。" +
+        "换人直接换绑：顾客报一个新号，照常再调一次本工具就行，不需要任何额外动作——" +
+        "换成了另一位会员时出参带 rebound=true（旧顾客还没确认的待确认单会被作废，见 discardedPendingOrders）；" +
+        "报的还是同一位会员则是幂等成功、不改任何状态，出参不带 rebound，别说成「换绑成功」。" +
+        "唯一拦换人的情况：上一次下单请求结果还没核对清楚时本工具会拒绝，" +
+        "先用 my_orders 或 get_order_status 把那一单核对掉再换人。" +
+        "三种标识形态：phone=11 位手机号（默认）；card=实体卡号或会员码；" +
+        "dynamic_code=小程序「会员码」页面显示的动态码（每 30 秒刷新一次，需要请顾客当场打开小程序读出）。",
       inputSchema: {
         code: z
           .string()
@@ -211,7 +230,7 @@ if (ORDERING_ENABLED) {
         codeType: z
           .enum(["phone", "card", "dynamic_code"])
           .describe(
-            "标识形态：phone=11 位手机号；card=实体卡号/会员码；dynamic_code=小程序会员码页动态码（每 30 秒刷新，对外默认形态）",
+            "标识形态：phone=11 位手机号，默认用这个；card=实体卡号/会员码；dynamic_code=小程序会员码页动态码（每 30 秒刷新，顾客报不出手机号时才用）",
           ),
       },
     },
