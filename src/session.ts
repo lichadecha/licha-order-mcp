@@ -40,7 +40,11 @@ export interface SessionBinding {
   phone?: string;
 }
 
-/** 一个会话已经绑定过会员身份，再次尝试绑定（无论是否同一个人）都会命中这个错误。 */
+/**
+ * `SessionStore.bind` 在该会话键已有绑定时抛出——它只保护「不覆盖」这一条不变量。
+ * 现行 bind_member 编排（bindMemberTool.ts）不会走到这里：同一个人再报号走幂等成功，
+ * 换人走 rebind 直接换绑，只有无绑定时才调 bind。留着是为了 bind 的语义自洽。
+ */
 export class SessionAlreadyBound extends Error {
   constructor(existing: SessionBinding) {
     const last4 = existing.customerId.slice(-4);
@@ -48,7 +52,7 @@ export class SessionAlreadyBound extends Error {
     const boundAtStr = beijingTimeString(existing.boundAt);
     super(
       `SessionAlreadyBound：本会话已绑定会员（***${last4}，绑定于 ${boundAtStr}）。` +
-        `一个会话只能绑定一位会员，要换人请重开会话。`,
+        `同一个人再报一次号是幂等成功，换人用 bind_member 直接换绑，都不该走到这里。`,
     );
     this.name = "SessionAlreadyBound";
   }
@@ -65,8 +69,9 @@ export class SessionNotBound extends Error {
 /**
  * 会话态存储：按会话键分组的绑定关系。
  *
- * 规则：一会话一次绑定，即使是同一个人再绑也拒绝——语义最清晰，也不用为了判断"是不是同一人"
- * 再多花一次接口调用（本身也没有可靠的"是不是同一人"判据，客户端标识本来就可能对应多个会员）。
+ * 规则：同一时刻一个会话键只挂一位会员，换人一律走 rebind 覆盖（老板拍板「换人就解绑」）。
+ * bind 本身不覆盖既有绑定——把「换绑」这个动作显式化，谁在覆盖谁一眼看得见；
+ * 是不是同一个人由上层 bind_member 按 customerId 判断（同人幂等，不改一个字节的状态）。
  */
 export class SessionStore {
   private bindings = new Map<string, SessionBinding>();
