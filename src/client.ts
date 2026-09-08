@@ -59,8 +59,10 @@ export interface ApiResult<T = unknown> {
 // ID 长 19 位超 float64 精度：响应文本在 JSON.parse 前把长数字 ID 字符串化；
 // 发送前再把字符串 ID 还原为 JSON 数字（v6 实测数字形式服务端可正确处理）。
 // 代码内所有 ID 全程 string。
-const ID_NUM_RE = /"(\w*[iI]d)"\s*:\s*(\d{15,})/g;
-const ID_STR_RE = /"(\w*[iI]d)"\s*:\s*"(\d{15,})"/g;
+// 24 号 A5：键名再加 tradeMark——5.1.7 筛券的商品行用 `tradeMark` 装 goodsId（19 位），
+// 2026-08-25 实测（tradeMark=goodsId 判定正确）发出的是 JSON 数字；不加这一条它会以字符串发出，与实测不同形。
+const ID_NUM_RE = /"(\w*[iI]d|tradeMark)"\s*:\s*(\d{15,})/g;
+const ID_STR_RE = /"(\w*[iI]d|tradeMark)"\s*:\s*"(\d{15,})"/g;
 
 export function protectIds(text: string): string {
   return text.replace(ID_NUM_RE, '"$1":"$2"');
@@ -139,10 +141,17 @@ function getCreds(): Credentials {
 // 二期改造：原 call() 原样改名为 callRead()，逻辑与 READONLY_WHITELIST 一字未动——
 // 这是一期「零写自证」证据链不被推翻的前提。文末 `export const call = callRead` 保留别名，
 // 四个一期工具文件的 import 一行都不用改。
-export async function callRead<T = unknown>(path: string, params: Record<string, unknown>): Promise<ApiResult<T>> {
+export async function callRead<T = unknown>(
+  path: string,
+  params: Record<string, unknown>,
+  // 24 号 A5：可选重试次数（默认 3 = 既有行为一字不变）。查券是组单的顺带增强，失败不该让顾客
+  // 多等 1s+2s 的退避——传 1 表示只试一次；只读白名单判断与其余逻辑不受影响。
+  opts: { attempts?: number } = {},
+): Promise<ApiResult<T>> {
   if (!READONLY_WHITELIST.includes(path) && !READONLY_WHITELIST_PHASE2.includes(path)) {
     throw new ReadOnlyViolation(path);
   }
+  const attempts = Math.max(1, Math.min(3, opts.attempts ?? 3));
   const c = getCreds();
   const nonce = randomInt(1_000_000, 1_000_000_000);
   const timestamp = Math.floor(Date.now() / 1000);
@@ -153,7 +162,7 @@ export async function callRead<T = unknown>(path: string, params: Record<string,
   );
 
   let lastError: unknown = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     await throttle();
     const t0 = Date.now();
     try {
@@ -166,7 +175,7 @@ export async function callRead<T = unknown>(path: string, params: Record<string,
       audit(path, resp.ok, Date.now() - t0);
       if (resp.status >= 500) {
         lastError = new Error(`HTTP ${resp.status}`);
-        if (attempt < 2) await backoff(attempt);
+        if (attempt < attempts - 1) await backoff(attempt);
         continue;
       }
       const data = JSON.parse(protectIds(text)) as { status?: boolean; code?: number; message?: string; data?: T };
@@ -185,7 +194,7 @@ export async function callRead<T = unknown>(path: string, params: Record<string,
       };
     } catch (e) {
       lastError = e;
-      if (attempt < 2) await backoff(attempt);
+      if (attempt < attempts - 1) await backoff(attempt);
     }
   }
   return {

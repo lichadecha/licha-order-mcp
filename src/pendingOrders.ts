@@ -40,6 +40,8 @@ export interface PendingOrder {
    * 准确理由，而不是含糊的「查无此单」。盲审 B04：同价改单旧令牌照样能提交，系统没表达「这一版已作废」。
    */
   supersededBy?: string;
+  /** 24 号 A5：组单时预测「系统默认会用的券」，下单读回后与实际用券比对。没查到券时缺省。 */
+  predictedCoupon?: { title: string; canDisFen: number };
   /**
    * 24 号 A3：这张单已经真的走过 place_order 的写出口（令牌已被 consume）。register 不再作废它——
    * 「买完再买」是独立的新购买，不是改主意；同时保住重放旧令牌时 TokenAlreadyUsed 这个既有理由。

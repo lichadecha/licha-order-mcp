@@ -135,6 +135,8 @@ interface ReadbackResult {
   readbackNote?: string;
   qmaiActualAmountYuan?: string;
   discountList?: unknown[];
+  /** 24 号 A5：读回里实际用掉的优惠（投影字段），以及与组单时预测的比对。 */
+  couponApplied?: { items: Array<{ name: string; summary?: string; amountYuan: string }>; matchesPrediction?: boolean; note: string };
   estimatedTotalYuan: string;
   diffYuan?: string;
   warning?: string;
@@ -149,6 +151,7 @@ async function readbackOrder(
   orderNo: string,
   estimatedAmountFen: number,
   binding: SessionBinding,
+  predictedCoupon?: { title: string; canDisFen: number },
 ): Promise<ReadbackResult> {
   const base: ReadbackResult = { orderNo, estimatedTotalYuan: yuan(estimatedAmountFen) };
 
@@ -211,6 +214,7 @@ async function readbackOrder(
   }
 
   const rawDiscounts = (resp.data as Record<string, unknown>).discountList;
+  const couponApplied = projectCouponApplied(Array.isArray(rawDiscounts) ? rawDiscounts : [], predictedCoupon);
   const diffFen = actualFen - estimatedAmountFen;
   const absDiff = Math.abs(diffFen);
   // 「取严」= 绝对值阈值与百分比阈值哪个更小就用哪个，任一被突破即告警。
@@ -220,12 +224,50 @@ async function readbackOrder(
     ...base,
     qmaiActualAmountYuan: yuan(actualFen),
     discountList: Array.isArray(rawDiscounts) ? rawDiscounts : [],
+    ...(couponApplied ? { couponApplied } : {}),
     diffYuan: yuan(diffFen),
     ...(absDiff > threshold
       ? {
           warning: `金额与预估不一致：企迈实付 ¥${yuan(actualFen)}，本地预估 ¥${yuan(estimatedAmountFen)}，差额 ¥${yuan(diffFen)}。请先向顾客说清这个差额并核对，再引导付款。`,
         }
       : {}),
+  };
+}
+
+/**
+ * 24 号 A5：把 6.1.9 读回的 discountList 投影成 Agent 能直接念的形态，并与组单时的预测比对。
+ * 实测（2026-08-25）条目形态：{ discountName:"优惠券", discountSummary:"单杯任意饮品5折券:¥12.00", discountAmount:1200(分), discountType:2 }。
+ * 只投影名称 / 摘要 / 金额，不带 discountId / extraMap（盲审 B05）。没有优惠条目时返回 undefined。
+ */
+function projectCouponApplied(
+  rawDiscounts: unknown[],
+  predicted?: { title: string; canDisFen: number },
+): ReadbackResult["couponApplied"] | undefined {
+  const items: Array<{ name: string; summary?: string; amountYuan: string }> = [];
+  for (const raw of rawDiscounts) {
+    if (!raw || typeof raw !== "object") continue;
+    const d = raw as { discountName?: unknown; discountSummary?: unknown; discountAmount?: unknown };
+    const amountFen = typeof d.discountAmount === "number" && Number.isFinite(d.discountAmount) ? Math.round(d.discountAmount) : 0;
+    const name = typeof d.discountName === "string" && d.discountName.trim() ? d.discountName.trim() : "优惠";
+    const summary = typeof d.discountSummary === "string" && d.discountSummary.trim() ? d.discountSummary.trim() : undefined;
+    items.push({ name, ...(summary ? { summary } : {}), amountYuan: yuan(amountFen) });
+  }
+  if (items.length === 0) {
+    return predicted
+      ? { items, matchesPrediction: false, note: `组单时预测会用「${predicted.title}」，读回里没有任何优惠——请按读回实付如实告知，别再说用了券。` }
+      : undefined;
+  }
+  const said = items.map((i) => `${i.summary ?? i.name}（抵 ¥${i.amountYuan}）`).join("；");
+  if (!predicted) {
+    return { items, note: `门店系统自动使用了优惠：${said}。请如实告知顾客「系统自动用了你的券」，不是算错。` };
+  }
+  const matches = items.some((i) => (i.summary ?? "").includes(predicted.title) || i.name.includes(predicted.title));
+  return {
+    items,
+    matchesPrediction: matches,
+    note: matches
+      ? `与组单时告知的一致：${said}。`
+      : `与组单时告知的不一致——念单时说的是「${predicted.title}」，实际用的是：${said}。请如实更正后再引导付款。`,
   };
 }
 
@@ -399,7 +441,7 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
     }
 
     // ⑧ 强制读回（立刻，趁订单还活着）。读回失败不算下单失败。
-    const readback = await readbackOrder(orderNo, pending.estimatedAmountFen, binding);
+    const readback = await readbackOrder(orderNo, pending.estimatedAmountFen, binding, pending.predictedCoupon);
 
     // 6.2.9 响应的 payAmount 单位是「元」（实测 24.0），与 6.1.9 的 actualAmount（分）不同单位——
     // 原样带出、不做换算、不与分制字段混算，只作为第三方对照值给模型看。
@@ -411,6 +453,7 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
       ...(payAmountYuanRaw != null ? { qmaiPayAmountYuanFromCreate: String(payAmountYuanRaw) } : {}),
       nextStep:
         "订单已创建但尚未支付。请把企迈实付金额与优惠明细念给顾客，" +
+        (readback.couponApplied ? "优惠部分按 couponApplied.note 如实说明（系统自动用了哪张券、抵了多少），" : "") +
         (readback.warning ? "先说清金额差额并核对，再" : "") +
         "引导顾客去小程序「我的订单」完成付款——我们不代付、不碰任何支付凭据。",
     });

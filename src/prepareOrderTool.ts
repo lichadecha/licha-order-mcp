@@ -27,6 +27,7 @@ import { getWriteGuard } from "./writeGuard.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
 import { getPendingOrderStore } from "./pendingOrders.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
+import { previewCoupons, type CouponPreview } from "./couponPreview.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -394,10 +395,26 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
     // ⑤ 预约单字段静态自检（组装完成后必跑一次）。
     assertNoPreOrderFields(finalParams);
 
+    // ⑤-b 24 号 A5：查券、事前告知。只读、一次尝试、失败不阻塞——这是「AI 对话充当确认页」的前半
+    // （施工令 §8-47：企迈默认用券、Agent 单没有确认页）。门店编码表里没有这家店就不查，如实说明。
+    const shopCode = STORES.find((s) => s.storeId === storeId)?.code;
+    const coupons: CouponPreview = shopCode
+      ? await previewCoupons({
+          customerId: binding.customerId,
+          shopCode,
+          lines: preview.lines.map((l, i) => ({ goodsId: items[i].goodsId, quantity: l.quantity, unitPriceFen: yuanStringToFen(l.unitPriceYuan) })),
+          estimatedAmountFen,
+        })
+      : { available: false, usable: [], unusable: [], note: "这家门店不在编码表里，本次未查券；下单后以读回实付为准。" };
+
     // ⑥ 签发一次性确认令牌 + 登记待确认单。
     const { tokenId } = getWriteGuard().issueConfirmToken(finalParams);
     // 24 号 A3：登记时作废这位顾客之前还没提交的待确认单，条数回给 Agent 好告诉顾客「以这张为准」。
-    const supersededPendingOrders = getPendingOrderStore().register(tokenId, { finalParams, estimatedAmountFen });
+    const supersededPendingOrders = getPendingOrderStore().register(tokenId, {
+      finalParams,
+      estimatedAmountFen,
+      ...(coupons.predicted ? { predictedCoupon: { title: coupons.predicted.title, canDisFen: Math.round(Number(coupons.predicted.canDisYuan) * 100) } } : {}),
+    });
 
     audit.record({
       event: "token_issued",
@@ -425,6 +442,7 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
         lineTotalYuan: l.lineTotalYuan,
       })),
       estimatedTotalYuan: yuan(estimatedAmountFen),
+      coupons,
       ...(supersededPendingOrders > 0
         ? {
             supersededPendingOrders,
@@ -438,7 +456,8 @@ export async function prepareOrderHandler({ storeId, items }: PrepareOrderInput)
       expiresInMinutes: ORDER_GUARD.confirmTokenTtlMs / 60000,
       note:
         "请把以上内容逐项念给顾客确认（门店、每杯商品与规格做法、杯数、总金额）。" +
-        "顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元）。" +
+        "coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；没有就不提券。" +
+        "顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。" +
         `令牌 ${ORDER_GUARD.confirmTokenTtlMs / 60000} 分钟内有效、只能用一次，过期请重新组单。`,
     });
   } catch (e) {

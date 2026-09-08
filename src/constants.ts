@@ -65,4 +65,8 @@ export const READONLY_WHITELIST_PHASE2: readonly string[] = [
   "v3/order/status", // 6.1.5 查询订单状态
   "v3/order/standard/cyOrderDetail", // 6.1.9 查询订单详情（M4 接工具）
   "v3/order/userAppointTimeOrderList", // 6.1.6 用户订单列表（M4 接工具）
+  // 24 号 A5（2026-09-08）：5.1.7 筛券——给定购物车逐张判定会员的券能不能用、能抵多少。只读、基础计费。
+  // 用途是「组单时事前告知系统默认会用哪张券」（施工令 §8-47：企迈后端对无券指令单默认用券，Agent 单没有
+  // 确认页，顾客不知道自己的券要被用掉）。不指定券、不核销——那些是写接口，不在本名单。
+  "v3/bsns/customer/chooseCouponAsOne", // 5.1.7 筛选可用优惠券（A5 接 prepare_order）
 ];
