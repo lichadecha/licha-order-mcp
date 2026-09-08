@@ -7,7 +7,7 @@
 
 import { callRead } from "./client.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
-import { getWriteGuard, untrustedAuditValue } from "./writeGuard.js";
+import { customerCountKey, getWriteGuard, untrustedAuditValue } from "./writeGuard.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -51,6 +51,9 @@ const STATUS_TEXT_MAP: Record<number, string> = {
 export function statusText(status: number): string {
   return STATUS_TEXT_MAP[status] ?? `未知状态(${status})`;
 }
+
+/** 已经不需要再付款的三个终态：已完成 / 已取消 / 已关闭（G1：这类单不许提示付款）。 */
+export const SETTLED_STATUSES: ReadonlySet<number> = new Set([50, 60, 70]);
 
 export interface OrderStatusInput {
   orderNo: string;
@@ -104,28 +107,46 @@ export async function getOrderStatusHandler({ orderNo }: OrderStatusInput): Prom
       return fail(new Error("无法查询：该订单不属于当前绑定的会员"));
     }
 
-    // ⑤ 「已发出≠已成功」闸门的解除点（M5 前置修复第 1 项，同 my_orders）：这一步意味着
-    // 企迈侧确实有这张单、且确实属于当前会员——一次真实发生的 6.1.5 读回。
-    // 查无此单（上面 resp.ok=false 已返回）不销账：连订单号都查不到，证明不了那笔状态未知的
-    // 写请求到底有没有建单，要核对「有没有那一单」应该用 my_orders 按时间段列。
-    const resolvedPendingWrites = getWriteGuard().resolveUnresolvedWrites({
+    // ⑤ 未决核对（G1 收紧，2026-09-08）：这一步意味着企迈侧确实有这张单、且属于当前会员，
+    // 但**它证明不了这张单就是那笔结果未知的请求建出来的**——6.1.5 的响应只有
+    // `status / storeOrderNo / userId`，没有下单时间、没有门店，一张单和一次请求之间没有
+    // 任何可核对的连接点。改造前这里无条件清掉全部未决，于是「查一张三天前的已完成旧单」
+    // 就能把闸门和额度一起清空（盲审 B01 / 审计反例 unrelated_old_order_clears_all）。
+    //
+    // 现在照样把证据交给 guard（判据只有一份，不在工具层另写一套），但如实标注这份证据的
+    // 成色：没有时间字段、不是完整列表 → guard 必然保留未知。核对「有没有那一单」要用
+    // my_orders 按时间段列，那条路径才有 orderAt。
+    const rawStatus = resp.data?.status;
+    const status = typeof rawStatus === "number" ? rawStatus : Number(rawStatus);
+    const guard = getWriteGuard();
+    const outcome = guard.resolveUnresolvedWrites({
       via: "get_order_status",
-      checkedOrderCount: 1,
+      customerKey: customerCountKey(binding.customerId),
+      orders: [{ orderNo, ...(Number.isFinite(status) ? { status } : {}) }],
+      complete: false,
     });
 
     // ⑥ 通过 → 只返回 orderNo/status/statusText，不返回 userId（连自己的也不返回）。
-    const rawStatus = resp.data?.status;
-    const status = typeof rawStatus === "number" ? rawStatus : Number(rawStatus);
+    // 付款引导按状态给（21 号 P0-1 发现 B）：已完成 / 已取消 / 已关闭的单再劝顾客付款，
+    // 是在让顾客对着一张不需要付款的单找付款入口。
+    const settled = SETTLED_STATUSES.has(status);
     return ok({
       orderNo,
       status,
       statusText: statusText(status),
-      ...(resolvedPendingWrites > 0
+      paymentHint: settled
+        ? `这张单已经是「${statusText(status)}」，不需要再付款。`
+        : status === 10
+          ? "这张单还没付款，请引导顾客去小程序「我的订单」完成付款。"
+          : `这张单当前是「${statusText(status)}」，按小程序订单页的提示走即可。`,
+      ...(outcome.released.length > 0 ? { resolvedPendingWrites: outcome.released.length } : {}),
+      ...(guard.hasUnresolvedWrite()
         ? {
-            resolvedPendingWrites,
+            unresolvedPendingWrites: guard.describeUnresolvedWrites().total,
             pendingWriteNote:
-              "此前有下单请求结果未知、下单闸门被暂时关闭；本次核对已解除闸门。" +
-              "这张单已经真实存在，请引导顾客直接付款，不要重复下单。",
+              "此前有下单请求结果未知、下单闸门仍然关着。这一次按单号查到的单**不能**用来核对那笔请求——" +
+              "6.1.5 的回执里没有下单时间，无法判断它是不是那一次建出来的。" +
+              "请改用 my_orders（按时间段列最近订单）核对，那条路径带下单时间。",
           }
         : {}),
     });

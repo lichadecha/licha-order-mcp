@@ -57,6 +57,25 @@ export function beijingTimeString(ts: number = Date.now()): string {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} +08:00`;
 }
 
+// beijingTimeString 的固定输出形态 → 毫秒时间戳（G1，2026-09-08）。
+//
+// 为什么需要它：G1 要把「未决写请求」和「企迈侧那张单」按时间窗关联，而未决条目在重启后
+// 只能从审计日志重建，日志里的时间只有 `time` 这个人类可读字符串。不解析它就没有时间窗，
+// 没有时间窗就只能退回「查到任意一张单就全清」——那正是 B01 的缺陷形态。
+//
+// 为什么不用 Date.parse：那个格式（空格分隔 + "+08:00"）不是 ISO 8601，Date.parse 对它的
+// 处理属实现相关行为（Node 当前能解析，别的引擎/将来版本不保证）。手写解析是确定的，
+// 而「时间窗算错」的后果是错误销账——这道门的判据不能建在实现相关行为上。
+const BEIJING_TIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) \+08:00$/;
+
+export function parseBeijingTimeString(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const m = BEIJING_TIME_RE.exec(value);
+  if (!m) return null;
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]) - 8, Number(m[5]), Number(m[6]));
+  return Number.isFinite(ms) ? ms : null;
+}
+
 // ---------- 顾客维度计数键：sha256(userId) 前 16 hex ----------
 //
 // 为什么要哈希而不是直接用 userId：完整会员 ID 落盘违 §8-26 硬纪律。
@@ -375,6 +394,90 @@ interface WriteGuardOptions {
   placedOrdersPath?: string;
 }
 
+// ---------- 未决写请求条目（G1，2026-09-08） ----------
+//
+// 改造前内存里只留 `{ dateKey, customerKey }` / `{ dateKey, time }`，于是 resolveUnresolvedWrites
+// 手上除了「有几笔未决」之外一无所知，只能一次全清。B01 的缺陷不是那个函数写错了，是它
+// **没有可核对的东西**——修法因此是把审计记录里本来就有的线索在内存里留下来。
+//
+// 刻意不改账本文件格式（总工裁决）：`idempotencyKey / time / dateKey / customerKey /
+// summary.{storeId,estimatedAmountFen}` 这些字段自 M2 起就在写审计日志里，本结构只是把它们
+// 从日志行搬进内存条目。Mac 生产机上的真实账本因此原样可读，不需要迁移。
+interface PendingWriteEntry {
+  idempotencyKey: string;
+  /** inflight = 请求落了盘还没等到终态；unknown = 终态是「结果未知」（5xx / 网络异常 / 畸形回执）。 */
+  kind: "inflight" | "unknown";
+  dateKey: string;
+  time: string;
+  /** 由 time 解析（见 parseBeijingTimeString）。解析不出来 → null，该笔永远无法按时间窗销账。 */
+  requestedAtMs: number | null;
+  customerKey?: string;
+  storeId?: string;
+  estimatedAmountFen?: number;
+  /**
+   * **本进程内这个请求还在飞**：只有实时 recordAudit 落 inflight 时为 true，从日志重建一律 false。
+   *
+   * 为什么必须区分：请求还没回话的时候去查订单列表，企迈侧那张单可能还没建出来——此刻
+   * 「列表里没有」不等于「没建单」，而改造前恰恰把它当成了「核对完成」（审计反例
+   * live_request_can_be_cleared：请求还挂着，一次 my_orders 就把闸门和额度一起清了）。
+   * 在飞的请求只能等它自己的终态，任何外部证据都不足以给它结论。
+   */
+  live: boolean;
+}
+
+/** 交给 guard 核对的一行订单证据（已过所有权校验的本人订单）。 */
+export interface OrderEvidenceRow {
+  orderNo: string;
+  /** 下单时间（毫秒）。6.1.5 单张查询没有这个字段，所以它只可能来自 6.1.6 列表。 */
+  orderAtMs?: number;
+  storeId?: string;
+  status?: number;
+}
+
+/**
+ * 一次真实读回给出的证据。**证据不足就该保留未知**——这个类型的每个字段都是在回答
+ * 「凭什么说那一笔已经弄清楚了」，缺一项就少一分把握。
+ */
+export interface UnresolvedEvidence {
+  via: "my_orders" | "get_order_status";
+  /** 当前会话绑定人的 customerCountKey。缺失 = 无法证明这些订单属于未决那一笔的顾客。 */
+  customerKey?: string;
+  orders: OrderEvidenceRow[];
+  /** 6.1.6 的查询时间窗（就是发出去的 orderAtStart / orderAtEnd）。 */
+  window?: { startMs: number; endMs: number };
+  /**
+   * 这份列表是否**完整可信**：data 是数组、total 不大于返回条数、没有他人订单混入。
+   * 任一不满足即 false —— 「没查到」这个结论只有在列表完整时才成立。
+   */
+  complete: boolean;
+}
+
+export type PendingWriteVerdict = "order_found" | "order_absent";
+
+export interface ResolvedPendingWrite {
+  idempotencyKey: string;
+  verdict: PendingWriteVerdict;
+  matchedOrderNo?: string;
+  /** 命中订单的企迈状态（给上层决定「要不要提示付款」用）。 */
+  matchedStatus?: number;
+}
+
+export interface ResolveOutcome {
+  released: ResolvedPendingWrite[];
+  /** 证据不足、仍然保留未知的笔数。 */
+  kept: number;
+}
+
+/**
+ * 订单创建时间与请求发出时间的允许偏差（±10 分钟）。
+ *
+ * 为什么要有窗口而不是要求精确相等：请求发出时间是本地时钟，订单创建时间是企迈的服务端
+ * 时钟，两者本来就不同源；6.1.6 的时间字段也只到秒。10 分钟足以吸收时钟偏差与排队延迟，
+ * 又远小于「顾客两次独立下单」的现实间隔——把它放宽到小时级就等于回到「查到任意一张单
+ * 就销账」，那是本门要消灭的缺陷。
+ */
+const ORDER_MATCH_WINDOW_MS = 10 * 60 * 1000;
+
 export class WriteGuard {
   private tokens = new Map<string, TokenRecord>();
   private placedOrders = new Map<string, { orderNo: string; at: number }>();
@@ -382,13 +485,17 @@ export class WriteGuard {
   // `${dateKey}|${customerKey}` -> 该顾客当日已结算占额。与 dailyCounts 并行维护、同一个状态机推进，
   // 两者不可能各自漂移（实时写入与重启重建都只走 applyAuditToState 这一条路）。
   private customerDailyCounts = new Map<string, number>();
-  /** 已落 inflight、还没等到任何终态的写请求：idempotencyKey -> 该请求所属北京时间自然日。 */
-  // idempotencyKey -> { dateKey, customerKey }。2026-08-19 从「只存 dateKey」扩成对象：
-  // 未决 inflight 同样占额度（代价发生在请求发出那一刻），按顾客计数时也必须算进对应顾客头上，
-  // 只存 dateKey 就没法归属到人。customerKey 可能缺失（历史日志、或调用方没传），缺失时只计全局。
-  private unresolvedInflight = new Map<string, { dateKey: string; customerKey?: string }>();
-  /** 终态为「结果未知」的写请求：idempotencyKey -> 落账日与时间（给错误提示用）。 */
-  private unknownWrites = new Map<string, { dateKey: string; time: string }>();
+  /**
+   * 全部未决写请求：idempotencyKey -> 条目（kind 区分 inflight / unknown）。
+   *
+   * 2026-09-08（G1）从两个 Map 合成一个：两个 Map 各存一半线索、状态转移时要记得从这个
+   * 删了往那个塞，而「按证据逐笔核对」需要同时看两类未决——一个 Map 加一个 kind 字段
+   * 把「转移」变成改一个字段，少一个能各自漂移的地方。
+   * 2026-08-19 起 inflight 也记 customerKey：未决 inflight 同样占额度（代价发生在请求发出
+   * 那一刻），按顾客计数时必须算进对应顾客头上。customerKey 可能缺失（历史日志、或调用方
+   * 没传），缺失时只计全局；G1 之后缺失还意味着「这笔无法按顾客核对」，一律保留未知。
+   */
+  private pendingWrites = new Map<string, PendingWriteEntry>();
   private readonly clock: () => number;
   private readonly auditLogPath: string;
   private readonly placedOrdersPath: string;
@@ -508,15 +615,15 @@ export class WriteGuard {
    */
   currentDailyCount(dateKey: string = beijingDateKey(this.clock())): number {
     let count = this.dailyCounts.get(dateKey) ?? 0;
-    for (const v of this.unresolvedInflight.values()) if (v.dateKey === dateKey) count++;
+    for (const v of this.pendingWrites.values()) if (v.kind === "inflight" && v.dateKey === dateKey) count++;
     return count;
   }
 
   /** 某位顾客当日的已占额度（口径与全局完全一致：allowed + unknown + 未决 inflight）。 */
   currentCustomerDailyCount(customerKey: string, dateKey: string = beijingDateKey(this.clock())): number {
     let count = this.customerDailyCounts.get(`${dateKey}|${customerKey}`) ?? 0;
-    for (const v of this.unresolvedInflight.values()) {
-      if (v.dateKey === dateKey && v.customerKey === customerKey) count++;
+    for (const v of this.pendingWrites.values()) {
+      if (v.kind === "inflight" && v.dateKey === dateKey && v.customerKey === customerKey) count++;
     }
     return count;
   }
@@ -577,42 +684,130 @@ export class WriteGuard {
    * 额度计数按日分组（那是「今天还能下几单」），未决闸门不按日分组（那是「有没有账没算清」）。
    */
   hasUnresolvedWrite(): boolean {
-    return this.unknownWrites.size > 0 || this.unresolvedInflight.size > 0;
+    return this.pendingWrites.size > 0;
   }
 
   /** 未决写请求的摘要，给拒绝提示与审计 reason 用（不含任何识别值）。 */
   describeUnresolvedWrites(): { total: number; unknown: number; inflight: number; earliestTime: string | null } {
-    const times = [...this.unknownWrites.values()].map((v) => v.time).filter((t) => Boolean(t)).sort();
-    return {
-      total: this.unknownWrites.size + this.unresolvedInflight.size,
-      unknown: this.unknownWrites.size,
-      inflight: this.unresolvedInflight.size,
-      earliestTime: times[0] ?? null,
-    };
+    let unknown = 0;
+    let inflight = 0;
+    const times: string[] = [];
+    for (const v of this.pendingWrites.values()) {
+      if (v.kind === "unknown") {
+        unknown++;
+        if (v.time) times.push(v.time); // earliestTime 沿用「只看 unknown」的既有口径，不改
+      } else {
+        inflight++;
+      }
+    }
+    times.sort();
+    return { total: this.pendingWrites.size, unknown, inflight, earliestTime: times[0] ?? null };
   }
 
   /**
-   * 解除未决状态：写一条 result="resolved" 审计并清账，返回被解除的条数。
+   * 按证据逐笔核对未决状态；只解除**被证实的那几笔**，其余保留未知。
    *
-   * 谁能调用它是这道闸门的关键设计（总工请复核）：**只有 my_orders / get_order_status 在
-   * 真正拿到企迈返回的订单数据之后才调**——不给模型开一个「我说核对完了」就能解除的 MCP 工具。
-   * 解除的凭据因此是一次真实发生的读回，而不是模型的一句自述；模型物理上无法凭空解除闸门。
+   * 谁能调用它是这道闸门的第一层设计（沿用 M5）：**只有 my_orders / get_order_status 在真正
+   * 拿到企迈返回的订单数据之后才调**——不给模型开一个「我说核对完了」就能解除的 MCP 工具。
+   *
+   * G1（2026-09-08）加的是第二层：**一次真实读回不等于一次成立的核对**。改造前本函数只收
+   * 「查单来源 + 数量」，然后把全部未决一次清空——于是「查了一张三天前的已完成旧单」
+   * 「查到的是别人的单」「data 是 null」「列表只有第一页」「重启后换了个人来查」这五种情形
+   * 都被当成「弄清楚了」（盲审 B01 / 21 号 P0-1 发现 B / 22 号 F03）。
+   *
+   * 现在每一笔未决独立判定，只有两种结论能销账：
+   *   · order_found —— 列表里有一行的下单时间落在本笔请求发出时间的 ±10 分钟内（门店也对得上），
+   *     结论是「企迈侧确实有那一单」；
+   *   · order_absent —— 列表**完整可信**、时间窗**覆盖**本笔请求的可能落点、却没有任何行落在窗内，
+   *     结论是「企迈侧没有那一单」。这一条是必须留的：没有它，一次真正失败的下单永远解除不了闸门，
+   *     整条链路会永久卡死；但它的证据门槛（complete + 窗口覆盖 + via=my_orders）必须全部满足。
+   * 其余一律保留未知——包括「在飞的请求」「顾客对不上」「列表不完整」「时间不可解析」
+   * 「6.1.5 单张查询（响应里根本没有时间字段，无从关联）」。
    *
    * 已经占用的额度不退还：核对的结论是「这单到底有没有成」，不是「这次请求有没有发出」——
    * 请求确确实实发出过。不退还同时也堵死了「靠反复触发异常再解除来多下几单」这条路。
    */
-  resolveUnresolvedWrites(opts: { via: string; checkedOrderCount: number }): number {
-    const keys = [...this.unresolvedInflight.keys(), ...this.unknownWrites.keys()];
-    if (keys.length === 0) return 0;
-    this.recordAudit({
-      path: WRITE_WHITELIST[0],
-      result: "resolved",
-      reason: `ResolvedBy:${opts.via}:checkedOrders=${opts.checkedOrderCount}`,
-      idempotencyKey: null,
-      resolvedKeys: keys,
-      durationMs: 0,
-    });
-    return keys.length;
+  resolveUnresolvedWrites(evidence: UnresolvedEvidence): ResolveOutcome {
+    const released: ResolvedPendingWrite[] = [];
+    if (this.pendingWrites.size === 0) return { released, kept: 0 };
+
+    // 一张订单只能给一笔未决销账：两笔未决撞在同一个时间窗里时，若允许同一张单销两笔，
+    // 「下单两次、企迈只建了一单」就会被判成「两单都成了」，另一笔的未知被凭空抹掉。
+    const claimedOrders = new Set<string>();
+    // 按请求发出时间从早到晚判定：早的那笔先挑走时间上最贴近的订单，判定结果不依赖 Map 迭代顺序。
+    const candidates = [...this.pendingWrites.values()].sort(
+      (a, b) => (a.requestedAtMs ?? Number.MAX_SAFE_INTEGER) - (b.requestedAtMs ?? Number.MAX_SAFE_INTEGER),
+    );
+
+    for (const entry of candidates) {
+      const verdict = this.judgePendingWrite(entry, evidence, claimedOrders);
+      if (!verdict) continue;
+      if (verdict.matchedOrderNo) claimedOrders.add(verdict.matchedOrderNo);
+      released.push({ idempotencyKey: entry.idempotencyKey, ...verdict });
+    }
+
+    const kept = this.pendingWrites.size - released.length;
+    if (released.length > 0) {
+      const found = released.filter((r) => r.verdict === "order_found").length;
+      this.recordAudit({
+        path: WRITE_WHITELIST[0],
+        result: "resolved",
+        reason: `ResolvedBy:${evidence.via}:found=${found}:absent=${released.length - found}:kept=${kept}`,
+        idempotencyKey: null,
+        resolvedKeys: released.map((r) => r.idempotencyKey),
+        durationMs: 0,
+      });
+    }
+    return { released, kept };
+  }
+
+  /** 单笔未决的证据判定。返回 undefined = 证据不足，保留未知。 */
+  private judgePendingWrite(
+    entry: PendingWriteEntry,
+    evidence: UnresolvedEvidence,
+    claimedOrders: ReadonlySet<string>,
+  ): { verdict: PendingWriteVerdict; matchedOrderNo?: string; matchedStatus?: number } | undefined {
+    // ① 请求还在飞：企迈侧那张单可能这一刻还没建出来，任何外部证据都给不出结论。
+    if (entry.live) return undefined;
+    // ② 顾客对不上（含任一侧缺失）：查的不是这笔未决那个人的账，看到什么都不算证据。
+    //    重启后绑定另一人再查 → 命中这一条（G1 验收反例 7）。
+    if (!entry.customerKey || !evidence.customerKey || entry.customerKey !== evidence.customerKey) return undefined;
+    // ③ 请求时间不可解析（历史日志缺 time / 格式异常）：算不出时间窗，两种结论都下不了。
+    if (entry.requestedAtMs == null) return undefined;
+
+    const windowStart = entry.requestedAtMs - ORDER_MATCH_WINDOW_MS;
+    const windowEnd = entry.requestedAtMs + ORDER_MATCH_WINDOW_MS;
+
+    // ④ order_found：时间窗内有一行还没被别的未决认领的订单，门店（若两边都有）也对得上。
+    let best: { row: OrderEvidenceRow; delta: number } | undefined;
+    for (const row of evidence.orders) {
+      if (!row.orderNo || claimedOrders.has(row.orderNo)) continue;
+      if (row.orderAtMs == null || row.orderAtMs < windowStart || row.orderAtMs > windowEnd) continue;
+      if (entry.storeId && row.storeId && entry.storeId !== row.storeId) continue;
+      const delta = Math.abs(row.orderAtMs - entry.requestedAtMs);
+      if (!best || delta < best.delta) best = { row, delta };
+    }
+    if (best) {
+      return { verdict: "order_found", matchedOrderNo: best.row.orderNo, ...(best.row.status != null ? { matchedStatus: best.row.status } : {}) };
+    }
+
+    // ⑤ order_absent：只有 6.1.6 的**完整**列表能证明不存在，而且它的查询时间窗必须
+    //    完整含住本笔请求的可能落点 —— 左端到 `requestedAtMs - 10min`、右端到
+    //    `requestedAtMs + 10min`（就是上面那个关联窗）。
+    //
+    //    右端这一条同时是一个**静默期**，它回答的是「列表里没有」什么时候才等于「企迈侧
+    //    没有」：请求刚发出几秒钟就去查，那张单可能还在企迈侧异步落库 / 建索引，此刻的
+    //    空列表证明不了任何事。所以「查到的是一张三天前的旧单、窗内什么都没有」在请求刚
+    //    发出时**保留未知**（任务书 G1 验收反例 1），等过了这 10 分钟再查同一份列表才
+    //    构成「企迈侧没有那一单」的结论。
+    //
+    //    为什么要留 order_absent 这条路：没有它，一次真正失败的下单永远解除不了闸门，
+    //    整条链路会永久卡死；但它的门槛必须全部满足（完整列表 + 窗口含住 + 静默期已过），
+    //    少一条就退回保留未知。
+    if (evidence.via !== "my_orders" || !evidence.complete || !evidence.window) return undefined;
+    if (evidence.window.startMs > windowStart) return undefined;
+    if (evidence.window.endMs < windowEnd) return undefined;
+    return { verdict: "order_absent" };
   }
 
   // ---------- 金额 ----------
@@ -657,7 +852,8 @@ export class WriteGuard {
     };
     // 先推进内存状态机、再落盘：落盘是尽力而为（磁盘满/权限问题都不阻塞主链路），
     // 而额度与未决闸门是护栏本身，不能因为写日志失败就不生效。
-    this.applyAuditToState(line);
+    // live=true：这条 inflight 是本进程实时写的，对应的请求此刻正在飞（见 PendingWriteEntry.live）。
+    this.applyAuditToState(line, { live: true });
     try {
       mkdirSync(dirname(this.auditLogPath), { recursive: true });
       // 统一出口脱敏：整条记录（含顶层 reason）而不是只有 summary——顶层 reason 会拼接
@@ -675,25 +871,29 @@ export class WriteGuard {
    * 输入都是「一条审计记录的 JSON 形态」。这是刻意的：两条路径若各写一份口径，日后改动
    * 必然一处改一处漏，而漏掉的那一处正好是重启场景——护栏被静默清零的经典姿势。
    */
-  private applyAuditToState(line: {
-    result?: string;
-    dateKey?: string;
-    time?: string;
-    path?: string;
-    idempotencyKey?: unknown;
-    resolvedKeys?: unknown;
-    // 2026-08-19：顾客维度计数所需。历史日志里没有这个字段——那些记录只推进全局计数，
-    // 按顾客计数从 undefined 开始，不会把旧单算到任何人头上。这是刻意的取舍：
-    // 宁可按顾客计数偏松（旧单不占额度），也不要凭尾号猜归属把两个顾客的额度算混。
-    customerKey?: unknown;
-  }): void {
+  private applyAuditToState(
+    line: {
+      result?: string;
+      dateKey?: string;
+      time?: string;
+      path?: string;
+      idempotencyKey?: unknown;
+      resolvedKeys?: unknown;
+      // 2026-08-19：顾客维度计数所需。历史日志里没有这个字段——那些记录只推进全局计数，
+      // 按顾客计数从 undefined 开始，不会把旧单算到任何人头上。这是刻意的取舍：
+      // 宁可按顾客计数偏松（旧单不占额度），也不要凭尾号猜归属把两个顾客的额度算混。
+      customerKey?: unknown;
+      // G1：未决条目的关联线索从这里取。summary 自 M2 起就在日志里，不是新增字段。
+      summary?: unknown;
+    },
+    opts: { live: boolean },
+  ): void {
     // resolved 不属于任何一次写请求，先处理掉（它的 path 只是占位）。
     if (line.result === "resolved") {
       const keys = Array.isArray(line.resolvedKeys) ? line.resolvedKeys : [];
       for (const k of keys) {
         if (typeof k !== "string") continue;
-        this.unresolvedInflight.delete(k);
-        this.unknownWrites.delete(k);
+        this.pendingWrites.delete(k);
       }
       return;
     }
@@ -714,25 +914,54 @@ export class WriteGuard {
       }
     };
 
+    // G1 关联线索：门店与预估金额来自 summary（M2 起就在日志里）；请求发出时间由 time 反解。
+    const summary = line.summary !== null && typeof line.summary === "object" ? (line.summary as Record<string, unknown>) : undefined;
+    const storeId = summary?.storeId != null ? String(summary.storeId) : undefined;
+    const estimatedAmountFen = typeof summary?.estimatedAmountFen === "number" ? summary.estimatedAmountFen : undefined;
+    const pendingBase = (kind: "inflight" | "unknown", live: boolean): PendingWriteEntry => ({
+      idempotencyKey: key as string,
+      kind,
+      dateKey: dateKey ?? "",
+      time: line.time ?? "",
+      requestedAtMs: parseBeijingTimeString(line.time),
+      ...(customerKey ? { customerKey } : {}),
+      ...(storeId ? { storeId } : {}),
+      ...(estimatedAmountFen != null ? { estimatedAmountFen } : {}),
+      live,
+    });
+
     switch (line.result) {
       case "inflight":
         // 请求即将发出，先挂账。等到终态记录出现时再销账。
-        if (key && dateKey) this.unresolvedInflight.set(key, { dateKey, customerKey });
+        if (key && dateKey) this.pendingWrites.set(key, pendingBase("inflight", opts.live));
         break;
       case "allowed":
-        if (key) this.unresolvedInflight.delete(key);
+        if (key) this.pendingWrites.delete(key);
         addCount();
         break;
-      case "unknown":
+      case "unknown": {
+        // inflight 的终态到了：从「未决 inflight」转成「结果未知」，live 一律落回 false
+        // （请求已经不在飞了，它的未知是确定的终态，可以被证据核对）。
+        //
+        // requestedAtMs 沿用同一幂等键的 inflight 时间（若有）：这个字段的语义是「请求发出
+        // 的那一刻」，而 unknown 这条记录的时间是**回话超时之后**——fetch 超时可能拖几十秒，
+        // 用终态时间去对齐企迈的建单时间会白白吃掉时间窗的余量。日志里只有 unknown 没有
+        // inflight 时（历史记录、或直接落终态）才退回用它自己的时间。
         if (key) {
-          this.unresolvedInflight.delete(key); // inflight 的终态到了，从「未决 inflight」转成「结果未知」
-          this.unknownWrites.set(key, { dateKey: dateKey ?? "", time: line.time ?? "" });
+          const previous = this.pendingWrites.get(key);
+          const next = pendingBase("unknown", false);
+          if (previous?.requestedAtMs != null) {
+            next.requestedAtMs = previous.requestedAtMs;
+            next.time = previous.time;
+          }
+          this.pendingWrites.set(key, next);
         }
         addCount();
         break;
+      }
       case "rejected":
         // 明确没发生：护栏在发出前拦下，或企迈明确回话说这单没成。销账、不占额度。
-        if (key) this.unresolvedInflight.delete(key);
+        if (key) this.pendingWrites.delete(key);
         break;
     }
   }
@@ -782,7 +1011,9 @@ export class WriteGuard {
         } catch {
           continue; // 单行损坏不影响其余行的重建
         }
-        this.applyAuditToState(obj as Parameters<WriteGuard["applyAuditToState"]>[0]);
+        // live=false：从日志重建的 inflight，那个请求早已随进程消亡，不可能还在飞——
+        // 它正是「可以、也必须靠一次真实读回来核对」的那一类未决。
+        this.applyAuditToState(obj as Parameters<WriteGuard["applyAuditToState"]>[0], { live: false });
       }
     } catch {
       // 审计日志本身读不到：新装机场景（文件不存在已在 existsSync 短路），

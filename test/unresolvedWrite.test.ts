@@ -301,7 +301,12 @@ test("U6: 成功下单 → 审计恰好 inflight + allowed 两条，当日额度
 // ============================================================================
 // U7：真实读回（my_orders）解除闸门，写 resolved 记录，但已占额度不退还
 // ============================================================================
-test("U7: my_orders 真实读回后闸门解除并写 resolved 记录；已占用的额度不退还", async () => {
+// 2026-09-08（G1）改动：原 fixture 的订单行**没有 orderAt**，却断言闸门被解除——那正是
+// 盲审 B01 的缺陷形态（一张无从关联的单也能销账），把它固化成通过用例就是把缺陷写成规格。
+// 改法是把 fixture 补成一份**能成立的证据**：同一位顾客、下单时间落在请求发出的时间窗内、
+// total 与返回条数一致（列表完整）。断言方向一字不改——解除仍然要发生，只是现在它有理由。
+// 「无关单 / 不完整列表 → 保留未知」的反向断言在 gateG1_unresolvedRelease.test.ts 里。
+test("U7: my_orders 拿到可关联的订单证据后闸门解除并写 resolved 记录；已占用的额度不退还", async () => {
   const fx = installFixture();
   const sessions = new SessionStore();
   sessions.bind(DEFAULT_SESSION_KEY, { customerId: FAKE_CUSTOMER_ID, boundAt: Date.now(), boundVia: "phone" });
@@ -314,7 +319,18 @@ test("U7: my_orders 真实读回后闸门解除并写 resolved 记录；已占�
         JSON.stringify({
           status: true,
           code: 0,
-          data: { total: 1, data: [{ orderNo: "D-MOCK-U7", status: 10, actualAmount: 2400, userId: FAKE_CUSTOMER_ID }] },
+          data: {
+            total: 1,
+            data: [
+              {
+                orderNo: "D-MOCK-U7",
+                status: 10,
+                actualAmount: 2400,
+                orderAt: Date.now(), // 与下面那次写请求同一时刻 → 落在 ±10 分钟关联窗内
+                userId: FAKE_CUSTOMER_ID,
+              },
+            ],
+          },
         }),
         { status: 200 },
       );
@@ -331,14 +347,19 @@ test("U7: my_orders 真实读回后闸门解除并写 resolved 记录；已占�
     const r = await myOrdersHandler({ days: 1 });
     const body = JSON.parse(textOf(r));
     assert.equal(body.resolvedPendingWrites, 1, "读回后应报告解除了 1 笔未决");
-    assert.match(body.pendingWriteNote, /已解除闸门/);
+    assert.equal(body.unresolvedPendingWrites, undefined, "证据成立，不该还剩未核对的笔数");
+    assert.match(body.pendingWriteNote, /确实建了单/);
+    assert.match(body.pendingWriteNote, /不要重下/);
+    assert.match(body.pendingWriteNote, /D-MOCK-U7/, "必须点名是哪一张单，模型才能据此引导付款");
 
-    assert.equal(fx.guard.hasUnresolvedWrite(), false, "真实读回之后闸门解除");
+    assert.equal(fx.guard.hasUnresolvedWrite(), false, "证据成立的读回之后闸门解除");
     assert.equal(fx.guard.currentDailyCount(), 1, "额度不退还——请求确实发出过（也堵死靠触发异常刷额度的路）");
 
     const resolved = auditLines(fx.auditLogPath).filter((l) => l.result === "resolved");
     assert.equal(resolved.length, 1, "解除动作必须留审计");
-    assert.match(resolved[0].reason, /^ResolvedBy:my_orders:checkedOrders=1$/);
+    // reason 现在如实记「按什么结论销了几笔、还留着几笔」，而不是只记「查了几张单」——
+    // 后者在事后排查时回答不了「凭什么销的」这个唯一重要的问题。
+    assert.match(resolved[0].reason, /^ResolvedBy:my_orders:found=1:absent=0:kept=0$/);
     assert.equal(resolved[0].resolvedKeys.length, 1);
 
     // 重启重建：resolved 记录必须让未决状态不再复活，且额度仍然记着

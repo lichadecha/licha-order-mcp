@@ -368,7 +368,23 @@ export async function callWrite<T = unknown>(
         error: { code: "TRANSPORT", message: `HTTP ${resp.status}`, hint: "服务异常，稍后再试；先去小程序查订单状态，不要立即重复下单" },
       };
     }
-    const data = JSON.parse(protectIds(text)) as { status?: boolean; code?: number; message?: string; data?: T };
+    // 回执解析失败 = 结果未知，不是失败（G1 第 5 条反例）：HTTP 200 说明请求确实到了企迈，
+    // 单据可能已经建好，只是回话我们读不懂。当成 rejected 会把「可能已成功」谎报成「失败」，
+    // 额度被退还、闸门不拉起，模型下一秒就能把同一杯再下一遍。
+    let data: { status?: boolean; code?: number; message?: string; data?: T };
+    try {
+      data = JSON.parse(protectIds(text)) as typeof data;
+    } catch {
+      guard.recordAudit({ ...auditWithKey, result: "unknown", reason: "MalformedResponse:unparsable", durationMs: ms });
+      return {
+        ok: false,
+        error: {
+          code: "MALFORMED_RESPONSE",
+          message: "下单接口回执无法解析",
+          hint: "结果未知：企迈侧可能已经建单。先去小程序查订单状态，不要立即重复下单",
+        },
+      };
+    }
     if (data.status === true) {
       const orderNo = extractOrderNo(data.data);
       guard.recordPlacedOrder(idempotencyKey, orderNo ?? "");
@@ -377,12 +393,30 @@ export async function callWrite<T = unknown>(
       guard.recordAudit({ ...auditWithKey, result: "allowed", orderNo: orderNo ?? null, code: data.code ?? null, durationMs: ms });
       return { ok: true, code: data.code, message: data.message, data: data.data };
     }
-    guard.recordAudit({ ...auditWithKey, result: "rejected", reason: `ApiRejected:${data.code}`, code: data.code ?? null, durationMs: ms });
+    // 只有 status === false 才是**企迈明确回话说这单没成**（库存不足、参数不合法一类业务拒绝）：
+    // 销账、不占额度，这一支必须原样保留（U8 防误伤）。
+    if (data.status === false) {
+      guard.recordAudit({ ...auditWithKey, result: "rejected", reason: `ApiRejected:${data.code}`, code: data.code ?? null, durationMs: ms });
+      return {
+        ok: false,
+        code: data.code,
+        message: data.message,
+        error: { code: data.code ?? "unknown", message: data.message ?? "未知错误", hint: humanHint(data.code) },
+      };
+    }
+    // status 既不是 true 也不是 false（字段缺失、被改成字符串、HTTP 200 配了一个别的结构）
+    // → 结果未知。改造前这里走的是 rejected 分支，等于「企迈没说这单没成，我们替它说了」
+    // （盲审 B01 / 审计反例 missing_status：额度被释放、未决闸门不拉起）。
+    guard.recordAudit({ ...auditWithKey, result: "unknown", reason: "MalformedResponse:noStatus", code: data.code ?? null, durationMs: ms });
     return {
       ok: false,
       code: data.code,
       message: data.message,
-      error: { code: data.code ?? "unknown", message: data.message ?? "未知错误", hint: humanHint(data.code) },
+      error: {
+        code: "MALFORMED_RESPONSE",
+        message: `下单接口回执缺少 status 字段${data.message ? `（message：${data.message}）` : ""}`,
+        hint: "结果未知：企迈侧可能已经建单。先去小程序查订单状态，不要立即重复下单",
+      },
     };
   } catch (e) {
     // 同 5xx：请求已经发出去了、回话没收到，企迈侧可能已建单。记 unknown 而不是 rejected。
