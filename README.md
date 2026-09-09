@@ -21,7 +21,7 @@
 ```json
 "licha-order-mcp": {
   "command": "npx",
-  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.5.2"]
+  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.5.3"]
 }
 ```
 
@@ -51,13 +51,23 @@ mcpServers 配置：
   "mcpServers": {
     "licha-order-mcp": {
       "command": "npx",
-      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.5.2"]
+      "args": ["-y", "github:lichadecha/licha-order-mcp#v0.5.3"]
     }
   }
 }
 ```
 
-安装命令固定指向版本标签（`#v0.5.2`），不追踪最新提交；升级时以新版 README 给出的标签为准。
+安装命令固定指向版本标签（`#v0.5.3`），不追踪最新提交；升级时以新版 README 给出的标签为准。
+
+要开下单相关的 5 个工具，在同一段配置里加 `env`（不加就是默认只读 4 工具；改装新标签时**整段一起换**，2026-09-08 曾漏掉这一行只见 4 个工具）：
+
+```json
+"licha-order-mcp": {
+  "command": "npx",
+  "args": ["-y", "github:lichadecha/licha-order-mcp#v0.5.3"],
+  "env": { "LICHA_ENABLE_ORDERING": "1" }
+}
+```
 
 要求 Node 不低于 18；首次安装会自动构建（prepare 钩子跑 tsc）。
 
@@ -80,6 +90,16 @@ mcpServers 配置：
 - 单笔 ≤¥100、单日每顾客 ≤5 单 / 全局 ≤10 单硬护栏；**永不代付**——付款一律由顾客在李茶小程序完成。
 - 三本审计日志（读/写/访问）分离，识别值只留尾号。
 - 出参只投影公开字段（店名/地址/营业状态/商品价格），不输出店长联系方式、成本等经营字段。
+
+## v0.5.3 变更（开交易后体验补洞，24 号 A 批）
+
+只改服务端行为与两条 SKILL 固定话术，工具入参不变；`SKILL.md` 同步升到 0.5.3。
+
+- `get_menu` 不再返回已下架（status=20）商品；有候选时提示「列表不含当日估清状态，以 get_item_detail 为准」。
+- `find_store` 营业状态与营业时间单独 10 分钟刷新，出参新增 `statusSampledAt`；取不到状态报「状态未知」而不是沿用一天前的旧值。
+- 同一顾客重新组单后，前一版待确认单作废；旧 confirmToken 提交被拒并说明「已被更新的一版替代」，`prepare_order` 出参新增 `supersededPendingOrders`。
+- MCP 进程启动时在 access-audit 记一条 `server_started`（版本 | pid | 写开关），宿主回收进程后可直接数日志。
+- `prepare_order` 组单时查询本单可用券（5.1.7，只读），出参新增 `coupons`（可用券、预测系统默认会用的那张与券后实付）；`place_order` 读回新增 `couponApplied`，与预测比对并给出话术。查券失败不阻塞组单。
 
 ## v0.5.2 变更（安全收口门）
 
