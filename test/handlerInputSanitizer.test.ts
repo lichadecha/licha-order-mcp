@@ -747,7 +747,7 @@ function snapshotLogs(): string {
       if (!statSync(p).isFile()) return `${f}:<dir>`;
       return `${f}:${createHash("md5").update(readFileSync(p)).digest("hex")}`;
     })
-    .join("\n");
+    .join("\n") || "<empty-logs-dir>"; // B08a：空目录是合法快照——改造前 join 出空串，被 length>0 判成「未登记」误报
 }
 
 const LOGS_SNAPSHOT_AT_START = snapshotLogs();
