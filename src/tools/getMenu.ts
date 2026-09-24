@@ -5,6 +5,7 @@
 
 import { call } from "../client.js";
 import { CHANNEL } from "../constants.js";
+import { projectUpstreamMessage } from "../outboundText.js";
 
 const MENU_TTL_MS = 5 * 60 * 1000;
 const SEARCH_TTL_MS = 2 * 60 * 1000;
@@ -91,7 +92,7 @@ async function loadCategories(storeId: number): Promise<CategoryRaw[]> {
   if (hit && Date.now() - hit.at < MENU_TTL_MS) return hit.list;
   const r = await call<CategoryRaw[]>("v3/goods/item/getShopCategory", { storeId, ...CHANNEL });
   if (!r.ok || !Array.isArray(r.data)) {
-    throw new Error(`分类菜单拉取失败：${r.error?.message ?? r.message ?? "未知错误"}（${r.error?.hint ?? "稍后再试"}）`);
+    throw new Error(`分类菜单拉取失败：${projectUpstreamMessage(r.error?.message ?? r.message) || "未知错误"}（${r.error?.hint ?? "稍后再试"}）`);
   }
   const list = [...r.data].sort((a, b) => (a.categorySort ?? 99) - (b.categorySort ?? 99));
   categoryCache.set(String(storeId), { at: Date.now(), list });
@@ -107,7 +108,7 @@ async function listByCategory(storeId: number, frontCategoryId: string): Promise
     includeProperties: ["SKU", "LABEL"],
   });
   if (!r.ok) {
-    throw new Error(`按分类查商品失败：${r.error?.message ?? r.message ?? "未知错误"}`);
+    throw new Error(`按分类查商品失败：${projectUpstreamMessage(r.error?.message ?? r.message) || "未知错误"}`);
   }
   return Array.isArray(r.data) ? r.data : [];
 }
@@ -124,7 +125,7 @@ async function searchGoods(storeId: number, keyword: string): Promise<GoodsRaw[]
     includeProperties: ["SKU", "LABEL"],
   });
   if (!r.ok) {
-    throw new Error(`搜索失败：${r.error?.message ?? r.message ?? "未知错误"}（${r.error?.hint ?? "换个商品名试试"}）`);
+    throw new Error(`搜索失败：${projectUpstreamMessage(r.error?.message ?? r.message) || "未知错误"}（${r.error?.hint ?? "换个商品名试试"}）`);
   }
   const items = Array.isArray(r.data) ? r.data : [];
   searchCache.set(key, { at: Date.now(), items });

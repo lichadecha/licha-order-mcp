@@ -789,7 +789,9 @@ test("V6: prepare → place 全链路 —— 请求体 params 与登记 finalPar
     assert.equal(out.placed, true);
     assert.equal(out.orderNo, "D-M4-OK");
     assert.equal(out.qmaiActualAmountYuan, "24.00", "企迈实付金额：2400 分 → ¥24.00");
-    assert.deepEqual(out.discountList, [{ discountName: "新客立减", discountAmount: 0 }]);
+    // C4（盲审 B05）：读回 discountList 不再原样出参，只留 A5 的 couponApplied 投影（名称 / 摘要 / 金额）。
+    assert.equal("discountList" in out, false, "C4：读回原字段不再带出");
+    assert.deepEqual(out.couponApplied.items, [{ name: "新客立减", amountYuan: "0.00" }]);
     assert.equal(out.estimatedTotalYuan, "24.00");
     assert.equal(out.diffYuan, "0.00");
     assert.equal(out.warning, undefined, "零差额不该告警");

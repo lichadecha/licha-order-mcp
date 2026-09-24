@@ -4,6 +4,7 @@
 
 import { call } from "../client.js";
 import { CHANNEL } from "../constants.js";
+import { projectUpstreamMessage } from "../outboundText.js";
 
 const DETAIL_TTL_MS = 5 * 60 * 1000;
 
@@ -167,7 +168,7 @@ export async function fetchItemDetailFresh(storeId: number, goodsId: string): Pr
     includeProperties: ["SKU", "PRACTICE", "ATTACH", "LABEL", "CATEGORY"],
   });
   if (!r.ok) {
-    throw new Error(`商品详情查询失败：${r.error?.message ?? r.message ?? "未知错误"}（${r.error?.hint ?? "换个商品试试"}）`);
+    throw new Error(`商品详情查询失败：${projectUpstreamMessage(r.error?.message ?? r.message) || "未知错误"}（${r.error?.hint ?? "换个商品试试"}）`);
   }
   if (!Array.isArray(r.data) || r.data.length === 0) {
     throw new Error("商品详情查询失败：商品不存在或已下架（换个商品试试）");

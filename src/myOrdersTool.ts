@@ -19,6 +19,7 @@ import { getAccessAuditLogger } from "./accessAudit.js";
 import { assertOrderOwnership, SETTLED_STATUSES, statusText } from "./orderStatusTool.js";
 import { beijingTimeString, customerCountKey, getWriteGuard, type OrderEvidenceRow } from "./writeGuard.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
+import { projectUpstreamMessage } from "./outboundText.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -98,7 +99,7 @@ export async function myOrdersHandler({ days }: MyOrdersInput): Promise<TextResu
       userId: binding.customerId,
     });
     if (!resp.ok) {
-      return fail(new Error(`查询订单列表失败：${resp.error?.message ?? resp.message ?? "接口异常"}`));
+      return fail(new Error(`查询订单列表失败：${projectUpstreamMessage(resp.error?.message ?? resp.message) || "接口异常"}`));
     }
 
     // ③ 订单数组在 data.data（不是 list/records）。

@@ -27,6 +27,7 @@ import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./ses
 // M4 定稿新增（M2/M3 骨架不依赖这两个模块）：待确认单登记表 + 与 get_order_status 共用的所有权判据。
 import { getPendingOrderStore } from "./pendingOrders.js";
 import { assertOrderOwnership } from "./orderStatusTool.js";
+import { projectUpstreamMessage } from "./outboundText.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -134,7 +135,6 @@ interface ReadbackResult {
   readbackFailed?: true;
   readbackNote?: string;
   qmaiActualAmountYuan?: string;
-  discountList?: unknown[];
   /** 24 号 A5：读回里实际用掉的优惠（投影字段），以及与组单时预测的比对。 */
   couponApplied?: { items: Array<{ name: string; summary?: string; amountYuan: string }>; matchesPrediction?: boolean; note: string };
   estimatedTotalYuan: string;
@@ -170,7 +170,7 @@ async function readbackOrder(
     return {
       ...base,
       readbackFailed: true,
-      readbackNote: `订单已创建成功，但读回企迈金额失败（${resp.error?.message ?? resp.message ?? "响应为空"}）。请用 get_order_status 或小程序核对金额后再引导付款。`,
+      readbackNote: `订单已创建成功，但读回企迈金额失败（${projectUpstreamMessage(resp.error?.message ?? resp.message) || "响应为空"}）。请用 get_order_status 或小程序核对金额后再引导付款。`,
     };
   }
 
@@ -223,7 +223,6 @@ async function readbackOrder(
   return {
     ...base,
     qmaiActualAmountYuan: yuan(actualFen),
-    discountList: Array.isArray(rawDiscounts) ? rawDiscounts : [],
     ...(couponApplied ? { couponApplied } : {}),
     diffYuan: yuan(diffFen),
     ...(absDiff > threshold
@@ -426,7 +425,7 @@ export async function placeOrderConfirmedHandler(input: PlaceOrderConfirmedInput
     getPendingOrderStore().markSubmitted(confirmToken);
 
     if (!result.ok) {
-      return fail(new Error(`下单失败：${result.error?.message ?? result.message ?? "未知错误"}（${result.error?.hint ?? "请稍后再试"}）`));
+      return fail(new Error(`下单失败：${projectUpstreamMessage(result.error?.message ?? result.message) || "未知错误"}（${result.error?.hint ?? "请稍后再试"}）`));
     }
 
     const orderNo = typeof result.data?.orderNo === "string" ? result.data.orderNo : String(result.data?.orderNo ?? "");

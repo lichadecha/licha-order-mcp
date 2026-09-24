@@ -10,6 +10,7 @@
 
 import { call } from "../client.js";
 import { beijingTimeString } from "../writeGuard.js";
+import { projectUpstreamMessage } from "../outboundText.js";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 // 状态 TTL 取 10 分钟（施工判断点，24 号 §9）：一次点单对话通常在 10 分钟内结束，不会重复拉；
@@ -102,7 +103,7 @@ async function loadStores(force = false): Promise<StoreRaw[]> {
   if (!force && cache && Date.now() - cache.at < TTL_MS) return cache.list;
   const r = await call<{ list?: StoreRaw[] }>("v3/org/shop/getShopList", { pageNum: 1, pageSize: 50 });
   if (!r.ok || !Array.isArray(r.data?.list)) {
-    throw new Error(`门店列表拉取失败：${r.error?.message ?? r.message ?? "未知错误"}（${r.error?.hint ?? "稍后再试"}）`);
+    throw new Error(`门店列表拉取失败：${projectUpstreamMessage(r.error?.message ?? r.message) || "未知错误"}（${r.error?.hint ?? "稍后再试"}）`);
   }
   const list = r.data.list;
   if (!list.some((s) => String(s.id) === ANCHOR_STORE_ID)) {

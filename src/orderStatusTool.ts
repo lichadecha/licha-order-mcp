@@ -9,6 +9,7 @@ import { callRead } from "./client.js";
 import { getAccessAuditLogger } from "./accessAudit.js";
 import { customerCountKey, getWriteGuard, untrustedAuditValue } from "./writeGuard.js";
 import { DEFAULT_SESSION_KEY, getSessionStore, type SessionBinding } from "./session.js";
+import { projectUpstreamMessage } from "./outboundText.js";
 
 export type TextResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -84,7 +85,7 @@ export async function getOrderStatusHandler({ orderNo }: OrderStatusInput): Prom
 
     // ③ ok=false → 透传错误信息（查无此单等）。
     if (!resp.ok) {
-      return fail(new Error(resp.error?.message ?? resp.message ?? "查询失败：查无此单或接口异常"));
+      return fail(new Error(projectUpstreamMessage(resp.error?.message ?? resp.message) || "查询失败：查无此单或接口异常"));
     }
 
     // ④ 所有权校验不过 → 丢弃全部响应内容，只返回不含任何订单字段的拒绝文本。
