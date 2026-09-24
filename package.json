@@ -8,7 +8,7 @@
     "licha-order-mcp": "dist/src/index.js"
   },
   "files": [
-    "dist"
+    "dist/src"
   ],
   "engines": {
     "node": ">=18"
