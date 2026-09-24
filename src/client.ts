@@ -117,6 +117,32 @@ function backoff(attempt: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ---------- 25 号 C5：HTTP 超时 ----------
+// 改造前两处 fetch 都没有 AbortSignal，企迈挂起时对话无限等待，WorkBuddy 侧表现为「AI 卡住」。
+// 读 8s：超时按既有传输异常路径退避重试（attempts 语义不变，A5 的 attempts:1 查券照旧只试一次）。
+// 写 15s：超时 ≠ 失败——请求已发出、回话没等到，企迈可能已建单。记 unknown/RequestTimeout（占额度、拉未决闸门），
+// 幂等键与 inflight 记录保留，零重试。节流与退避常量不动。
+const DEFAULT_HTTP_TIMEOUTS = { readMs: 8000, writeMs: 15000 } as const;
+let httpTimeouts: { readMs: number; writeMs: number } = { ...DEFAULT_HTTP_TIMEOUTS };
+
+/** 仅供测试使用：注入超时值（mock fetch 挂起时用几十毫秒就能验）。传 null 恢复默认。 */
+export function setHttpTimeoutsForTesting(t: { readMs?: number; writeMs?: number } | null): void {
+  httpTimeouts = t ? { ...DEFAULT_HTTP_TIMEOUTS, ...t } : { ...DEFAULT_HTTP_TIMEOUTS };
+}
+
+function isTimeoutError(e: unknown): boolean {
+  const name = (e as { name?: unknown } | null)?.name;
+  return name === "TimeoutError" || name === "AbortError";
+}
+
+// 超时后回给 Agent 的一句话提示——Agent 会照着对顾客说，所以这里写的是给顾客听的话。
+// 读超时：这次查询没拿到结果，也什么都没发生，可以再问一次。
+// 写超时：下单请求已经发出去、没等到回话，企迈那边可能已经建了单——绝不能让顾客再点一次。
+const TIMEOUT_HINTS = {
+  read: "门店系统这会儿反应慢，刚才那一步没查到结果，稍等几秒我再帮你问一次。",
+  write: "下单请求已经发出去了，但系统没回话，单子可能已经生成。请先打开小程序「我的订单」看一眼，有单就直接付款，没单再告诉我，先别重复下单。",
+} as const;
+
 function humanHint(code: unknown): string {
   switch (code) {
     case 110004:
@@ -170,6 +196,7 @@ export async function callRead<T = unknown>(
         method: "POST",
         headers: { "Content-Type": "application/json;charset=UTF-8" },
         body,
+        signal: AbortSignal.timeout(httpTimeouts.readMs),
       });
       const text = await resp.text();
       audit(path, resp.ok, Date.now() - t0);
@@ -199,7 +226,11 @@ export async function callRead<T = unknown>(
   }
   return {
     ok: false,
-    error: { code: "TRANSPORT", message: String(lastError), hint: "网络异常，稍后再试" },
+    error: {
+      code: isTimeoutError(lastError) ? "TIMEOUT" : "TRANSPORT",
+      message: String(lastError),
+      hint: isTimeoutError(lastError) ? TIMEOUT_HINTS.read : "网络异常，稍后再试",
+    },
   };
 }
 
@@ -381,6 +412,7 @@ export async function callWrite<T = unknown>(
       method: "POST",
       headers: { "Content-Type": "application/json;charset=UTF-8" },
       body,
+      signal: AbortSignal.timeout(httpTimeouts.writeMs),
     });
     const text = await resp.text();
     const ms = Date.now() - t0;
@@ -445,10 +477,16 @@ export async function callWrite<T = unknown>(
     };
   } catch (e) {
     // 同 5xx：请求已经发出去了、回话没收到，企迈侧可能已建单。记 unknown 而不是 rejected。
-    guard.recordAudit({ ...auditWithKey, result: "unknown", reason: "TransportError", durationMs: Date.now() - t0 });
+    // C5：超时单列 reason=RequestTimeout——它和「连不上」是两种故障，日志里要分得开；处置相同（未决闸门拦后续，零重试）。
+    const timedOut = isTimeoutError(e);
+    guard.recordAudit({ ...auditWithKey, result: "unknown", reason: timedOut ? "RequestTimeout" : "TransportError", durationMs: Date.now() - t0 });
     return {
       ok: false,
-      error: { code: "TRANSPORT", message: String(e), hint: "网络异常，先去小程序查订单状态，不要立即重复下单" },
+      error: {
+        code: timedOut ? "TIMEOUT" : "TRANSPORT",
+        message: String(e),
+        hint: timedOut ? TIMEOUT_HINTS.write : "网络异常，先去小程序查订单状态，不要立即重复下单",
+      },
     };
   }
 }
