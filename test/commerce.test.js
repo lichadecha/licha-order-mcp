@@ -283,13 +283,16 @@ test('查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08', asy
   }
   m.orders = [
     {userId:memberB,orderNo:number(66)},
-    {orderNo:number(1),status:null,actualAmount:' ',createTime:String(Date.now()),itemList:[{num:3},{itemName:'茶',num:2}]},
+    {orderNo:number(67)}, {orderNo:number(68)},
+    {userId:memberA,orderNo:number(1),status:null,actualAmount:' ',createTime:String(Date.now()),itemList:[{num:3},{itemName:'茶',num:2}]},
     {userId:memberA,orderNo:number(2),status:10,actualAmount:'0',orderAt:Date.now(),itemList:[],secret:'FAKE_PRIVATE'}
   ];
   const result = await success(s,'my_orders',{days:90});
   assert.equal(result.count,2);
   assert.equal(result.discardedNotOwned,1);
-  assert.equal(result.orders[0].unverified,true);
+  assert.equal(result.unverifiedNotShown,2);
+  assert.match(result.note,/另有 2 条订单门店系统没标明属于哪位会员，没有展示；请在小程序「我的订单」里查看。$/);
+  assert.deepEqual(result.orders.map(row => row.orderNo),[number(1),number(2)]);
   assert.equal(result.orders[0].actualAmountYuan,null);
   assert.match(result.orders[0].orderTime,/\+08:00$/);
   assert.deepEqual(result.orders[0].items,['茶 ×2']);
@@ -728,16 +731,45 @@ test('QRY-04 R24 归属缺失与形态异常分别处理、商品名称按主备
   m.orders = invalid.map((userId, i) => ({ orderNo: number(40 + i), userId }));
   m.orders.push(
     { orderNo: number(1), userId: memberB },
-    { orderNo: number(2), itemList: [{ goodsName: '备选商品名', num: 2 }] },
-    { orderNo: number(3), userId: memberA, itemList: [{ itemName: '主商品名', goodsName: '备选商品名', num: 1 }] }
+    { orderNo: number(2), itemList: [{ goodsName: '归属缺失商品' }] },
+    { orderNo: number(3), userId: memberA, itemList: [
+      { itemName: '主商品名', goodsName: '备选商品名', num: 1 }, { goodsName: '备选商品名', num: 2 }
+    ] }
   );
   const list = await success(s, 'my_orders');
   assert.equal(list.discardedNotOwned, invalid.length + 1);
-  assert.equal(list.count, 2);
-  assert.equal(list.orders[0].unverified, true);
-  assert.deepEqual(list.orders[0].items, ['备选商品名 ×2']);
-  assert.equal(list.orders[1].unverified, undefined);
-  assert.deepEqual(list.orders[1].items, ['主商品名']);
+  assert.equal(list.unverifiedNotShown, 1);
+  assert.equal(list.count, 1);
+  assert.equal(list.orders[0].orderNo, number(3));
+  assert.deepEqual(list.orders[0].items, ['主商品名', '备选商品名 ×2']);
+});
+
+test('QRY-04 两位会员各有一单，列表夹入缺少会员号的他人订单时整份出参只多计数和提示', async t => {
+  const { r, s, m } = await withBound(t);
+  const own = await place(s, await prepare(s));
+  const clean = await success(s, 'my_orders');
+  assert.equal(clean.count, 1);
+  assert.deepEqual(clean.orders.map(row => row.orderNo), [own.orderNo]);
+  assert.equal(clean.orders[0].unverified, undefined);
+  assert.equal(clean.unverifiedNotShown, undefined);
+  assert.equal(clean.unresolvedPendingWrites, undefined);
+  assert.equal(clean.note, '只列出最近 7 天、最多 10 条本人订单。要看某一单的最新状态用 get_order_status。');
+
+  const other = await r.session();
+  await bind(other, 'FAKE_CARD_B', 'card');
+  m.price = 3899;
+  const placed = await place(other, await prepare(other));
+  const foreign = m.orders.find(row => row.orderNo === placed.orderNo);
+  assert.equal(foreign.userId, memberB);
+  delete foreign.userId;
+  foreign.status = 40;
+  foreign.itemList = [{ itemName: '另一位会员的商品' }];
+
+  const mixed = await success(s, 'my_orders');
+  assert.deepEqual(mixed, {
+    ...clean, unverifiedNotShown: 1,
+    note: clean.note + '另有 1 条订单门店系统没标明属于哪位会员，没有展示；请在小程序「我的订单」里查看。'
+  });
 });
 
 test('WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额', async t => {

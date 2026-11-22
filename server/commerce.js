@@ -325,26 +325,36 @@ export async function createCommerce(config, qmai, browse, logs) {
     try { data = await qmai.read(PATHS.orderList, { orderAtStart: start, orderAtEnd: end, pageNo: 1, pageSize: 10, userId: b.id }); }
     catch (error) { throw Error('查询订单列表失败：' + queryError(error, '接口异常')); }
     if (!Array.isArray(data?.data)) throw Error('查询订单列表失败：接口异常');
-    const rows = data.data;
-    const inRange = rows.filter(row => {
+    const visible = [];
+    let outOfRange = 0, discarded = 0, unverifiedNotShown = 0;
+    let hasMissingOwner = false;
+    for (const row of data.data) {
+      const missingOwner = row?.userId === undefined;
+      // 即使时间越界，归属缺失也意味着上游可能给错了页，不能据此判无单。
+      if (missingOwner) hasMissingOwner = true;
       const time = rowTime(row);
-      return time === null || (start <= time && time <= end);
-    });
-    const outOfRange = rows.length - inRange.length;
+      if (time !== null && (time < start || time > end)) outOfRange++;
+      else if (!orderNumber(row)) discarded++;
+      else if (missingOwner) unverifiedNotShown++;
+      else if (owner(row) !== b.id) discarded++;
+      else visible.push(row);
+    }
     if (outOfRange) logs.access({event:'orders_out_of_range', count:outOfRange}, {device,memberId:b.id});
-    const visible = inRange.filter(row => orderNumber(row) && (!Object.hasOwn(row, 'userId') || owner(row) === b.id));
-    const discarded = inRange.length - visible.length;
     if (discarded) logs.access({event:'ownership_rejected', count:discarded}, {device,memberId:b.id});
-    const list = visible.slice(0, 10).map(row => orderView(row, !Object.hasOwn(row, 'userId')));
+    const list = visible.slice(0, 10).map(orderView);
     const result = { days, count: list.length, member: memberView(b), ...(discarded && { discardedNotOwned: discarded }),
       orders: list, note: `只列出最近 ${days} 天、最多 10 条本人订单。要看某一单的最新状态用 get_order_status。` };
+    if (unverifiedNotShown) {
+      result.unverifiedNotShown = unverifiedNotShown;
+      result.note += `另有 ${unverifiedNotShown} 条订单门店系统没标明属于哪位会员，没有展示；请在小程序「我的订单」里查看。`;
+    }
     const total = nonnegativeInteger(data.total);
     const evidence = visible.map(row => ({
       row, time: rowTime(row), products: listedProducts(row),
       store: Object.hasOwn(row, 'storeId') ? responseId(row.storeId) : undefined
     }));
     const distinctOrderNos = new Set(evidence.filter(entry => entry.time !== null).map(entry => entry.row.orderNo));
-    const complete = total !== null && total <= distinctOrderNos.size && !discarded
+    const complete = total !== null && total <= distinctOrderNos.size && !discarded && !hasMissingOwner
       && evidence.every(entry => entry.time !== null && entry.store !== null && entry.products !== null);
     const known = book.knownOrders();
     const found = [];
@@ -355,7 +365,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       const windowStart = record.time - windowMs;
       const windowEnd = record.time + windowMs;
       const nearby = evidence.filter(entry => entry.time !== null && entry.time >= windowStart && entry.time <= windowEnd);
-      const candidates = nearby.filter(({row, store, products}) => owner(row) === b.id && !known.has(row.orderNo)
+      const candidates = nearby.filter(({row, store, products}) => !known.has(row.orderNo)
         && (store === undefined || (store !== null && store === decimalId(record.storeId))) && sameProducts(record.products, products));
       let match;
       if (candidates.length === 1) match = candidates[0].row;

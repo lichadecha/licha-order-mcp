@@ -231,7 +231,7 @@ export function sameProducts(expected, observed) {
   return [...quantities.values()].every(count => count === 0);
 }
 
-export function orderView(row, unverified) {
+export function orderView(row) {
   const items = [];
   for (const item of Array.isArray(row?.itemList) ? row.itemList : []) {
     const name = projectText(productName(item));
@@ -241,5 +241,5 @@ export function orderView(row, unverified) {
   const time = rowTime(row);
   const amount = nonnegativeInteger(row?.actualAmount);
   return { orderNo: orderNumber(row), ...statusView(row?.status), actualAmountYuan: amount === null ? null : yuan(amount),
-    ...(time && { orderTime: beijingTime(time) }), items, ...(unverified && { unverified: true }) };
+    ...(time && { orderTime: beijingTime(time) }), items };
 }

@@ -217,3 +217,55 @@ test('UNR-04 区间总数为一，返回的一张区间内旧单在匹配窗外�
   assert.equal(result.unresolvedPendingWrites, undefined);
   assert.match(result.pendingWriteNote, /企迈侧没有建单/);
 });
+
+test('UNR-04 A 已建单，错页只返回未标会员的 B 旧单时，第二次确认不发送', async t => {
+  const { r, m, s } = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
+  const old = { ...candidate(Date.now() - 3600000), userId: memberB };
+  m.orders.push(old);
+  m.override.set(PATHS.create, ({ userId }) => {
+    m.orders.push({ ...candidate(Date.now(), 2), userId });
+    return ok({}); // 上游已登记，但回执缺单号。
+  });
+  await failure(s, 'place_order', argsFor(await prepare(s)), /结果未知/);
+  m.override.delete(PATHS.create);
+  const { userId, ...withoutOwner } = old;
+  m.override.set(PATHS.orderList, ({ userId: queried }) => ok({
+    data: [withoutOwner], total: m.orders.filter(row => row.userId === queried).length
+  }));
+  await delay(250);
+  const pending = await success(s, 'my_orders', { days: 1 });
+  assert.equal(pending.unresolvedPendingWrites, 1);
+  assert.equal(pending.resolvedPendingWrites, undefined);
+  assert.doesNotMatch(pending.pendingWriteNote, /企迈侧没有建单/);
+  assert.deepEqual(bookRecords(r).map(row => row.state), ['unknown']);
+  await failure(s, 'place_order', argsFor(await prepare(s)), /先调用 my_orders/);
+  assert.equal(count(r, PATHS.create), 1);
+  assert.equal(m.orders.filter(row => row.userId === memberA).length, 1);
+
+  // 同页多出缺归属的旧单，不影响认领唯一吻合的本人新单。
+  m.override.set(PATHS.orderList, () => ok({ data: [withoutOwner, m.orders[1]], total: 1 }));
+  const matched = await success(s, 'my_orders', { days: 1 });
+  assert.equal(matched.resolvedPendingWrites, 1);
+  assert.equal(bookRecords(r)[0].orderNo, number(2));
+});
+
+test('UNR-04 总数为零，归属缺失的越界行仍阻止判无单，换成完整空页后解除', async t => {
+  const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
+  const { r, m, s } = service;
+  await unknownOrder(service);
+  await delay(250);
+  m.override.set(PATHS.orderList, ({ orderAtStart }) => ok({
+    data: [{ orderNo: number(1), orderAt: orderAtStart - 1 }], total: 0
+  }));
+  const pending = await success(s, 'my_orders', { days: 1 });
+  assert.deepEqual(pending.orders, []);
+  assert.equal(pending.unverifiedNotShown, undefined);
+  assert.equal(pending.unresolvedPendingWrites, 1);
+  assert.equal(bookRecords(r)[0].state, 'unknown');
+
+  m.override.delete(PATHS.orderList);
+  const empty = await success(s, 'my_orders', { days: 1 });
+  assert.equal(empty.resolvedPendingWrites, 1);
+  assert.match(empty.pendingWriteNote, /企迈侧没有建单/);
+  assert.equal(bookRecords(r)[0].state, 'absent');
+});
