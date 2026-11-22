@@ -6,6 +6,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { orderNumber } from './commerce-view.js';
 
 const checksum = text => createHash('sha256').update(text).digest('hex');
 const bookName = 'orders.json';
@@ -35,7 +36,7 @@ function validateRecord(record) {
     && Number.isSafeInteger(record.totalFen) && record.totalFen > 0
     && /^\d{4}-\d{2}-\d{2}$/.test(record.day)
     && states.has(record.state)
-    && (!['success', 'found'].includes(record.state) || typeof record.orderNo === 'string' && record.orderNo.trim().length > 0)
+    && (['success', 'found'].includes(record.state) ? Boolean(orderNumber(record)) : !Object.hasOwn(record, 'orderNo'))
     && (record.state !== 'success' || Number.isSafeInteger(record.completedAt))
     && (!['found', 'absent'].includes(record.state) || Number.isSafeInteger(record.resolvedAt));
 }
@@ -171,13 +172,26 @@ export class Ledger {
   }
 
   #confirmSnapshot(candidate) {
+    // SQLite 可能在提交生效后才报错。先同步独立标记，确保持续只读时也能拒绝启动写路径。
+    const review = join(this.directory, reviewName);
+    writeFileSync(review, this.lastBytes, {flag:'wx', mode:0o600, flush:true});
+    this.#syncDirectory();
     try {
       this.journal.exec('DELETE FROM pending_snapshot WHERE id=1');
     } catch (error) {
-      // 最后一次 SQLite 提交可能已经生效才报告 I/O 错误。
-      this.#restoreOnUncertainCommit(candidate);
+      try {
+        this.#restoreOnUncertainCommit(candidate);
+        unlinkSync(review);
+        this.#syncDirectory();
+      } catch { /* 撤销无法确认时保留预先落盘的标记。 */ }
       throw error;
     }
+    // 此刻 SQLite 已明确确认，候选快照已落盘。清理失败只关闭后续写入；
+    // 报告本笔已确认的结果，否则 unlink 已生效才报错时会给出相反的交易结论。
+    try {
+      unlinkSync(review);
+      this.#syncDirectory();
+    } catch { this.fault = true; }
   }
 
   #restoreOnUncertainCommit(candidate) {
@@ -185,12 +199,7 @@ export class Ledger {
       this.journal.prepare('INSERT OR REPLACE INTO pending_snapshot VALUES (1, ?, ?)').run(this.lastBytes, checksum(candidate));
       return;
     } catch { /* 数据库仍不可写时，走文件恢复。 */ }
-    try {
-      this.#replaceFile(this.lastBytes);
-      return;
-    } catch { /* 两种恢复均失败时，隔离现场供人工核对。 */ }
-    writeFileSync(join(this.directory, reviewName), this.lastBytes, {flag:'wx', mode:0o600, flush:true});
-    this.#syncDirectory();
+    this.#replaceFile(this.lastBytes);
   }
 
   #persistRecord(record) {

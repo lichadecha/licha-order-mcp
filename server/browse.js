@@ -1,5 +1,5 @@
 import {PATHS, readHint} from './qmai.js';
-import {beijingTime, digest, projectText, yuan} from './common.js';
+import {beijingTime, decimalId, digest, projectText, yuan} from './common.js';
 import {itemCard, menuItem, id, list, numeric} from './catalog.js';
 import {priceLine, SelectionError} from './price.js';
 
@@ -74,13 +74,14 @@ export class Browse {
         for (const row of list(data.list)) {
           const storeId = id(row.id);
           if (!storeId) continue;
+          const rawCode = typeof row.code === 'string' ? row.code : id(row.code);
           const store = {
-            name:projectText(row.name), storeId, shopCode:projectText(typeof row.code === 'string' ? row.code : id(row.code)),
+            name:projectText(row.name), storeId, shopCode:projectText(rawCode),
             address:projectText(row.address), cityName:projectText(row.cityName)
           };
           const searchable = [row.name, row.address, row.fullAddress, row.cityName, store.shopCode]
             .filter(value => typeof value === 'string').map(normalize);
-          records.set(storeId, {store, searchable, status:numeric(row.openStatus)});
+          records.set(storeId, {store, rawCode, searchable, status:numeric(row.openStatus)});
         }
         if (data.list.length < pageSize || records.size === previous) break;
       }
@@ -88,9 +89,10 @@ export class Browse {
     }, fresh);
   }
 
-  async store(storeId) {
+  async storeForOrder(storeId) {
     const directory = await this.#directory();
-    return directory.records.get(String(storeId))?.store;
+    const record = directory.records.get(String(storeId));
+    if (record) return {name:record.store.name, shopCode:record.rawCode};
   }
 
   async #liveStatus(storeId) {
@@ -189,7 +191,7 @@ export class Browse {
         const {line, item, tradeMark, lineFen} = priceLine(row, card, input, preparing);
         totalFen += lineFen;
         if (!Number.isSafeInteger(totalFen)) throw new SelectionError('商品价格无法计算', '换个商品试试');
-        if (preparing) productEvidence.push({ goodsId:item.goodsId,
+        if (preparing) productEvidence.push({ goodsId:decimalId(item.goodsId),
           nameHash:typeof row.name === 'string' && row.name.trim() ? digest(row.name) : null, quantity:item.num });
         lines.push(line);
         orderItems.push(item);

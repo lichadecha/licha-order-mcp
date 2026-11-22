@@ -11,72 +11,10 @@ import { Ledger } from '../server/ledger.js';
 import { beijingTime, digest } from '../server/common.js';
 import { checkOrderFields } from '../server/commerce.js';
 
-const memberA = '9000000000000001234';
-const memberB = '9000000000000005678';
-const phone = '13800000000';
-const goodsId = '8100000000000000001';
-const skuId = '8100000000000000002';
-const shop = '111111';
-const basket = { storeId: shop, items: [{ goodsId, quantity: 1 }] };
-const number = i => 'D' + String(i).padStart(20, '0');
-const ok = data => ({ code: 0, status: true, data });
-
-async function setup(t, env = {}) {
-  const mock = {
-    price: 2000, couponRows: [], orders: [], last: null, writes: 0, override: new Map(), code: '01'
-  };
-  const r = await rig(t, {
-    env: { LICHA_RATE_CALLS_PER_DEVICE_PER_MIN: '200', ...env },
-    upstream: async (path, params, context) => {
-      if (mock.override.has(path)) return mock.override.get(path)(params, context);
-      switch (path) {
-      case PATHS.member: {
-        const id = { [phone]: memberA, FAKE_CARD_A: memberA, FAKE_CARD_B: memberB, ABCD: memberB,
-          '0000': 0, '0001': '0', '0002': null }[params.customerCode.code];
-        return ok({ customerId: id ?? null });
-      }
-      case PATHS.item: return ok([{ goodsId, name: '测试茶', type: 1, status: 10,
-        goodsSkuList: [{ skuId, salePrice: mock.price, clearStatus: 1, inventory: 99 }] }]);
-      case PATHS.stores: return ok({ list: [{ id: Number(shop), code: mock.code, name: '模拟门店', openStatus: 1 }], total: 1 });
-      case PATHS.coupons: return ok(mock.couponRows);
-      case PATHS.create: {
-        const orderNo = number(++mock.writes);
-        mock.last = { orderNo, userId: params.userId, actualAmount: mock.price, discountAmount: 0 };
-        mock.orders.push({ ...mock.last, storeId: params.storeId, orderAt: Date.now(), status: 10 });
-        return ok({ orderNo, payAmount: mock.price / 100 });
-      }
-      case PATHS.orderDetail: return ok(mock.last);
-      case PATHS.orderList: return ok({ data: mock.orders, total: mock.orders.length });
-      case PATHS.orderStatus: return ok({ userId: memberA, status: 10 });
-      default: return ok([]);
-      }
-    }
-  });
-  return { ...r, mock };
-}
-async function success(s, tool, args) {
-  const result = await s.call(tool, args);
-  assert.ok(!result.isError, result.content[0].text);
-  return JSON.parse(result.content[0].text);
-}
-async function failure(s, tool, args, regex) {
-  const result = await s.call(tool, args);
-  assert.equal(result.isError, true, result.content[0].text);
-  assert.match(result.content[0].text, regex);
-  return result.content[0].text;
-}
-const bind = (s, code = phone, codeType = 'phone') => success(s, 'bind_member', { code, codeType });
-const prepare = s => success(s, 'prepare_order', basket);
-const argsFor = d => ({ confirmToken: d.confirmToken, confirmAmountYuan: Number(d.estimatedTotalYuan) });
-const place = (s, draft) => success(s, 'place_order', argsFor(draft));
-const count = (r, path) => r.requests.filter(x => x.path === path).length;
-const bookFile = r => join(r.dataDir, 'orders.json');
-async function withBound(t, env) {
-  const r = await setup(t, env);
-  const s = await r.session();
-  await bind(s);
-  return { r, s, m: r.mock };
-}
+import {
+  memberA, memberB, phone, goodsId, skuId, shop, basket, number, ok, setup, success, failure,
+  bind, prepare, argsFor, place, count, bookFile, withBound
+} from '../test-support/commerce.js';
 
 test('绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01', async t => {
   const r = await setup(t);
@@ -384,8 +322,10 @@ test('未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/0
   assert.equal((await success(b,'my_orders')).unresolvedPendingWrites,undefined);
   await place(b,await prepare(b));
   await delay(455);
+  page={total:0};
+  await failure(s,'my_orders',{days:90},/查询订单列表失败/);
   for (const bad of [
-    {total:0}, {data:[],total:' '}, {data:[],total:-1}, {data:[],total:2.1},
+    {data:[],total:' '}, {data:[],total:-1}, {data:[],total:2.1},
     {data:[{...candidate,userId:memberB}],total:1}, {data:[{...candidate,userId:null}],total:1},
     {data:[{...candidate,orderNo:''}],total:1}, {data:[{...candidate,orderAt:null}],total:1},
     {data:[{...candidate,orderNo:prior.orderNo}],total:1},

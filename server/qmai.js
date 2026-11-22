@@ -45,10 +45,20 @@ export function checkSignature() {
   if (token !== 'cFw0t9IuvL9jVo9qAzk0qMcw5BM%3D') throw new Error('企迈签名自检失败');
 }
 
-// 扫描完整字符串或数字词素。引号里的数字、指数、分数及转义字符均保持原样。
-export function parseResponse(raw) {
-  const tokens = /"(?:[^"\\]|\\.)*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/gs;
-  return JSON.parse(raw.replace(tokens, token => /^-?\d{15,}$/.test(token) ? JSON.stringify(token) : token));
+const orderReadPaths = new Set([PATHS.orderList, PATHS.orderDetail, PATHS.orderStatus]);
+const orderIntegerFields = new Set(['userId', 'total', 'status', 'actualAmount', 'discountAmount',
+  'discountType', 'goodsId', 'num', 'storeId', 'orderAt', 'createTime']);
+
+export function parseResponse(raw, path) {
+  const orderRead = orderReadPaths.has(path);
+  return JSON.parse(raw, (key, value, context) => {
+    if (typeof value !== 'number') return value;
+    const token = context.source;
+    // 大整数直接取原文。交易证据中的分数和指数也保留词法，让整数校验能识别舍入前的值。
+    const integerField = (orderRead && orderIntegerFields.has(key))
+      || (path === PATHS.member && (key === 'customerId' || key === 'data'));
+    return /^-?\d{15,}$/.test(token) || (integerField && /[.eE]/.test(token)) ? token : value;
+  });
 }
 
 const numericKeys = new Set(['userId', 'customerId', 'goodsId', 'skuId', 'id', 'valueId', 'frontCategoryId', 'storeId', 'shopId']);
@@ -78,7 +88,7 @@ export function readHint(error, fallback) {
     ?? (error.code == null ? fallback : undefined) ?? '接口暂时异常，换个问法试试';
 }
 
-function post(url, payload, timeout, onFlush) {
+function post(url, path, payload, timeout, onFlush) {
   const transport = url.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
     let timedOut = false;
@@ -98,7 +108,7 @@ function post(url, payload, timeout, onFlush) {
       response.on('data', part => chunks.push(part));
       response.once('end', () => {
         try {
-          const envelope = parseResponse(Buffer.concat(chunks).toString('utf8'));
+          const envelope = parseResponse(Buffer.concat(chunks).toString('utf8'), path);
           if (envelope?.status === false) {
             const {message, code} = envelope;
             reject(new QmaiError('business', projectText(message) || '未知错误', {
@@ -201,7 +211,7 @@ export class Qmai {
           path, outcome, elapsedMs: Math.round(performance.now() - started),
           ...(error?.code !== undefined && {code:error.code}), ...(error?.messageLength !== undefined && {messageLength:error.messageLength})
         });
-        const response = post(url, payload, timeout, flushed.resolve);
+        const response = post(url, path, payload, timeout, flushed.resolve);
         response.then(data => {
           const rows = path === PATHS.orderList && Array.isArray(data?.data) ? data.data
             : path === PATHS.create ? [data] : [];

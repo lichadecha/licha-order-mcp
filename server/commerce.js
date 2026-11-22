@@ -1,8 +1,8 @@
 import { currentQuotaDay, issueConfirmation } from './logs.js';
-import { beijingTime, digest, tail, yuan } from './common.js';
+import { beijingTime, decimalId, digest, tail, yuan } from './common.js';
 import { PATHS, readHint } from './qmai.js';
 import { Ledger } from './ledger.js';
-import { couponView, decimalId, listedProducts, sameProducts, numeric, orderNumber, orderView, placedView, rowTime, statusView, toFen } from './commerce-view.js';
+import { couponView, listedProducts, sameProducts, nonnegativeInteger, orderNumber, orderView, placedView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
 
 const bookProblem = '安全账本不可用，已拒绝下单。未决核对、当日额度、防重复都靠这本账本，读不出它就等于没有护栏。请稍后再试或直接在小程序下单；看菜单和查订单不受影响。';
 const missingToken = '确认令牌无效（不存在或已被使用过）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。';
@@ -153,9 +153,10 @@ export async function createCommerce(config, qmai, browse, logs) {
       ...(b.phone && { mobile: b.phone, reservePhone: b.phone }) };
     checkOrderFields(params);
     let store;
-    try { store = await browse.store(storeId); } catch { /* 门店名录失败时仍可按门店 ID 组单 */ }
+    try { store = await browse.storeForOrder(storeId); } catch { /* 门店名录失败时仍可按门店 ID 组单 */ }
     let rows;
-    if (store?.shopCode) {
+    const hasCode = !!store?.shopCode.trim();
+    if (hasCode) {
       try {
         const data = await qmai.read(PATHS.coupons, {
           customerId: b.id, discountPrice: 0, multiMark: store.shopCode, typeCate: 1, tradeMarks
@@ -163,13 +164,13 @@ export async function createCommerce(config, qmai, browse, logs) {
         rows = Array.isArray(data) ? data : data?.list;
       } catch { /* 券预测失败不阻断组单 */ }
     }
-    const coupons = couponView(rows, totalFen, !store || !!store.shopCode);
+    const { coupons, prediction } = couponView(rows, totalFen, !store || hasCode);
     if (book.fault) throw Error(bookProblem);
     const now = Date.now();
     const confirmation = issueConfirmation();
     const confirmToken = confirmation.token;
     const discarded = supersede(draft => draft.hash === b.hash);
-    drafts.set(confirmToken, { confirmation, params, totalFen, products: productEvidence, prediction: coupons.predicted, storeId, hash: b.hash,
+    drafts.set(confirmToken, { confirmation, params, totalFen, products: productEvidence, prediction, storeId, hash: b.hash,
       device, expires: now + tokenTtl, state: 'ready' });
     logs.access({event:'prepare_order',totalFen}, {device,memberId:b.id,confirmation});
     const result = { confirmToken, member: memberView(b), store: { storeId, ...(store?.name && { name: store.name }) },
@@ -297,6 +298,8 @@ export async function createCommerce(config, qmai, browse, logs) {
     try { row = await qmai.read(PATHS.orderStatus, { orderNo }); }
     catch (error) { throw Error(queryError(error, '查询失败：查无此单或接口异常')); }
     if (!row || typeof row !== 'object') throw Error('查询失败：查无此单或接口异常');
+    const returnedNumber = orderNumber(row);
+    if (returnedNumber && returnedNumber !== orderNo) throw Error('查询失败：返回的订单号与查询不符');
     if (owner(row) !== b.id) {
       logs.access({event:'ownership_rejected', orderNo}, {device,memberId:b.id});
       throw Error('无法查询：该订单不属于当前绑定的会员');
@@ -316,21 +319,26 @@ export async function createCommerce(config, qmai, browse, logs) {
     let data;
     try { data = await qmai.read(PATHS.orderList, { orderAtStart: start, orderAtEnd: end, pageNo: 1, pageSize: 10, userId: b.id }); }
     catch (error) { throw Error('查询订单列表失败：' + queryError(error, '接口异常')); }
-    const validArray = Array.isArray(data?.data);
-    const rows = validArray ? data.data.slice(0, 10) : [];
-    const visible = rows.filter(row => orderNumber(row) && (!Object.hasOwn(row, 'userId') || owner(row) === b.id));
-    const discarded = rows.length - visible.length;
+    if (!Array.isArray(data?.data)) throw Error('查询订单列表失败：接口异常');
+    const rows = data.data;
+    const owned = rows.filter(row => orderNumber(row) && (!Object.hasOwn(row, 'userId') || owner(row) === b.id));
+    const discarded = rows.length - owned.length;
     if (discarded) logs.access({event:'ownership_rejected', count:discarded}, {device,memberId:b.id});
-    const list = visible.map(row => orderView(row, !Object.hasOwn(row, 'userId')));
+    const visible = owned.filter(row => {
+      const time = rowTime(row);
+      return time === null || (start <= time && time <= end);
+    });
+    const outOfRange = owned.length - visible.length;
+    const list = visible.slice(0, 10).map(row => orderView(row, !Object.hasOwn(row, 'userId')));
     const result = { days, count: list.length, member: memberView(b), ...(discarded && { discardedNotOwned: discarded }),
+      ...(outOfRange && { discardedOutOfRange: outOfRange }),
       orders: list, note: `只列出最近 ${days} 天、最多 10 条本人订单。要看某一单的最新状态用 get_order_status。` };
-    const total = numeric(data?.total);
+    const total = nonnegativeInteger(data.total);
     const evidence = visible.map(row => ({
       row, time: rowTime(row), products: listedProducts(row),
       store: Object.hasOwn(row, 'storeId') ? decimalId(row.storeId) : undefined
     }));
-    const complete = validArray && data.data.length <= 10 && Number.isSafeInteger(total)
-      && total >= 0 && total <= rows.length && !discarded
+    const complete = total !== null && total <= rows.length && !discarded && !outOfRange
       && evidence.every(entry => entry.time !== null && entry.store !== null && entry.products !== null);
     const known = book.knownOrders();
     const found = [];
@@ -342,7 +350,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       const windowEnd = record.time + windowMs;
       const nearby = evidence.filter(entry => entry.time !== null && entry.time >= windowStart && entry.time <= windowEnd);
       const candidates = nearby.filter(({row, store, products}) => owner(row) === b.id && !known.has(row.orderNo)
-        && (store === undefined || store === record.storeId) && sameProducts(record.products, products));
+        && (store === undefined || (store !== null && store === decimalId(record.storeId))) && sameProducts(record.products, products));
       let match;
       if (candidates.length === 1) match = candidates[0].row;
       else if (!(complete && !nearby.length
@@ -359,10 +367,8 @@ export async function createCommerce(config, qmai, browse, logs) {
         {device,memberId:b.id,order:match,ledgerRecord:record});
     }
     if (found.length) {
-      const unpaid = found.filter(row => numeric(row.status) === 10).length;
       notes.push(`核对结果：此前 ${found.length} 笔结果未知的下单请求，在企迈侧确实建了单（${found.map(orderNumber).join('、')}）。不要重下。`
-        + (unpaid ? '请引导顾客去小程序「我的订单」付款。' : '')
-        + (unpaid < found.length ? `其中 ${found.length - unpaid} 笔不是待支付状态，按小程序订单页显示的为准。` : ''));
+        + reconciledPaymentNote(found));
     }
     if (absent) notes.push(`核对结果：此前 ${absent} 笔结果未知的下单请求，在这段时间里没有对应订单——企迈侧没有建单，可以重新走 prepare_order 组单。`);
     const remaining = unresolved(b.hash);

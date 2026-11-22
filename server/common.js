@@ -5,6 +5,12 @@ export function digest(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
 
+export function decimalId(value) {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
+  if (typeof value !== 'string' || !/^0*[1-9]\d*$/.test(value)) return null;
+  return value.replace(/^0+/, '');
+}
+
 export function beijingTime(ms = Date.now()) {
   return new Date(ms + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ') + ' +08:00';
 }
