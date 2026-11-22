@@ -1,8 +1,17 @@
-# 李茶的茶点单 MCP v1.5 交付清单
+# 李茶的茶点单 MCP v1.6 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.5 编号、金额与未决核对
+## v1.6 未决核对与复述金额
+
+基线为 `0f5ca6c`。据负责人反馈，上一轮 5 条修订均经独立复核通过，第七轮黑盒验收共 221 项，206 项通过，0 项失败。
+
+- **UNR-04 · 查询时段。** `my_orders` 只用本次查询起止时间内的不同订单号核对 `total`。查最近一天、总数为 1 而第一页仅有两天前旧单时，列表为空，原请求保持未决，再次提交仍被拦截。总数为 0 且仅多返回一张越界旧单，或总数为 1 且唯一旧单落在查询时段内、匹配窗外，其余无单条件齐全时均可解除未决。[查询与重下回归](test/order-query.test.js)
+- **WRT-05 · 复述金额。** `place_order` 按收到的数值检查小数位数。超过两位时返回工具契约 §7 的重新确认提示，创建请求发出 0 次。整数及最多两位小数的金额沿用原规则，与待确认单相差 1 分可提交，超过 1 分拒绝。[长小数与一分容差回归](test/commerce.test.js#L886)
+
+**本轮验收。** Node 22.23.1，使用假凭证和本机回环模拟上游运行完整的 `npm test`。143 项全部通过，失败、跳过、取消均为 0。相对基线新增 4 项，UNR-04 和 WRT-05 各 2 项，另各修订 1 项已有用例。原始 JSON 数字 `19.984999999999999999`、`20.014999999999999999` 均返回 §7 指定文案，随后用同一令牌复述整数 `20` 成功创建一单。
+
+## v1.5 编号、金额与未决核对（历史记录）
 
 本轮基于 `2e52982`。负责人反馈，上一版独立复核的 84 组写入故障与强制结束实验均恢复到预期的已提交状态，第六轮黑盒验收共 214 项，199 项通过、0 项失败。
 
@@ -239,7 +248,7 @@
 | WRT-02 | [server/commerce.js](server/commerce.js) · place | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | WRT-03 | [server/commerce.js](server/commerce.js) · place | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | WRT-04 | [server/commerce.js](server/commerce.js) · place | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| WRT-05 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135) |
+| WRT-05 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读](test/commerce.test.js#L135) · [两位小数与一分容差](test/commerce.test.js#L886) |
 | WRT-06 | [server/commerce.js](server/commerce.js) · place | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377) |
 | WRT-07 | [server/commerce.js](server/commerce.js) · place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 | WRT-08 | [server/commerce.js](server/commerce.js) · place | [零元预估不占位 WRT-08](test/commerce.test.js#L360) |
@@ -275,7 +284,7 @@
 | UNR-01 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 | UNR-02 | [server/commerce.js](server/commerce.js) · unresolved、orders | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268)<br>[未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 | UNR-03 | [server/commerce.js](server/commerce.js) · orders · [rowTime、listedProducts、sameProducts](server/commerce-view.js) | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536)<br>[UNR-03 商品名称、编号和杯数随发送记录恢复，畸形时间不能用于正负核对](test/commerce.test.js#L608) |
-| UNR-04 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409) |
+| UNR-04 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据](test/commerce.test.js#L304) · [核对结论持久化失败](test/commerce.test.js#L409) · [总数为零与越界旧单](test/order-query.test.js#L98) · [错页拦截与匹配窗外旧单](test/order-query.test.js#L184) |
 | UNR-05 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536)<br>[迟到的订单列表只核对查询开始时的未决 UNR-05](test/commerce.test.js#L564) |
 | UNR-06 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536) |
 | UNR-07 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536) |

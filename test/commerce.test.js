@@ -138,7 +138,7 @@ test('并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 
   const draft = await prepare(s);
   const args = argsFor(draft);
   await failure(s,'place_order',{...args, other:{userId:memberB}},/只接受/);
-  await failure(s,'place_order',{...args,confirmAmountYuan:20.015},/20.02.*20.00/);
+  await failure(s,'place_order',{...args,confirmAmountYuan:20.02},/20.02.*20.00/);
   assert.equal(count(r, PATHS.create), 0);
   m.override.set(PATHS.orderDetail, p => ok({ ...m.last, actualAmount: 0, discountList: [{ discountType:2,
     discountName:'优惠券', discountSummary:'半价券', discountAmount:2000, discountId:memberA }] }));
@@ -881,4 +881,28 @@ test('LED-06 账本目录不可写时启动失败，恢复写权限后可接管'
   const resumed = await r.session();
   await bind(resumed);
   assert.equal((await prepare(resumed)).recentOrder.orderNo,receipt.orderNo);
+});
+
+test('WRT-05 复述金额多于两位小数时按契约拒绝，原令牌仍可用整数金额提交', async t => {
+  const { r, s } = await withBound(t);
+  const { confirmToken } = await prepare(s);
+  const message = '复述金额要照待确认单上的金额，用两位小数（如 24.00）。请按待确认单的金额重新向顾客确认后再提交。';
+  for (const raw of ['19.984999999999999999', '20.014999999999999999', '20.001', '1e-7']) {
+    const result = await s.call('place_order', { confirmToken, confirmAmountYuan: JSON.rawJSON(raw) });
+    assert.equal(result.isError, true, raw);
+    assert.equal(result.content[0].text, message, raw);
+    assert.equal(count(r, PATHS.create), 0);
+  }
+  await success(s, 'place_order', { confirmToken, confirmAmountYuan: 20 });
+  assert.equal(count(r, PATHS.create), 1);
+});
+
+test('WRT-05 合格的一位与两位小数按整分比对，相差一分仍可提交', async t => {
+  const { r, s, m } = await withBound(t);
+  m.price = 29;
+  for (const confirmAmountYuan of [0.3, 0.29, 0.28]) {
+    const { confirmToken } = await prepare(s);
+    await success(s, 'place_order', { confirmToken, confirmAmountYuan });
+  }
+  assert.equal(count(r, PATHS.create), 3);
 });

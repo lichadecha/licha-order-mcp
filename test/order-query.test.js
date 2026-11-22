@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PATHS } from '../server/qmai.js';
 import {
-  argsFor, bookRecords, failure, goodsId, memberA, memberB, number, ok, place, prepare, shop, success, withBound
+  argsFor, bookRecords, count, failure, goodsId, memberA, memberB, number, ok, place, prepare, shop, success, withBound
 } from '../test-support/commerce.js';
 
 async function unknownOrder(service) {
@@ -95,7 +95,7 @@ test('OUT-01 QRY-04 本人及他人的越界行都只写日志，不进入列表
   assert.equal(access.find(row => row.event === 'orders_out_of_range')?.count, 2);
 });
 
-test('UNR-04/07 匹配窗已过，整页只有能按时间排除的行时确认无单', async t => {
+test('UNR-04/07 匹配窗已过，区间总数为零时多返回一张越界旧单仍可确认无单', async t => {
   const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
   const { m, s } = service;
   await unknownOrder(service);
@@ -103,8 +103,8 @@ test('UNR-04/07 匹配窗已过，整页只有能按时间排除的行时确认�
   let total = 2;
   m.override.set(PATHS.orderList, ({ orderAtStart }) => ok({ total, data: [candidate(orderAtStart - 86400000)] }));
   assert.equal((await success(s, 'my_orders', { days: 90 })).unresolvedPendingWrites, 1);
-  total = 1;
-  const result = await success(s, 'my_orders', { days: 90 });
+  total = 0;
+  const result = await success(s, 'my_orders', { days: 1 });
   assert.equal(result.count, 0);
   assert.equal(result.resolvedPendingWrites, 1);
   assert.equal(result.unresolvedPendingWrites, undefined);
@@ -179,4 +179,41 @@ test('QRY-02/03 状态回执的单号已提供但不合格时，拒绝返回状�
   await failure(s, 'get_order_status', { orderNo: digits }, /查询失败/);
   m.override.set(PATHS.orderStatus, () => ok({ orderNo: requested, userId: memberA, status: 10 }));
   assert.equal((await success(s, 'get_order_status', { orderNo: requested })).status, 10);
+});
+
+test('UNR-04 区间总数为一，错页只返回两天前的订单时保持未决并阻止再次创建', async t => {
+  const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
+  const { r, m, s } = service;
+  await unknownOrder(service);
+  const [{ time }] = bookRecords(r);
+  await delay(250);
+  const newOrder = candidate(time, 2);
+  m.orders = [newOrder];
+  m.override.set(PATHS.orderList, () => ok({ data: [candidate(time - 2 * 86400000)], total: 1 }));
+  const result = await success(s, 'my_orders', { days: 1 });
+  assert.equal(result.count, 0);
+  assert.deepEqual(result.orders, []);
+  assert.equal(result.unresolvedPendingWrites, 1);
+  assert.equal(result.resolvedPendingWrites, undefined);
+  assert.doesNotMatch(result.pendingWriteNote, /企迈侧没有建单/);
+  await failure(s, 'place_order', argsFor(await prepare(s)), /先调用 my_orders/);
+  assert.equal(count(r, PATHS.create), 1);
+
+  m.override.delete(PATHS.orderList);
+  const corrected = await success(s, 'my_orders', { days: 1 });
+  assert.equal(corrected.resolvedPendingWrites, 1);
+  assert.equal(bookRecords(r)[0].orderNo, newOrder.orderNo);
+});
+
+test('UNR-04 区间总数为一，返回的一张区间内旧单在匹配窗外时确认无单', async t => {
+  const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
+  const { m, s } = service;
+  const at = await unknownOrder(service);
+  m.orders = [candidate(at - 3600000)];
+  await delay(250);
+  const result = await success(s, 'my_orders', { days: 1 });
+  assert.deepEqual(result.orders.map(row => row.orderNo), [number(1)]);
+  assert.equal(result.resolvedPendingWrites, 1);
+  assert.equal(result.unresolvedPendingWrites, undefined);
+  assert.match(result.pendingWriteNote, /企迈侧没有建单/);
 });

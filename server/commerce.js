@@ -217,10 +217,12 @@ export async function createCommerce(config, qmai, browse, logs) {
     if (draft.state === 'submitted') reject('WRT-03', missingToken);
     if (draft.hash !== b.hash) reject('WRT-04', '这张待确认单不属于当前绑定的会员，已拒绝。请重新用 prepare_order 组单。');
     if (draft.state !== 'ready') reject('WRT-03', missingToken);
-    const amount = toFen(confirmAmountYuan);
     const key = digest(confirmToken);
     Object.assign(audit, { storeId: draft.storeId, totalFen: draft.totalFen,
       lineCount: draft.params.items.length, cupCount: draft.params.items.reduce((sum, item) => sum + item.num, 0) });
+    if (Number(confirmAmountYuan.toFixed(2)) !== confirmAmountYuan) reject('WRT-05',
+      '复述金额要照待确认单上的金额，用两位小数（如 24.00）。请按待确认单的金额重新向顾客确认后再提交。');
+    const amount = toFen(confirmAmountYuan);
     if (amount === null || Math.abs(amount - draft.totalFen) > 1) reject('WRT-05',
       `复述金额与待确认单不一致：你报的是 ¥${amount === null ? '超出范围' : yuan(amount)}，待确认单是 ¥${yuan(draft.totalFen)}。请按待确认单的金额重新向顾客确认，不要凭记忆报数。`);
     if (book.fault) reject('WRT-06', bookProblem);
@@ -341,7 +343,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       row, time: rowTime(row), products: listedProducts(row),
       store: Object.hasOwn(row, 'storeId') ? responseId(row.storeId) : undefined
     }));
-    const distinctOrderNos = new Set(rows.map(orderNumber).filter(Boolean));
+    const distinctOrderNos = new Set(evidence.filter(entry => entry.time !== null).map(entry => entry.row.orderNo));
     const complete = total !== null && total <= distinctOrderNos.size && !discarded
       && evidence.every(entry => entry.time !== null && entry.store !== null && entry.products !== null);
     const known = book.knownOrders();

@@ -30,7 +30,8 @@ const schemas = {
   preview_order: order,
   bind_member: shape({code:{type:'string',minLength:4,maxLength:64},codeType:{enum:['phone','card','dynamic_code']}},['code','codeType']),
   prepare_order: order,
-  place_order: shape({confirmToken:nonempty,confirmAmountYuan:{type:'number',exclusiveMinimum:0}},['confirmToken','confirmAmountYuan']),
+  place_order: shape({confirmToken:nonempty,confirmAmountYuan:{type:'number',exclusiveMinimum:0,
+    description:'刚念给顾客的合计金额（元），最多两位小数。'}},['confirmToken','confirmAmountYuan']),
   get_order_status: shape({orderNo:nonempty},['orderNo']),
   my_orders: shape({days:{type:'integer',minimum:1,maximum:90,default:7}})
 };
