@@ -6,9 +6,8 @@ export function digest(value) {
 }
 
 export function decimalId(value) {
-  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? String(value) : null;
-  if (typeof value !== 'string' || !/^0*[1-9]\d*$/.test(value)) return null;
-  return value.replace(/^0+/, '');
+  if (typeof value === 'string' && !/^\d+$/.test(value)) return null;
+  return responseId(value);
 }
 
 // R25：只在十进制原文上移动小数点；任何会落在整数位右边的非零数字都不能舍入。
@@ -29,7 +28,9 @@ export function integerDigits(value) {
 
 export function responseId(value) {
   const digits = integerDigits(value);
-  return digits === '0' ? null : digits;
+  const max = '9223372036854775807';
+  if (!digits || digits === '0' || digits.length > max.length || (digits.length === max.length && digits > max)) return null;
+  return digits;
 }
 
 export function beijingTime(ms = Date.now()) {
@@ -42,7 +43,8 @@ export function tail(value) {
 }
 
 export function yuan(fen) {
-  return (fen / 100).toFixed(2);
+  const digits = String(Math.abs(fen)).padStart(3, '0');
+  return (fen < 0 ? '-' : '') + digits.slice(0, -2) + '.' + digits.slice(-2);
 }
 
 export function maskNumbers(value) {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { rig } from './rig.js';
 import { PATHS } from '../server/qmai.js';
 
@@ -62,7 +63,15 @@ export const prepare = s => success(s, 'prepare_order', basket);
 export const argsFor = d => ({ confirmToken: d.confirmToken, confirmAmountYuan: Number(d.estimatedTotalYuan) });
 export const place = (s, draft) => success(s, 'place_order', argsFor(draft));
 export const count = (r, path) => r.requests.filter(x => x.path === path).length;
-export const bookFile = r => join(r.dataDir, 'orders.json');
+export const bookFile = r => join(r.dataDir, 'orders.sqlite');
+export function bookRecords(r) {
+  const db = new DatabaseSync(bookFile(r), { readOnly: true });
+  try {
+    return db.prepare('SELECT record FROM records ORDER BY rowid').all().map(row => JSON.parse(row.record));
+  } finally {
+    db.close();
+  }
+}
 export async function withBound(t, env) {
   const r = await setup(t, env);
   const s = await r.session();

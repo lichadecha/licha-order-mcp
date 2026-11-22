@@ -5,6 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {rig} from '../test-support/rig.js';
+import {bookRecords} from '../test-support/commerce.js';
 import {PATHS} from '../server/qmai.js';
 
 const good = data => ({status:true,code:0,data});
@@ -21,11 +22,10 @@ async function bind(r,code) {
 }
 const prepare = s => value(s.call('prepare_order',order));
 const place = (s,draft) => s.call('place_order',{confirmToken:draft.confirmToken,confirmAmountYuan:1});
-const records = async r => JSON.parse(await readFile(join(r.dataDir,'orders.json'),'utf8')).records;
 function mockUpstream(onCreate) {
   return async (path,params,wire) => {
     switch(path) {
-      case PATHS.member: return good({customerId:'9900000000000000'+params.customerCode.code.slice(-3)});
+      case PATHS.member: return good({customerId:'9100000000000000'+params.customerCode.code.slice(-3)});
       case PATHS.item: return good([{goodsId:'10001',name:'测试茶',goodsSkuList:[{skuId:'902',salePrice:100}]}]);
       case PATHS.categories: return good([]);
       case PATHS.stores: return good({list:[{id:601,code:'',name:'测试店'}]});
@@ -70,7 +70,7 @@ test('WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写�
   const early = await Promise.race(attempts.map((promise,i)=>promise.then(result=>({result,i}))));
   assert.match(early.result.content[0].text,/总单量已到上限/);
   await firstReceived.promise;
-  const [sent] = await records(r);
+  const [sent] = bookRecords(r);
   assert.equal(sent.day,'2031-02-07');
   assert.ok(sent.time >= midnight,JSON.stringify(sent));
   assert.equal(sent.state,'sent');
@@ -80,7 +80,7 @@ test('WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写�
   assert.equal((await value(results[winner])).placed,true);
   // 昨天被拒没有消耗令牌或名额；新一天仍有完整额度。
   assert.equal((await value(place(customers[early.i],drafts[early.i]))).placed,true);
-  assert.deepEqual((await records(r)).map(row=>[row.day,row.state]),
+  assert.deepEqual(bookRecords(r).map(row=>[row.day,row.state]),
     [['2031-02-07','success'],['2031-02-08','success']]);
   assert.equal(created.length,2);
   const audit = (await readFile(join(r.logDir,'write.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
@@ -107,13 +107,13 @@ test('WRT-11 等待实际发送名额超时，账本空且个人、全局占位�
   assert.equal(response.isError,true);
   assert.match(response.content[0].text,/排队的人多，这次下单请求没有发出/);
   assert.equal(r.requests.filter(x=>x.path===PATHS.create).length,0);
-  assert.equal((await records(r)).length,0);
+  assert.equal(bookRecords(r).length,0);
   const reused = await place(s,first);
   assert.match(reused.content[0].text,/令牌无效/);
   const second = await prepare(s);
   await sleep(interval+25);
   assert.equal((await value(place(s,second))).placed,true);
-  assert.equal((await records(r)).length,1);
+  assert.equal(bookRecords(r).length,1);
   assert.equal(r.requests.filter(x=>x.path===PATHS.create).length,1);
 });
 

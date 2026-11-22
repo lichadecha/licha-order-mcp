@@ -2,7 +2,7 @@ import {createHmac, randomInt} from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import {setTimeout as delay} from 'node:timers/promises';
-import {integerDigits, projectText} from './common.js';
+import {decimalId, integerDigits, projectText} from './common.js';
 import {consumeSendReceipt} from './ledger.js';
 
 export const PATHS = Object.freeze({
@@ -46,14 +46,16 @@ export function checkSignature() {
 }
 
 const orderReadPaths = new Set([PATHS.orderList, PATHS.orderDetail, PATHS.orderStatus]);
-const transactionPaths = new Set([...orderReadPaths, PATHS.member, PATHS.coupons, PATHS.create]);
+const catalogPaths = new Set([PATHS.stores, PATHS.storeStatus, PATHS.categories, PATHS.categoryItems, PATHS.search, PATHS.item]);
+const catalogIntegers = new Set(['salePrice', 'showPriceLow', 'price', 'attachGoodsPrice', 'type', 'status',
+  'categorySort', 'openStatus', 'isPractice', 'isAttach', 'clearStatus', 'inventory', 'isRequired']);
 const orderIntegerFields = new Set(['userId', 'total', 'status', 'actualAmount', 'discountAmount',
   'discountType', 'goodsId', 'num', 'storeId', 'orderAt', 'createTime']);
 
 export function parseResponse(raw, path) {
   const orderRead = orderReadPaths.has(path);
   return JSON.parse(raw, function (key, value, context) {
-    if (key === 'code' && this.status === false && transactionPaths.has(path)) {
+    if (key === 'code' && this.status === false) {
       const token = typeof value === 'number' ? context.source : value;
       if (typeof token === 'string' && /[.eE]/.test(token)) {
         const digits = integerDigits(token);
@@ -62,9 +64,14 @@ export function parseResponse(raw, path) {
       }
     }
     if (typeof value !== 'number') return value;
-    // 状态回执的订单号只接受字符串，数字不能经大整数转换变成合格单号。
-    if (path === PATHS.orderStatus && key === 'orderNo') return null;
+    // R23：大整数保留原文之前，先排除以 JSON 数字返回的订单号。
+    if ((orderRead || path === PATHS.create) && key === 'orderNo') return null;
     const token = context.source;
+    if (catalogPaths.has(path) && /[.eE]/.test(token)
+      && (key === 'id' || key.endsWith('Id') || catalogIntegers.has(key) || Array.isArray(this))) {
+      // 做法和加料的数值价格仍以数值透传；只有精确的小整数才能使用解析后的 Number。
+      return Number.isSafeInteger(value) && integerDigits(token) !== null ? value : token;
+    }
     // 大整数直接取原文。交易证据中的分数和指数也保留词法，让整数校验能识别舍入前的值。
     const integerField = (orderRead && orderIntegerFields.has(key))
       || (path === PATHS.coupons && (key === 'unUseStatus' || key === 'couponCenterType'))
@@ -76,12 +83,14 @@ export function parseResponse(raw, path) {
 const numericKeys = new Set(['userId', 'customerId', 'goodsId', 'skuId', 'id', 'valueId', 'frontCategoryId', 'storeId', 'shopId']);
 function encode(body) {
   return JSON.stringify(body, (key, value) => {
-    if (!numericKeys.has(key)) return value;
-    const digits = String(value);
-    if (!/^\d+$/.test(digits) || (typeof value === 'number' && !Number.isSafeInteger(value))) {
-      throw new Error('企迈请求中的标识无效');
+    if (key === 'goodsIds' && (!Array.isArray(value) || value.some(id => typeof id !== 'string' || !decimalId(id)))) {
+      throw new Error('企迈请求中的商品编号无效');
     }
-    return JSON.rawJSON(digits.replace(/^0+(?=\d)/, ''));
+    if (key === 'tradeMark' && (typeof value !== 'string' || !decimalId(value))) throw new Error('企迈请求中的商品编号无效');
+    if (!numericKeys.has(key)) return value;
+    const digits = decimalId(value);
+    if (!digits) throw new Error('企迈请求中的标识无效');
+    return JSON.rawJSON(digits);
   });
 }
 

@@ -1,244 +1,157 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { chmod, readFile, stat, writeFile } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { PATHS } from '../server/qmai.js';
-import { argsFor, basket, bind, bookFile, count, failure, memberA, number, ok, place, prepare, shop,
-  success, withBound } from '../test-support/commerce.js';
+import { argsFor, basket, bind, bookRecords, count, failure, memberA, number, ok, place, prepare,
+  shop, success, withBound } from '../test-support/commerce.js';
 
-function failCommittedWrite(state) {
-  const source = `import fs from 'node:fs';
+// 只在测试子进程的 SQLite API 上注入。在该连接内能观察到未提交的记录。
+// 提交前的失败由第二条连接持有读锁触发，实际 COMMIT 返回 SQLITE_BUSY。
+// 提交后的错误先执行真正的 COMMIT，然后模拟应用收到存储异常。
+function interruptCommit(state, phase, kill = false) {
+  const source = `import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import { syncBuiltinESMExports } from 'node:module';
-const directory = process.env.LICHA_DATA_DIR;
-const db = DatabaseSync.prototype, exec = db.exec;
-let readOnly = false;
-db.exec = function(sql) {
-  const result = exec.call(this, sql);
-  if (sql !== ${JSON.stringify(state === 'sent' ? 'COMMIT' : 'DELETE FROM pending_snapshot WHERE id=1')}) return result;
-  const rows = JSON.parse(fs.readFileSync(join(directory, 'orders.json'), 'utf8')).records;
-  if (!rows.some(row => row.state === ${JSON.stringify(state)})) return result;
-  if (this.prepare('SELECT 1 FROM pending_snapshot WHERE id=1').get()) throw Error('撤销记录没有删除');
-  fs.chmodSync(directory, 0o500);
-  exec.call(this, 'PRAGMA query_only=ON');
-  readOnly = true;
-  throw Error('模拟 SQLite 实际提交后回报 I/O 错误');
-};
-// chmod 对特权测试进程无效；目录不可增删条目，但现有文件本身仍可写。
-for (const method of ['openSync', 'renameSync', 'writeFileSync', 'unlinkSync']) {
-  const original = fs[method];
-  fs[method] = function(path, ...args) {
-    if (readOnly && process.getuid?.() === 0 && typeof path === 'string' && path.startsWith(directory + '/')
-      && (method !== 'openSync' || args[0] !== 'r')
-      && !(method === 'writeFileSync' && path === join(directory, 'orders.json') && args[1]?.flag === 'w')) {
-      throw Error('EACCES');
-    }
-    return original.call(fs, path, ...args);
-  };
-}
-syncBuiltinESMExports();`;
+const original = DatabaseSync.prototype.exec;
+DatabaseSync.prototype.exec = function(sql) {
+  if (sql !== 'COMMIT') return original.call(this, sql);
+  const row = this.prepare('SELECT record FROM records ORDER BY rowid DESC LIMIT 1').get();
+  if (!row || JSON.parse(row.record).state !== ${JSON.stringify(state)}) return original.call(this, sql);
+  if (${JSON.stringify(phase)} === 'after') original.call(this, sql);
+  if (${kill}) process.kill(process.pid, 'SIGKILL');
+  if (${JSON.stringify(phase)} === 'before') {
+    const reader = new DatabaseSync(join(process.env.LICHA_DATA_DIR, 'orders.sqlite'), {readOnly:true});
+    try {
+      reader.exec('BEGIN');
+      reader.prepare('SELECT COUNT(*) FROM records').get();
+      return original.call(this, sql);
+    } finally { reader.close(); }
+  }
+  throw Error('模拟事务已经提交，调用方却收到 I/O 错误');
+};`;
   return '--import=data:text/javascript;base64,' + Buffer.from(source).toString('base64');
 }
 
-async function checkReadOnlyAfterCommit(t, state) {
-  const { r, s, m } = await withBound(t, {
-    NODE_OPTIONS: failCommittedWrite(state), LICHA_ORDER_MATCH_WINDOW_MS: '30000'
-  });
-  const writes = state === 'sent' ? 0 : 1;
-  try {
-    if (state === 'failed') m.override.set(PATHS.create, () => ({ status:false, code:30005 }));
-    if (state === 'found') m.override.set(PATHS.create, () => ok({}));
-    const draft = await prepare(s);
-    if (state === 'success') {
-      assert.equal((await place(s, draft)).orderNo, number(1));
-    } else if (state === 'found') {
-      await failure(s, 'place_order', argsFor(draft), /结果未知/);
-      const orderAt = r.requests.find(req => req.path === PATHS.create).at;
-      m.orders = [{ userId:memberA, orderNo:number(2), orderAt, storeId:shop, status:10 }];
-      const result = await success(s, 'my_orders');
-      assert.equal(result.unresolvedPendingWrites, 1);
-      assert.equal(result.resolvedPendingWrites, undefined);
-      assert.match(result.pendingWriteNote, /没能保存/);
-    } else {
-      await failure(s, 'place_order', argsFor(draft), state === 'sent' ? /没有发出/ : /这一单没有创建/);
-    }
-    assert.equal((await stat(r.dataDir)).mode & 0o777, 0o500);
-    const rows = JSON.parse(await readFile(bookFile(r), 'utf8')).records;
-    if (state === 'sent') assert.deepEqual(rows, []);
-    else assert.equal(rows[0].state, state);
-    assert.equal(count(r, PATHS.create), writes);
-    await failure(s, 'prepare_order', basket, /账本不可用/);
-  } finally {
-    await r.stop('SIGKILL');
-    await chmod(r.dataDir, 0o700);
-  }
-  delete r.env.NODE_OPTIONS;
-  await r.start();
-  const resumed = await r.session(s.device);
-  await bind(resumed);
-  if (state === 'sent') await prepare(resumed);
-  else await failure(resumed, 'prepare_order', basket, /账本不可用/);
-  assert.equal(count(r, PATHS.create), writes);
-}
-
-for (const [state, point] of [['sent', '发送前记录'], ['success', '成功终态'], ['failed', '明确失败终态'], ['found', '未决认领']]) {
-  const recovery = state === 'sent' ? '恢复空额' : '保持故障态';
-  test('LED-03 ' + point + '实际提交后报错、目录持续只读，重启' + recovery, t => checkReadOnlyAfterCommit(t, state));
-}
-
-test('LED-03 确认成功后清除标记已生效才报错，回执、重启后的成功记录一致', async t => {
-  const source = `import fs from 'node:fs';
-import { join } from 'node:path';
-import { syncBuiltinESMExports } from 'node:module';
-const remove = fs.unlinkSync, directory = process.env.LICHA_DATA_DIR;
-fs.unlinkSync = path => {
-  remove(path);
-  if (path === join(directory, '.orders-need-review')
-    && JSON.parse(fs.readFileSync(join(directory, 'orders.json'), 'utf8')).records[0]?.state === 'success') {
-    throw Error('模拟标记已移除后清理报错');
-  }
-};
-syncBuiltinESMExports();`;
-  const { r, s } = await withBound(t, {
-    NODE_OPTIONS: '--import=data:text/javascript;base64,' + Buffer.from(source).toString('base64'),
-    LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY: '1'
-  });
-  const receipt = await place(s, await prepare(s));
-  assert.equal(receipt.orderNo, number(1));
-  await failure(s, 'prepare_order', basket, /账本不可用/);
+async function restartAndBind(r, s) {
   delete r.env.NODE_OPTIONS;
   await r.restart();
   const resumed = await r.session(s.device);
   await bind(resumed);
-  const draft = await prepare(resumed);
-  assert.equal(draft.recentOrder.orderNo, receipt.orderNo);
-  await failure(resumed, 'place_order', argsFor(draft), /每位会员每天最多 1 单/);
-  assert.equal(count(r, PATHS.create), 1);
-});
-
-test('LED-02 R23 旧快照校验和正确、记录订单号无效时仍禁止再次下单', async t => {
-  const { r, s } = await withBound(t);
-  await place(s, await prepare(s));
-  await r.stop();
-  const path = bookFile(r);
-  const snapshot = JSON.parse(await readFile(path, 'utf8'));
-  const [{ completedAt, ...original }] = snapshot.records;
-  for (const state of ['success', 'found', 'unknown']) {
-    snapshot.records = [{ ...original, state, orderNo:'N/A',
-      ...(state === 'success' && { completedAt }), ...(state === 'found' && { resolvedAt: completedAt }) }];
-    snapshot.checksum = createHash('sha256').update(JSON.stringify(snapshot.records)).digest('hex');
-    await writeFile(path, JSON.stringify(snapshot) + '\n');
-    await r.start();
-    const resumed = await r.session(s.device);
-    await bind(resumed);
-    await failure(resumed, 'prepare_order', basket, /账本不可用/);
-    assert.equal(count(r, PATHS.create), 1);
-    await r.stop();
-  }
-});
-
-const inject = source => '--import=data:text/javascript;base64,' + Buffer.from(source).toString('base64');
-function list(r) {
-  const cli = fileURLToPath(new URL('../server/ledger-cli.js', import.meta.url));
-  return spawnSync(process.execPath, [cli, 'list'], {cwd:r.cwd, env:r.env, encoding:'utf8'});
+  return resumed;
 }
 
-for (const error of ['EACCES', 'EIO']) {
-  test('WRT-06/11 LED-03 发送前清理标记报 ' + error + '，零次创建，重启恢复空额', async t => {
-    const source = `import fs from 'node:fs';
-import { join } from 'node:path';
-import { syncBuiltinESMExports } from 'node:module';
-const unlink = fs.unlinkSync, directory = process.env.LICHA_DATA_DIR;
-fs.unlinkSync = path => {
-  if (path === join(directory, '.orders-need-review')
-    && JSON.parse(fs.readFileSync(join(directory, 'orders.json'), 'utf8')).records[0]?.state === 'sent') {
-    if (${JSON.stringify(error)} === 'EIO') unlink(path);
-    fs.chmodSync(directory, 0o500);
-    throw Object.assign(Error('模拟标记清理失败'), {code:${JSON.stringify(error)}});
-  }
-  return unlink(path);
-};
-syncBuiltinESMExports();`;
-    const { r, s } = await withBound(t, {NODE_OPTIONS:inject(source), LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1'});
-    const prior = await readFile(bookFile(r), 'utf8');
-    try {
-      await failure(s, 'place_order', argsFor(await prepare(s)), /账本写入失败，本次下单请求没有发出/);
-      assert.equal(count(r, PATHS.create), 0);
-      await failure(s, 'prepare_order', basket, /账本不可用/);
-    } finally {
-      await r.stop('SIGKILL');
-      await chmod(r.dataDir, 0o700);
+for (const phase of ['before', 'after']) {
+  const point = phase === 'before' ? '实际提交被拒' : '实际已提交却报错';
+
+  test('LED-03① 发送前记录' + point + '，零次创建，重启按已提交记录核对', async t => {
+    const {r, s} = await withBound(t, {NODE_OPTIONS:interruptCommit('sent', phase), LICHA_ORDER_MATCH_WINDOW_MS:'50'});
+    const other = await r.session();
+    await bind(other, 'FAKE_CARD_B', 'card');
+    const spare = await prepare(other);
+    const draft = await prepare(s);
+    await failure(s, 'place_order', argsFor(draft), /本次下单请求没有发出/);
+    await failure(other, 'place_order', argsFor(spare), /账本不可用/);
+    await failure(s, 'prepare_order', basket, /账本不可用/);
+    assert.equal(count(r, PATHS.create), 0);
+
+    const resumed = await restartAndBind(r, s);
+    await failure(resumed, 'place_order', argsFor(draft), /令牌无效/);
+    const records = bookRecords(r);
+    if (phase === 'before') {
+      assert.deepEqual(records, []);
+    } else {
+      assert.deepEqual(records.map(row => row.state), ['sent']);
+      await failure(resumed, 'place_order', argsFor(await prepare(resumed)), /状态未知/);
+      await delay(55);
+      const list = await success(resumed, 'my_orders');
+      assert.equal(list.resolvedPendingWrites, 1);
+      assert.match(list.pendingWriteNote, /没有建单/);
+      assert.deepEqual(bookRecords(r).map(row => row.state), ['absent']);
     }
-    delete r.env.NODE_OPTIONS;
-    await r.start();
-    const resumed = await r.session(s.device);
-    await bind(resumed);
-    assert.equal(await readFile(bookFile(r), 'utf8'), prior);
+    assert.equal(count(r, PATHS.create), 0);
     assert.equal((await place(resumed, await prepare(resumed))).placed, true);
     assert.equal(count(r, PATHS.create), 1);
   });
+
+  for (const state of ['success', 'failed', 'unknown']) {
+    test('LED-03② ' + state + ' 终态' + point + '，如实返回上游结果且只发送一次', async t => {
+      const {r, s, m} = await withBound(t, {NODE_OPTIONS:interruptCommit(state, phase),
+        LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1'});
+      if (state === 'failed') m.override.set(PATHS.create, () => ({status:false, code:30005}));
+      if (state === 'unknown') m.override.set(PATHS.create, () => ok({}));
+      const draft = await prepare(s);
+      if (state === 'success') assert.equal((await place(s, draft)).orderNo, number(1));
+      else await failure(s, 'place_order', argsFor(draft), state === 'failed' ? /这一单没有创建/ : /结果未知/);
+      await failure(s, 'prepare_order', basket, /账本不可用/);
+      const resumed = await restartAndBind(r, s);
+      await failure(resumed, 'place_order', argsFor(draft), /令牌无效/);
+      const expected = phase === 'before' ? 'sent' : state;
+      assert.deepEqual(bookRecords(r).map(row => row.state), [expected]);
+      const next = await prepare(resumed);
+      if (expected === 'success') {
+        assert.equal(next.recentOrder.orderNo, number(1));
+        await failure(resumed, 'place_order', argsFor(next), /每位会员每天最多 1 单/);
+      } else if (expected !== 'failed') {
+        await failure(resumed, 'place_order', argsFor(next), /状态未知/);
+      }
+      assert.equal(count(r, PATHS.create), 1);
+      if (expected === 'failed') {
+        m.override.delete(PATHS.create);
+        assert.equal((await place(resumed, next)).placed, true);
+        assert.equal(count(r, PATHS.create), 2);
+      }
+    });
+  }
+
+  for (const state of ['found', 'absent']) {
+    test('LED-03③ ' + state + ' 核对结论' + point + '，当场不报解除，重启读已提交结论', async t => {
+      const {r, s, m} = await withBound(t, {NODE_OPTIONS:interruptCommit(state, phase),
+        LICHA_ORDER_MATCH_WINDOW_MS: state === 'found' ? '30000' : '50'});
+      m.override.set(PATHS.create, () => ok({}));
+      await failure(s, 'place_order', argsFor(await prepare(s)), /结果未知/);
+      if (state === 'found') {
+        const {at} = r.requests.find(req => req.path === PATHS.create);
+        m.orders = [{userId:memberA, orderNo:number(2), orderAt:at, storeId:shop, status:10}];
+      } else {
+        await delay(55);
+      }
+      const result = await success(s, 'my_orders');
+      if (state === 'found') assert.equal(result.orders[0].orderNo, number(2));
+      assert.equal(result.unresolvedPendingWrites, 1);
+      assert.equal(result.resolvedPendingWrites, undefined);
+      assert.match(result.pendingWriteNote, /闸门还关着.*稍后再查/);
+      assert.doesNotMatch(result.pendingWriteNote, /没有建单|可以重新走 prepare_order/);
+      await failure(s, 'prepare_order', basket, /账本不可用/);
+      const resumed = await restartAndBind(r, s);
+      assert.deepEqual(bookRecords(r).map(row => row.state), [phase === 'before' ? 'unknown' : state]);
+      const checked = await success(resumed, 'my_orders');
+      assert.equal(checked.resolvedPendingWrites, phase === 'before' ? 1 : undefined);
+      assert.equal(checked.unresolvedPendingWrites, undefined);
+      assert.deepEqual(bookRecords(r).map(row => row.state), [state]);
+      assert.equal(count(r, PATHS.create), 1);
+    });
+  }
 }
 
-test('LED-01/04 UNR-01 强杀在成功终态标记同步后，CLI 恢复 sent，其他会员可下单', async t => {
-  const source = `import fs from 'node:fs';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-const exec = DatabaseSync.prototype.exec, directory = process.env.LICHA_DATA_DIR;
-DatabaseSync.prototype.exec = function(sql) {
-  if (sql === 'DELETE FROM pending_snapshot WHERE id=1'
-    && JSON.parse(fs.readFileSync(join(directory, 'orders.json'), 'utf8')).records[0]?.state === 'success') {
-    process.kill(process.pid, 'SIGKILL');
-  }
-  return exec.call(this, sql);
-};`;
-  const { r, s } = await withBound(t, {NODE_OPTIONS:inject(source)});
-  const draft = await prepare(s);
-  await assert.rejects(() => place(s, draft));
-  await r.stop();
-  delete r.env.NODE_OPTIONS;
-  assert.equal(count(r, PATHS.create), 1);
-  const marker = join(r.dataDir, '.orders-need-review');
-  const prior = await readFile(marker, 'utf8');
-  assert.equal(JSON.parse(prior).records[0].state, 'sent');
-  const listed = list(r);
-  assert.equal(listed.status, 0, listed.stderr);
-  assert.equal(JSON.parse(listed.stdout)[0].key, JSON.parse(prior).records[0].key);
-  assert.equal(await readFile(bookFile(r), 'utf8'), prior);
-  await assert.rejects(stat(marker), {code:'ENOENT'});
-  await r.start();
-  const resumed = await r.session(s.device);
-  await bind(resumed);
-  await failure(resumed, 'place_order', argsFor(await prepare(resumed)), /状态未知/);
-  const other = await r.session();
-  await bind(other, 'FAKE_CARD_B', 'card');
-  assert.equal((await place(other, await prepare(other))).placed, true);
-  assert.equal(count(r, PATHS.create), 2);
-});
-
-test('LED-01 WRT-07/09 无摘要版本的旧会员额度与未决账本须核清后切换', async t => {
-  const { r, s, m } = await withBound(t, {LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1'});
-  m.override.set(PATHS.create, () => ok({}));
-  await failure(s, 'place_order', argsFor(await prepare(s)), /结果未知/);
-  await r.stop();
-  const path = bookFile(r);
-  const snapshot = JSON.parse(await readFile(path, 'utf8'));
-  delete snapshot.memberHashVersion;
-  snapshot.records[0].memberHash = createHash('sha256').update('0' + memberA).digest('hex');
-  snapshot.checksum = createHash('sha256').update(JSON.stringify(snapshot.records)).digest('hex');
-  const legacy = JSON.stringify(snapshot) + '\n';
-  await writeFile(path, legacy);
-  const listed = list(r);
-  assert.notEqual(listed.status, 0);
-  assert.match(listed.stderr, /停.*旧.*核清.*空账本/);
-  assert.equal(await readFile(path, 'utf8'), legacy);
-  await r.start();
-  const resumed = await r.session(s.device);
-  await bind(resumed);
-  await failure(resumed, 'prepare_order', basket, /账本不可用/);
-  assert.match(r.stderr, /停.*旧.*核清.*空账本/);
-  assert.equal(count(r, PATHS.create), 1);
-});
+for (const [state, phase, point] of [
+  ['sent', 'after', '发送记录已提交、创建尚未发出'],
+  ['success', 'before', '上游已建单、成功终态正在提交']
+]) {
+  test('LED-03/04 SIGKILL 在' + point + '，重启后只拦原会员', async t => {
+    const {r, s} = await withBound(t, {NODE_OPTIONS:interruptCommit(state, phase, true)});
+    const draft = await prepare(s);
+    const child = r.child;
+    await assert.rejects(s.call('place_order', argsFor(draft)));
+    await r.stop();
+    assert.equal(child.signalCode, 'SIGKILL');
+    const created = state === 'sent' ? 0 : 1;
+    assert.equal(count(r, PATHS.create), created);
+    const resumed = await restartAndBind(r, s);
+    assert.deepEqual(bookRecords(r).map(row => row.state), ['sent']);
+    await failure(resumed, 'place_order', argsFor(draft), /令牌无效/);
+    await failure(resumed, 'place_order', argsFor(await prepare(resumed)), /状态未知/);
+    const other = await r.session();
+    await bind(other, 'FAKE_CARD_B', 'card');
+    assert.equal((await place(other, await prepare(other))).placed, true);
+    assert.equal(count(r, PATHS.create), created + 1);
+  });
+}

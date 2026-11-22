@@ -1,8 +1,34 @@
-# 李茶的茶点单 MCP v1.3 交付清单
+# 李茶的茶点单 MCP v1.4 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.3 第五轮修复
+## v1.4 数据可靠性改进
+
+本次基于 `f01df9c` 的服务实现，保留其后的两笔顾客说明书提交。负责人反馈，第五轮独立黑盒验收共 189 项，其中 182 项通过、0 项失败。以下验证针对 v1.4，均使用假凭证和本机模拟企迈。
+
+**账本与切换。** `orders.sqlite` 保存请求记录、终态、未决核对结论与人工裁决说明。已占额度、待核对请求和已认领的单号从记录恢复。每笔事务以 `synchronous=FULL` 提交后才对当前进程生效，发送凭据只在发送前记录明确提交后签发一次。服务与 CLI 使用同一把目录排他锁，重启读取 SQLite 已提交状态。格式号为 2，存入 `PRAGMA user_version`。首次发布完整空库后才接受业务写入。日常恢复由 SQLite 自己的事务日志完成。
+
+`a42cb6b`、`b16d3c3`、`f01df9c` 等旧版账本和未知格式会触发 LED-02，保留现场并停用下单。按 §8 第 8 项停旧版下单，使用原版本的工具核清未决和当日额度，保留旧目录，将新版切到新的空目录。若当天新旧额度合计可能超限，可在下一个北京时间自然日启用。运维仍使用 `list`、`resolve … found …`、`resolve … absent …`。[运行及切换说明](README.md#账本故障与人工核对)
+
+另以本仓库中的三个历史提交各自写入一笔未决。三版原 CLI 均列出一笔，新版 CLI 对原目录均以退出码 1 拒绝接管，并给出 §8 第 8 项的切换提示。
+
+**LED-03 允许的保守偏差。** 任意写入报错都会关闭本进程后续下单。即使提交已生效才报错，当场答复也遵守下表。
+
+| 报错位置 | 当场答复与发送结果 | 重启读取到的状态 |
+| --- | --- | --- |
+| 发送前记录 | 创建请求发出 0 次，明确告知「本次下单请求没有发出」。 | 无此笔记录，或该会员多一笔占额的未决。匹配窗过去且订单列表足以证实无单时，`my_orders` 解除未决。 |
+| 发出后写终态 | 如实返回已收到的企迈结果，成功时给出单号，回执不明时提示先别重下。 | 至少有发送前记录。可以是未决，或已提交的终态。 |
+| 核对结论 | 可告知查到的订单，说明闸门仍关着、稍后再查。 | 仍为未决，或已有证据支持的结论已提交并解除。 |
+
+进程强杀后按同样的提交边界恢复，其他会员可照常下单。已发出的创建始终有记录，同一确认单至多发出一次。仅凭超时、无效单号或不完整的订单列表不能判无单。
+
+**整数、单号与显示。** R25 按原始十进制值解析整数，目录编号和整数分与交易回执使用同一判据。有效 `long` 编号的范围为 1 至 9223372036854775807。售价带不足一分的尾数时，详情显示「价格待询」，该规格不能下单。R23 在保留大整数原文前区分 JSON 类型，创建、详情、列表和状态均只接受合格的字符串单号。金额按整数分的十进制数字拼两位小数（含负差额）。会员 ID 的纯数字字符串按原样取尾，含小数点或指数的等值写法按规范整数取尾；长度不足八位只显示 `***`。
+
+取值范围按编号的十进制数值判断，纯数字字符串的前导零不计入有效位数。目录中原本允许省略的做法和加料加价继续按 0 处理，明确给出的负数或不足一分的加价会阻止选购该项。非零加价沿用 R18 的单位约定，尚未经真实企迈确认。[目录数据回归](test/catalog-integers.test.js)
+
+**本轮验收。** Linux、Node 22.23.1，最终代码在本机回环运行 `npm test`，128 项通过，失败、跳过、取消均为 0。v1.4 新写 30 项用例，其中账本 19 项、目录 6 项、会员范围与尾号 2 项、订单号 2 项、金额显示 1 项。账本的 19 项覆盖并替换旧存储专项 18 项；逐文件损坏测试从两个文件子项变为一个。全套比上轮 117 项净增 11 项。已验证两个进程并发启动时只有一个取得目录锁、上游收到创建后强杀和发送前提交后强杀两处恢复边界，以及实际写连接的同步级别。整机掉电未实测。[事务与强杀](test/ledger-recovery.test.js) · [格式与同步级别](test/ledger-evidence.test.js) · [并发启动与运维](test/commerce.test.js)
+
+## v1.3 第五轮修复（历史记录）
 
 基线为 `b16d3c3`。据负责人反馈，第四轮的 13 条原反例均经独立复验通过，黑盒验收 175 个场景、0 失败。以下为 v1.3 改动及本地回归结果。
 
@@ -101,16 +127,16 @@
 | LED-03、LED-06 | 已用进程强杀、同步错误注入与磁盘文件损坏验证恢复。物理断电、损坏的存储硬件以及网络文件系统锁语义未验证。部署目标为本机持久化文件系统。 |
 | BND-10、PRE-06、PRE-07、WRT-17/19 | 未连接真实企迈、未创建或付款。真实身份持有证明、非零加价的价格单位、默认或指定用券及全额抵扣后状态仍待真实环境核实（P1、P2）。 |
 | SES-04、WRT-09、§8 | 实际开放时的绑定时长和额度仍待确认（P3、P4）。生产部署、旧版停单及人工清算未执行。 |
-| 独立验收 | 第四轮黑盒结果由负责人提供。v1.3 本轮改动尚未经独立黑盒复验。本地只使用假钥匙与回环 HTTP。 |
-| 品牌 Skill 话术 | 根目录 `SKILL.md` 的首次绑定话术仍指向 `customerIdLast4`。按规格的交付分工，此话术由规格负责人另行修订为 `member.last4`。本轮验证到 MCP 工具出参，未验证实际 AI 客户端的口播。 |
+| 独立验收 | 第五轮黑盒结果由负责人提供。v1.4 尚未经新一轮独立黑盒复验。本地只使用假钥匙与回环 HTTP。 |
+| 品牌 Skill 话术 | 根目录 `SKILL.md` 已使用 `member.last4`。本轮验证到 MCP 工具出参，未验证实际 AI 客户端的口播。 |
 
 ## 规格缺口与实现取舍
 
 | 对应范围 | 取舍与依据 |
 | --- | --- |
 | BRW-08、OUT-02 | 做法值与加料都按上游原名逐字选中。另一个原名若仅在首尾空白或连续空白的数量、形式上有差别，就报歧义。空白归一化只用于发现冲突。 |
-| UNR-03、UNR-04 | 新版保存商品编号、名称摘要与数量，同一商品分多行时合计比较。早期快照缺少商品证据、列表行却带明细时保持未决。缺少证据不靠实付金额或订单状态补猜。判无单要求完整覆盖的窗口内没有任何订单。 |
-| PRE-11、R23 | 已核实有单的提醒按原发送时刻计时。恢复早期快照遇到成功或已认领记录的订单号不合格时，整本故障，保全快照等待人工核对。 |
+| UNR-03、UNR-04 | 新版保存商品编号、名称摘要与数量，同一商品分多行时合计比较。缺少证据不靠实付金额或订单状态补猜。判无单要求完整覆盖的窗口内没有任何订单。 |
+| PRE-11、R23 | 已核实有单的提醒按原发送时刻计时。启动读取成功或已认领记录时，订单号不合格会导致账本故障，保留数据库供人工核对。 |
 | WRT-17、WRT-19 | 工具契约给“用了与预测不同的券”的固定末句仍含付款提示。实付为零时只保留更正说明，下一步按 WRT-19 核对订单状态；非零时沿用契约文案。已知非券类型采用企迈契约中列举的编码。 |
 | PRE-06、PRE-10、UPS-01 | 按 R18 以分计算加价，创建请求保留企迈的价格原值。同名同一项加料的多份合并为数量。就餐方式按样本和固定取餐文案使用堂食。 |
 | BRW-04、BRW-06 | 分类商品使用分类缓存时长，搜索截断按上游原始条数判断。图片标签枚举不全，按样本过滤图片类型并保留文字。 |
@@ -165,7 +191,7 @@
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
 | BND-01 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-02 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19)<br>[BND-02 R24 会员查询支持标量编号，未知形态报告查询失败并保留原绑定](test/commerce.test.js#L743) |
+| BND-02 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19)<br>[BND-02 R24 会员查询支持标量编号，未知形态报告查询失败并保留原绑定](test/commerce.test.js#L749) |
 | BND-03 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | BND-04 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | BND-05 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
@@ -180,7 +206,7 @@
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
 | PRE-01 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| PRE-02 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L370) |
+| PRE-02 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377) |
 | PRE-03 | [server/browse.js](server/browse.js) · quote、#item | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164)<br>[BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读缓存](test/browse.test.js#L318) |
 | PRE-04 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164) |
 | PRE-05 | [server/price.js](server/price.js) · priceLine | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164) |
@@ -189,7 +215,7 @@
 | PRE-08 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19)<br>[设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | PRE-09 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | PRE-10 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| PRE-11 | [server/commerce.js](server/commerce.js) · prepare | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[PRE-11 自动认领与停服人工裁决均按发出时刻提醒再下单](test/commerce.test.js#L645) |
+| PRE-11 | [server/commerce.js](server/commerce.js) · prepare | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[PRE-11 自动认领与停服人工裁决均按发出时刻提醒再下单](test/commerce.test.js#L651) |
 
 ### 下单
 
@@ -200,33 +226,33 @@
 | WRT-03 | [server/commerce.js](server/commerce.js) · place | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | WRT-04 | [server/commerce.js](server/commerce.js) · place | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | WRT-05 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135) |
-| WRT-06 | [server/commerce.js](server/commerce.js) · place | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L370) |
+| WRT-06 | [server/commerce.js](server/commerce.js) · place | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377) |
 | WRT-07 | [server/commerce.js](server/commerce.js) · place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 | WRT-08 | [server/commerce.js](server/commerce.js) · place | [零元预估不占位 WRT-08](test/commerce.test.js#L360) |
 | WRT-09 | [server/commerce.js](server/commerce.js) · place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39) |
-| WRT-10 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[WRT-10 持久防重记录命中时归还占位，不再请求创建](test/commerce.test.js#L577) |
-| WRT-11 | [server/commerce.js](server/commerce.js) · place · [recordSending](server/ledger.js) · [Qmai.write](server/qmai.js) | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L370)<br>[WRT-11 等待实际发送名额超时，账本空且个人、全局占位都释放](test/quota-time.test.js#L99)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12) |
+| WRT-10 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[WRT-10 持久防重记录命中时归还占位，不再请求创建](test/commerce.test.js#L583) |
+| WRT-11 | [server/commerce.js](server/commerce.js) · place · [recordSending](server/ledger.js) · [Qmai.write](server/qmai.js) | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377)<br>[WRT-11 等待实际发送名额超时，账本空且个人、全局占位都释放](test/quota-time.test.js#L99)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12) |
 | WRT-12 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201) |
 | WRT-13 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135) |
-| WRT-14 | [server/commerce.js](server/commerce.js) · place · [orderNumber](server/commerce-view.js) | [资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[WRT-14 QRY-04 R23 占位文字不算订单号；列表逐行校验 12 至 40 位英数](test/commerce.test.js#L674) |
+| WRT-14 | [server/commerce.js](server/commerce.js) · place · [orderNumber](server/commerce-view.js) | [资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[WRT-14 QRY-04 R23 占位文字不算订单号；列表逐行校验 12 至 40 位英数](test/commerce.test.js#L680) |
 | WRT-15 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229) |
 | WRT-16 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229) |
-| WRT-17 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229)<br>[WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额](test/commerce.test.js#L712) |
+| WRT-17 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229)<br>[WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额](test/commerce.test.js#L718) |
 | WRT-18 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229) |
-| WRT-19 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229)<br>[WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额](test/commerce.test.js#L712) |
+| WRT-19 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229)<br>[WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额](test/commerce.test.js#L718) |
 
 ### 账本
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
-| LED-01 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L402)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441) |
-| LED-02 | [server/ledger.js](server/ledger.js) · Ledger 核对文件与恢复快照 | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L370)<br>[LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单](test/commerce.test.js#L833)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L894) |
-| LED-03 | [server/ledger.js](server/ledger.js) · Ledger、#save、#confirmSnapshot、#restoreOnUncertainCommit · [place、orders](server/commerce.js) | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L370)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L402)<br>[LED-03 发送前记录已替换后确认失败，重启恢复空额](test/commerce.test.js#L828)<br>[LED-03 成功终态已替换后确认失败，重启保留发送前记录](test/commerce.test.js#L829)<br>[LED-03 明确失败终态已替换后确认失败，重启仍保留占额](test/commerce.test.js#L830)<br>[LED-03 未决认领已替换后确认失败，重启保留未决](test/commerce.test.js#L831)<br>[LED-03 撤销记录已删除才报错，重启从重建的撤销记录恢复](test/commerce.test.js#L981)<br>[LED-03 提交后数据库持续报错，重启保留直接恢复的旧文件](test/commerce.test.js#L982)<br>[LED-03 提交报错且两个恢复出口都失败，重启保留现场并拒绝下单](test/commerce.test.js#L983) |
-| LED-04 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441) |
-| LED-05 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441) |
-| LED-06 | [server/ledger.js](server/ledger.js) · Ledger 取得与释放目录锁 | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441)<br>[全新目录双实例并发抢锁、别名与死亡接管 LED-06](test/commerce.test.js#L512)<br>[LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单](test/commerce.test.js#L833)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L894)<br>[LED-06 账本目录不可写时启动失败，恢复写权限后可接管](test/commerce.test.js#L908) |
-| LED-07 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L402)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441)<br>[WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39) |
-| LED-08 | [server/ledger-cli.js](server/ledger-cli.js) · run | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441)<br>[LED-08 运维按固定字段列未决，R23 不合格单号及未知请求退出非零且账本不变](test/commerce.test.js#L867) |
+| LED-01 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448) |
+| LED-02 | [server/ledger.js](server/ledger.js) · Ledger 校验库格式、记录摘要与内容 | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377)<br>[LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单](test/commerce.test.js#L767)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L828) |
+| LED-03 | [SQLite 事务与发送凭据](server/ledger.js) · [下单和核对答复](server/commerce.js) | [实际 COMMIT 被拒、已提交却报错、两处强杀](test/ledger-recovery.test.js) · [初建强杀、版本与记录校验](test/ledger-evidence.test.js) |
+| LED-04 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448) |
+| LED-05 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448) |
+| LED-06 | [server/ledger.js](server/ledger.js) · Ledger 取得与释放目录锁 | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[全新目录双实例并发抢锁、别名与死亡接管 LED-06](test/commerce.test.js#L518)<br>[LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单](test/commerce.test.js#L767)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L828)<br>[LED-06 账本目录不可写时启动失败，恢复写权限后可接管](test/commerce.test.js#L842) |
+| LED-07 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39) |
+| LED-08 | [server/ledger-cli.js](server/ledger-cli.js) · run | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[LED-08 运维按固定字段列未决，R23 不合格单号及未知请求退出非零且账本不变](test/commerce.test.js#L801) |
 
 ### 未决核对
 
@@ -234,11 +260,11 @@
 | --- | --- | --- |
 | UNR-01 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 | UNR-02 | [server/commerce.js](server/commerce.js) · unresolved、orders | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268)<br>[未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
-| UNR-03 | [server/commerce.js](server/commerce.js) · orders · [rowTime、listedProducts、sameProducts](server/commerce-view.js) | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L530)<br>[UNR-03 商品名称、编号和杯数随发送记录恢复，畸形时间不能用于正负核对](test/commerce.test.js#L602) |
-| UNR-04 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L402) |
-| UNR-05 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L402)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L530)<br>[迟到的订单列表只核对查询开始时的未决 UNR-05](test/commerce.test.js#L558) |
-| UNR-06 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L441)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L530) |
-| UNR-07 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L402)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L530) |
+| UNR-03 | [server/commerce.js](server/commerce.js) · orders · [rowTime、listedProducts、sameProducts](server/commerce-view.js) | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536)<br>[UNR-03 商品名称、编号和杯数随发送记录恢复，畸形时间不能用于正负核对](test/commerce.test.js#L608) |
+| UNR-04 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409) |
+| UNR-05 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536)<br>[迟到的订单列表只核对查询开始时的未决 UNR-05](test/commerce.test.js#L564) |
+| UNR-06 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536) |
+| UNR-07 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536) |
 | UNR-08 | [server/commerce.js](server/commerce.js) · unresolved、orders | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268)<br>[未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 
 ### 查单
@@ -248,7 +274,7 @@
 | QRY-01 | [server/commerce.js](server/commerce.js) · requireBinding、status、orders | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | QRY-02 | [server/commerce.js](server/commerce.js) · requireBinding、status、orders | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268) |
 | QRY-03 | [server/commerce-view.js](server/commerce-view.js) · statusView | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268) |
-| QRY-04 | [server/commerce.js](server/commerce.js) · orders · [orderNumber、orderView](server/commerce-view.js) · [decimalId](server/common.js) | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268)<br>[WRT-14 QRY-04 R23 占位文字不算订单号；列表逐行校验 12 至 40 位英数](test/commerce.test.js#L674)<br>[QRY-04 R24 归属缺失与形态异常分别处理、商品名称按主备字段投影](test/commerce.test.js#L694) |
+| QRY-04 | [server/commerce.js](server/commerce.js) · orders · [orderNumber、orderView](server/commerce-view.js) · [decimalId](server/common.js) | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268)<br>[WRT-14 QRY-04 R23 占位文字不算订单号；列表逐行校验 12 至 40 位英数](test/commerce.test.js#L680)<br>[QRY-04 R24 归属缺失与形态异常分别处理、商品名称按主备字段投影](test/commerce.test.js#L700) |
 | QRY-05 | [server/commerce.js](server/commerce.js) · requireBinding、status、orders | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268) |
 
 ### 审计
@@ -257,7 +283,7 @@
 | --- | --- | --- |
 | LOG-01 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |
 | LOG-02 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |
-| LOG-03 | [server/logs.js](server/logs.js) · createLogs、issueConfirmation、currentQuotaDay · [企迈回执](server/qmai.js) · [已确认快照](server/ledger.js) | [WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39)<br>[LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142)<br>[LOG-03 写审计默认掩码，伪造的令牌、订单回执和账本对象不能取得全值](test/session.test.js#L297) |
+| LOG-03 | [server/logs.js](server/logs.js) · createLogs、issueConfirmation、currentQuotaDay · [企迈回执](server/qmai.js) · [已提交账本记录](server/ledger.js) | [WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39)<br>[LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142)<br>[LOG-03 写审计默认掩码，伪造的令牌、订单回执和账本对象不能取得全值](test/session.test.js#L297) |
 | LOG-04 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |
 | LOG-05 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-05 三本日志介质故障不改变业务结果](test/session.test.js#L180) |
 | LOG-06 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |

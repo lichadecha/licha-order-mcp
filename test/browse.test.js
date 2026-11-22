@@ -5,8 +5,8 @@ import {rig} from '../test-support/rig.js';
 import {PATHS, Qmai, parseResponse, sign} from '../server/qmai.js';
 
 const good = data => ({status:true, code:0, data});
-const digits = '9990000000000000123';
-const skuId = '9991000000000000321';
+const digits = '8990000000000000123';
+const skuId = '8991000000000000321';
 const kind = key => key.replace(/^\//,'');
 const product = (overrides = {}) => ({
   goodsId:digits, name:'测试奶茶', type:1, goodsSkuList:[{skuId, salePrice:2400, skuItemList:[{specValue:'1杯'}]}],
@@ -163,7 +163,7 @@ test('BRW-08 逐行算价、同名做法及缺价规格', async t => {
 
 test('BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照', async t => {
   let reads = 0, row = product();
-  const member = '9999999999999909001', orderNo = 'D00000000000000000901';
+  const member = '8999999999999909001', orderNo = 'D00000000000000000901';
   const r = await rig(t,{upstream(path,params,{res}) {
     switch (kind(path)) {
       case PATHS.member: return good({customerId:member});
@@ -322,7 +322,7 @@ test('BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读
   const preload = "const fixed=Date.now(); Date.now=()=>fixed;";
   const hook = 'data:text/javascript;base64,'+Buffer.from(preload).toString('base64');
   const r = await rig(t,{env:{NODE_OPTIONS:'--import='+hook,LICHA_READ_TIMEOUT_MS:'5000'},async upstream(path) {
-    if (path === PATHS.member) return good({customerId:'9900000000000000001'});
+    if (path === PATHS.member) return good({customerId:'8900000000000000001'});
     if (path === PATHS.stores) return good({list:[]});
     assert.equal(path,PATHS.item);
     const price = ++reads === 1 ? 2000 : 3300;
@@ -384,7 +384,7 @@ test('UPS-01 R21 损坏的密钥封装不作为普通字符串签名', () => {
 });
 
 test('BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至创建请求',async t => {
-  const orderNo = 'D00000000000000008765', member = '9999000000000000123';
+  const orderNo = 'D00000000000000008765', member = '8999000000000000123';
   const variants = [['单空格','桂花 蜜'], ['双空格','桂花  蜜'], ['首尾空白',' 桂花 蜜 ']];
   const row = product({
     sortedPracticeList: [

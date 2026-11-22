@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { PATHS } from '../server/qmai.js';
 import {
-  argsFor, basket, bookFile, failure, memberA, number, ok, place, prepare,
+  argsFor, basket, bookRecords, failure, memberA, number, ok, place, prepare,
   shop, skuId, success, withBound
 } from '../test-support/commerce.js';
 
@@ -66,7 +65,7 @@ test('PRE-03/06 WRT-10/11 R3 前导零商品可提交，账本与查单按同一
   m.override.set(PATHS.create, () => ok({}));
   const next = await success(s, 'prepare_order', args);
   await failure(s, 'place_order', argsFor(next), /结果未知/);
-  const { records } = JSON.parse(await readFile(bookFile(r), 'utf8'));
+  const records = bookRecords(r);
   const pending = records.find(record => record.state === 'unknown');
   assert.equal(pending.products[0].goodsId, '12345');
   m.override.set(PATHS.orderList, () => ok({ total: 1, data: [{

@@ -1,20 +1,17 @@
 import { spawnSync } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
 import {
-  accessSync, closeSync, constants, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync,
-  realpathSync, renameSync, statSync, unlinkSync, writeFileSync
+  accessSync, closeSync, constants, fsyncSync, mkdirSync, openSync, readdirSync,
+  realpathSync, renameSync, statSync, unlinkSync
 } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { decimalId, digest } from './common.js';
 import { orderNumber } from './commerce-view.js';
 
-const checksum = text => createHash('sha256').update(text).digest('hex');
-const bookName = 'orders.json';
-const memberHashVersion = 'sha256-canonical-decimal-v1';
-const digestCutover = '安全账本的会员摘要口径未标明或不兼容。请按规格 §8 第 8 项停掉旧版写入，核清未决请求与当日额度后用空账本切换。';
-// 保留已部署版本的文件名，库中保存快照撤销记录。
-const journalName = '.ledger-lock.sqlite';
-const reviewName = '.orders-need-review';
+const bookName = 'orders.sqlite';
+const initialName = '.orders-init.sqlite';
+const formatVersion = 2;
+const cutover = '安全账本不可用，格式不兼容或组成不完整。请按规格 §8 第 8 项停掉旧版写入，核清未决请求与当日额度后用空账本切换。';
 // 凭据只在记录持久化之后由账本签发，并绑定到这一次实际发送。
 const sendReceipts = new WeakMap();
 export function consumeSendReceipt(receipt, attempt) {
@@ -29,10 +26,10 @@ const isDigest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(val
 
 function validateRecord(record) {
   return record && isDigest(record.key) && isDigest(record.memberHash)
-    && typeof record.storeId === 'string' && /^\d+$/.test(record.storeId)
+    && typeof record.storeId === 'string' && decimalId(record.storeId) !== null
     && (record.products === undefined || (Array.isArray(record.products) && record.products.length >= 1
       && record.products.length <= 20 && record.products.every(item => item && typeof item.goodsId === 'string'
-        && /^[1-9]\d*$/.test(item.goodsId) && (item.nameHash === null || isDigest(item.nameHash))
+        && decimalId(item.goodsId) === item.goodsId && (item.nameHash === null || isDigest(item.nameHash))
         && Number.isInteger(item.quantity) && item.quantity >= 1 && item.quantity <= 99)))
     && Number.isSafeInteger(record.time) && record.time > 0
     && Number.isSafeInteger(record.totalFen) && record.totalFen > 0
@@ -73,188 +70,83 @@ export class Ledger {
       throw error;
     }
     this.file = join(this.directory, bookName);
-    this.journalFile = join(this.directory, journalName);
     try {
       const files = readdirSync(this.directory);
-      const fresh = files.length === 0;
-      if (fresh && !initializeIfEmpty) return;
-      if (!fresh && (!files.includes(journalName) || !files.includes(bookName))) {
-        throw Error('账本组成不完整或需要人工核对');
+      if (!files.includes(bookName)) {
+        // 初建暂名下从未接受过业务记录。正式库一经发布，只有 SQLite 写它。
+        if (files.some(name => name !== initialName && name !== initialName + '-journal')) {
+          this.faultReason = cutover;
+          throw Error(cutover);
+        }
+        if (!initializeIfEmpty) return;
+        for (const name of files) unlinkSync(join(this.directory, name));
+        this.#initialize();
       }
-      if (fresh) closeSync(openSync(this.journalFile, 'wx', 0o600));
-      else if (!statSync(this.journalFile).size) throw Error('撤销记录库为空');
-      this.journal = new DatabaseSync(this.journalFile);
-      this.journal.exec('PRAGMA busy_timeout=0; PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE');
-      if (this.journal.prepare('PRAGMA quick_check').get().quick_check !== 'ok') throw Error('账本数据库损坏');
-      if (fresh) {
-        this.journal.exec('CREATE TABLE initialized (version INTEGER)');
+      this.identity = statSync(this.file);
+      if (!this.identity.isFile() || !this.identity.size) throw Error('账本损坏');
+      this.db = new DatabaseSync(this.file);
+      this.db.exec('PRAGMA synchronous=FULL');
+      if (this.db.prepare('PRAGMA user_version').get().user_version !== formatVersion) {
+        this.faultReason = cutover;
+        throw Error(cutover);
       }
-      if (this.journal.prepare('SELECT 1 FROM initialized WHERE version=0').get()) throw Error('账本需要人工核对');
-      // v1 的完整快照可升级到带撤销记录的格式。
-      this.journal.exec(`CREATE TABLE IF NOT EXISTS pending_snapshot (
-        id INTEGER PRIMARY KEY CHECK (id = 1), previous TEXT NOT NULL, candidate_hash TEXT NOT NULL
-      )`);
-      this.journalIdentity = statSync(this.journalFile);
-      if (fresh) {
-        this.#save(new Map(), {initial:true});
-      } else {
-        const current = readFileSync(this.file);
-        const pending = this.journal.prepare('SELECT previous, candidate_hash FROM pending_snapshot WHERE id=1').get();
-        const hasReview = files.includes(reviewName);
-        const previous = pending ? Buffer.from(pending.previous, 'utf8') : current;
-        if (hasReview && !readFileSync(join(this.directory, reviewName)).equals(previous)) {
-          throw Error('人工核对标记无法与撤销记录核实');
+      if (this.db.prepare('PRAGMA integrity_check').get().integrity_check !== 'ok') throw Error('账本损坏');
+      const recovered = new Map();
+      for (const row of this.db.prepare('SELECT key, record, checksum FROM records').all()) {
+        const record = JSON.parse(row.record);
+        if (row.key !== record?.key || recovered.has(row.key)
+          || digest(row.record) !== row.checksum || !validateRecord(record)) {
+          throw Error('账本记录损坏');
         }
-        // 两次提交之间退出时，只接受日志记载的旧、候选两种现场。
-        if (pending && !current.equals(previous) && checksum(current) !== pending.candidate_hash) throw Error('快照与撤销记录不符');
-        const bytes = new TextDecoder('utf-8', {fatal:true, ignoreBOM:true}).decode(previous);
-        const envelope = JSON.parse(bytes);
-        if (envelope.version !== 1 || !Array.isArray(envelope.records)
-          || envelope.checksum !== checksum(JSON.stringify(envelope.records))
-          || !envelope.records.every(validateRecord)) throw Error('损坏');
-        if (envelope.memberHashVersion !== memberHashVersion
-          && (envelope.records.length || Object.hasOwn(envelope, 'memberHashVersion'))) {
-          this.faultReason = digestCutover;
-          throw Error(digestCutover);
-        }
-        const recovered = new Map(envelope.records.map(row => [row.key, row]));
-        if (recovered.size !== envelope.records.length) throw Error('重复');
-        if (pending) this.#replaceFile(bytes);
-        if (hasReview) {
-          unlinkSync(join(this.directory, reviewName));
-          this.#syncDirectory();
-        }
-        if (pending) {
-          this.journal.exec('DELETE FROM pending_snapshot WHERE id=1');
-        }
-        this.lastBytes = bytes;
-        this.records = recovered;
-        for (const record of this.records.values()) rememberAuditFields(record);
+        recovered.set(record.key, record);
       }
+      this.records = recovered;
+      for (const record of recovered.values()) rememberAuditFields(record);
     } catch {
       this.fault = true;
     }
   }
 
-  #replaceFile(bytes) {
-    const temporary = join(this.directory, '.orders-' + randomUUID() + '.tmp');
+  #initialize() {
+    const temporary = join(this.directory, initialName);
+    closeSync(openSync(temporary, 'wx', 0o600));
+    const db = new DatabaseSync(temporary);
     try {
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(fd, bytes, 'utf8');
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(temporary, this.file);
-      this.#syncDirectory();
+      db.exec('PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE');
+      db.exec('BEGIN IMMEDIATE');
+      db.exec('CREATE TABLE records (key TEXT PRIMARY KEY, record TEXT NOT NULL, checksum TEXT NOT NULL) STRICT');
+      db.exec(`PRAGMA user_version=${formatVersion}`);
+      db.exec('COMMIT');
     } finally {
-      if (existsSync(temporary)) {
-        try { unlinkSync(temporary); } catch { /* 保留现场供运维检查 */ }
-      }
+      db.close();
     }
+    renameSync(temporary, this.file);
+    fsyncSync(this.directoryFd);
   }
 
-  #syncDirectory() {
-    if (process.platform === 'win32') return;
-    const directory = openSync(this.directory, 'r');
-    try { fsyncSync(directory); } finally { closeSync(directory); }
-  }
-
-  #save(records, {initial = false, beforeSend = false} = {}) {
+  #persistRecord(record, insertOnly) {
     if (this.fault) throw Error('安全账本不可用，需要人工检查');
     try {
-      const journalFile = statSync(this.journalFile);
-      if (journalFile.dev !== this.journalIdentity.dev || journalFile.ino !== this.journalIdentity.ino) throw Error('账本数据库已替换');
-      const rows = [...records.values()];
-      const bytes = JSON.stringify({ version: 1, memberHashVersion, records: rows, checksum: checksum(JSON.stringify(rows)) }) + '\n';
-      if (!initial) {
-        const prior = openSync(this.file, 'r+');
-        try {
-          if (!readFileSync(prior).equals(Buffer.from(this.lastBytes))) throw Error('账本已更改');
-        } finally { closeSync(prior); }
-        // SQLite 单语句事务先确认撤销记录，替换、同步任一步失败都保留它。
-        this.journal.prepare('INSERT INTO pending_snapshot VALUES (1, ?, ?)').run(this.lastBytes, checksum(bytes));
-      }
-      this.#replaceFile(bytes);
-      if (!initial) this.#confirmSnapshot(bytes, beforeSend);
-      this.records = records;
-      this.lastBytes = bytes;
+      if (!validateRecord(record)) throw Error('账本记录无效');
+      const current = statSync(this.file);
+      if (current.ino !== this.identity.ino || current.dev !== this.identity.dev) throw Error('账本已替换');
+      const json = JSON.stringify(record);
+      // 发送前只许插入新请求。终态、防重和认领信息都在同一行随事务提交。
+      const sql = 'INSERT INTO records (key, record, checksum) VALUES (?, ?, ?)'
+        + (insertOnly ? '' : ' ON CONFLICT(key) DO UPDATE SET record=excluded.record, checksum=excluded.checksum');
+      this.db.exec('BEGIN IMMEDIATE');
+      this.db.prepare(sql).run(record.key, json, digest(json));
+      this.db.exec('COMMIT');
     } catch {
       this.fault = true;
+      // 关闭连接会回滚尚未提交的事务。若 COMMIT 已生效，保留该提交供重启读取。
+      try {
+        this.db?.close();
+        this.db = undefined;
+      } catch { /* 服务仍持有目录锁并拒绝后续写入。 */ }
       throw Error('安全账本写入失败');
     }
-  }
-
-  #confirmSnapshot(candidate, beforeSend) {
-    // 独立标记保留写前快照，启动时可与 SQLite 撤销行交叉核验。
-    const review = join(this.directory, reviewName);
-    writeFileSync(review, this.lastBytes, {flag:'wx', mode:0o600, flush:true});
-    this.#syncDirectory();
-    if (beforeSend) {
-      this.#confirmSending(candidate, review);
-      return;
-    }
-    try {
-      this.journal.exec('DELETE FROM pending_snapshot WHERE id=1');
-    } catch (error) {
-      try {
-        this.#restoreOnUncertainCommit(candidate);
-        unlinkSync(review);
-        this.#syncDirectory();
-      } catch { /* 撤销无法确认时保留预先落盘的标记。 */ }
-      throw error;
-    }
-    // 此刻 SQLite 已明确确认，候选快照已落盘。清理失败只关闭后续写入；
-    // 报告本笔已确认的结果，否则 unlink 已生效才报错时会给出相反的交易结论。
-    try {
-      unlinkSync(review);
-      this.#syncDirectory();
-    } catch { this.fault = true; }
-  }
-
-  #confirmSending(candidate, review) {
-    // 清理期间 SQLite 删除仍在事务中。即使 unlink 已生效才报错，撤销行也能随回滚恢复。
-    this.journal.exec('BEGIN IMMEDIATE');
-    try {
-      this.journal.exec('DELETE FROM pending_snapshot WHERE id=1');
-      unlinkSync(review);
-      this.#syncDirectory();
-    } catch (error) {
-      this.journal.exec('ROLLBACK');
-      throw error;
-    }
-    try {
-      this.journal.exec('COMMIT');
-    } catch (error) {
-      // COMMIT 可能已经生效才报错。优先恢复撤销行或原文件。
-      try { this.journal.exec('ROLLBACK'); } catch { /* 事务可能已结束。 */ }
-      try {
-        this.#restoreOnUncertainCommit(candidate);
-      } catch {
-        try {
-          writeFileSync(review, this.lastBytes, {flag:'wx', mode:0o600, flush:true});
-          this.#syncDirectory();
-        } catch {
-          // 目录只读也能写已有快照；回写中断时，截断或校验不符将阻止加载。
-          writeFileSync(this.file, this.lastBytes, {flag:'w', flush:true});
-        }
-      }
-      throw error;
-    }
-  }
-
-  #restoreOnUncertainCommit(candidate) {
-    try {
-      this.journal.prepare('INSERT OR REPLACE INTO pending_snapshot VALUES (1, ?, ?)').run(this.lastBytes, checksum(candidate));
-      return;
-    } catch { /* 数据库仍不可写时，走文件恢复。 */ }
-    this.#replaceFile(this.lastBytes);
-  }
-
-  #persistRecord(record, options) {
-    if (!validateRecord(record)) throw Error('账本记录无效');
-    this.#save(new Map(this.records).set(record.key, record), options);
+    this.records.set(record.key, record);
     rememberAuditFields(record);
   }
 
@@ -264,7 +156,7 @@ export class Ledger {
 
   recordSending(record, attempt) {
     if (record.state !== 'sent' || this.records.has(record.key)) throw Error('发送前记录无效或重复');
-    this.#persistRecord(record, {beforeSend:true});
+    this.#persistRecord(record, true);
     const receipt = Object.freeze({});
     sendReceipts.set(receipt, attempt);
     return receipt;
@@ -281,8 +173,8 @@ export class Ledger {
 
   close() {
     try {
-      this.journal?.close();
-      this.journal = undefined;
+      this.db?.close();
+      this.db = undefined;
     } finally {
       if (this.directoryFd !== undefined) {
         closeSync(this.directoryFd);

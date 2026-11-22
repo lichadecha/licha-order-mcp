@@ -165,6 +165,7 @@ export class Browse {
 
   #item(storeId, goodsId, fresh = false) {
     return this.#cached(['item',String(storeId),goodsId], this.config.LICHA_CACHE_ITEM_MS, async () => {
+      if (!decimalId(goodsId)) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
       const result = await this.#read(PATHS.item, {storeId, goodsIds:[goodsId], ...channel,
         includeProperties:['SKU','PRACTICE','ATTACH','LABEL','CATEGORY']}, '商品详情查询失败', '换个商品试试');
       const row = Array.isArray(result) ? result[0] : null;

@@ -1,5 +1,5 @@
 import {yuan, projectText} from './common.js';
-import {id, list} from './catalog.js';
+import {id, list, optionPrice} from './catalog.js';
 
 export class SelectionError extends Error {
   constructor(message, hint) {
@@ -9,7 +9,7 @@ export class SelectionError extends Error {
 }
 
 function requireId(item, part, name, value) {
-  if (!/^\d+$/.test(id(value)) || /^0+$/.test(id(value))) {
+  if (!id(value)) {
     throw new Error(`组单失败：商品「${item}」的${part}「${name}」缺少下单所需的信息，暂时点不了，请换一个或稍后再试`);
   }
 }
@@ -83,12 +83,13 @@ export function priceLine(row, card, input, preparing) {
   let unitFen = sku.priceFen;
   const practices = [], practiceList = [];
   for (const {group, value, rawGroup, rawValue} of selected.values()) {
+    if (value.priceFen === null) throw new SelectionError(`「${value.name}」做法价格待询`, '换个做法或商品');
     if (preparing) {
       requireId(card.name, '做法', value.name, rawGroup.practiceId);
       requireId(card.name, '做法', value.name, rawValue.practiceValueId);
     }
     practiceList.push({id:id(rawGroup.practiceId), name:rawGroup.practiceName || group.name, value:rawValue.practiceValue,
-      valueId:id(rawValue.practiceValueId), price:rawValue.price ?? 0});
+      valueId:id(rawValue.practiceValueId), price:optionPrice(rawValue.price)});
     practices.push(value.name);
     unitFen += value.priceFen;
   }
@@ -104,8 +105,9 @@ export function priceLine(row, card, input, preparing) {
       '可加：' + (card.attaches.map(a => a.name).join('、') || '无'));
     checkOptionSpacing(name, rawAttaches.map(option => option.attachGoodsName), card.name, '加料');
     const {option:raw, index} = match;
+    if (card.attaches[index].priceFen === null) throw new SelectionError(`「${card.attaches[index].name}」加料价格待询`, '换个加料或商品');
     if (preparing) requireId(card.name, '加料', card.attaches[index].name, raw.attachGoodsId);
-    const item = attachByIndex.get(index) ?? {id:id(raw.attachGoodsId), name:raw.attachGoodsName, price:raw.attachGoodsPrice ?? 0, num:0};
+    const item = attachByIndex.get(index) ?? {id:id(raw.attachGoodsId), name:raw.attachGoodsName, price:optionPrice(raw.attachGoodsPrice), num:0};
     item.num++;
     attachByIndex.set(index, item);
     attaches.push(card.attaches[index].name);

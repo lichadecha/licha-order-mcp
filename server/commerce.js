@@ -111,10 +111,11 @@ export async function createCommerce(config, qmai, browse, logs) {
     }
     const wrapped = data !== null && typeof data === 'object' && Object.hasOwn(data, 'customerId');
     const value = wrapped ? data.customerId : data;
-    const id = integerDigits(value);
-    if ((wrapped && value === null) || id === '0' || (typeof value === 'string' && /^0*$/.test(value.trim()))) {
+    const digits = integerDigits(value);
+    if ((wrapped && value === null) || digits === '0' || (typeof value === 'string' && /^0*$/.test(value.trim()))) {
       reject('not_member', notMember);
     }
+    const id = decimalId(digits);
     if (!id) reject('invalid_response', bindFailed);
     const previous = bindings.get(device);
     if (previous?.id === id) {
@@ -124,7 +125,8 @@ export async function createCommerce(config, qmai, browse, logs) {
     const pending = previous ? unresolved(previous.hash) : [];
     if (pending.length) reject('unresolved', `暂时不能换人：上一次下单请求的结果还没核对清楚（${pendingCount(pending)}）。\n先用「看看我最近的订单」把那一单核对掉，再换人——否则那笔单到底成没成就没人能确认了。`);
     const created = Date.now();
-    const binding = { id, hash: digest(id), customerIdTail: tail(value), identifierTail: tail(clean),
+    const displayId = typeof value === 'string' && /^\d+$/.test(value) ? value : id;
+    const binding = { id, hash: digest(id), customerIdTail: tail(displayId), identifierTail: tail(clean),
       via: codeType, created, touched: created, ...(codeType === 'phone' && { phone: clean }) };
     const discarded = previous ? supersede(draft => draft.device === device && draft.hash === previous.hash, 'rebound') : 0;
     bindings.set(device, binding);
@@ -266,12 +268,12 @@ export async function createCommerce(config, qmai, browse, logs) {
         }
         if (error.kind === 'business') {
           const hint = { 110004: '验签失败，检查凭证配置', 100002: '参数格式不对', 100007: '搜索词为空或不支持' }[error.code] || '接口暂时异常，换个问法试试';
-          try { book.update({ ...record, state: 'failed' }); } catch { /* 保留发送前记录，重启按未决处理 */ }
+          try { book.update({ ...record, state: 'failed' }); } catch { /* 重启后可能仍是未决，当场应返回上游的明确失败。 */ }
           log('failed', 'business', { qmaiCode: error.code, messageLength: error.messageLength });
           throw Error(`下单失败：${error.message || '未知错误'}（${hint}）。这一单没有创建，可以调整后重新组单。`);
         }
         try { book.update({ ...record, state: 'unknown', reason: error.kind || 'invalid' }); }
-        catch { /* 故障时保留即将发出的记录，重启后仍按未决恢复 */ }
+        catch { /* 两种提交结果都保留未决。 */ }
         log('unknown', error.kind || 'invalid');
         throw Error(unknownMessage(error));
       }
@@ -360,7 +362,8 @@ export async function createCommerce(config, qmai, browse, logs) {
       const orderNo = orderNumber(match);
       try { book.update({ ...record, state, ...(match && { orderNo }), resolvedAt: Date.now() }); }
       catch {
-        if (match) notes.push(`查到了对应订单（${orderNo}），但核对结论暂时没能保存，下单闸门还关着。请稍后再查一次。`);
+        notes.push((match ? `查到了对应订单（${orderNo}），但` : '')
+          + '核对结论暂时没能保存，下单闸门还关着。请稍后再查一次。');
         break;
       }
       if (match) { known.add(orderNo); found.push(match); } else { absent++; }

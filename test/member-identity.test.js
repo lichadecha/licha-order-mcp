@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { PATHS } from '../server/qmai.js';
 import { digest } from '../server/common.js';
-import { argsFor, bind, bookFile, count, failure, number, ok, place, prepare, setup, success } from '../test-support/commerce.js';
+import { argsFor, bind, bookRecords, count, failure, number, ok, place, prepare, setup, success } from '../test-support/commerce.js';
 
 test('BND-04/05/06 PRE-10 按原编号取尾号，绑定、念单、查单说同一个标识尾号', async t => {
   const r = await setup(t);
@@ -55,7 +54,7 @@ for (const unknown of [false, true]) {
     assert.equal(r.requests.find(req => req.path === PATHS.create).params.userId, 123);
     const guard = unknown ? /还没有核对清楚/ : /今天的下单次数已到上限/;
     await failure(plain, 'place_order', argsFor(await prepare(plain)), guard);
-    const [record] = JSON.parse(await readFile(bookFile(r), 'utf8')).records;
+    const [record] = bookRecords(r);
     assert.equal(record.memberHash, digest('123'));
     if (receipt) {
       assert.equal(receipt.qmaiActualAmountYuan, '20.00');
@@ -112,5 +111,33 @@ test('QRY-02/04 WRT-18 UNR-03 R25 原始会员编号有非零小数或指数溢�
       r.mock.override.set(PATHS.member, (_, { res }) => rawReply(member, res));
       await failure(s, 'bind_member', { code: 'BASE', codeType: 'card' }, /查询会员信息/);
     }
+  }
+});
+
+test('R25 会员编号超出 long 上限视为查询失败，上限值按原文发出', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  for (const token of ['9223372036854775808', '10000000000000000000', '9'.repeat(512)]) {
+    for (const encode of [JSON.rawJSON, String]) {
+      r.mock.override.set(PATHS.member, () => ok({ customerId: encode(token) }));
+      await failure(s, 'bind_member', { codeType: 'card', code: 'CARD' }, /查询会员信息/);
+    }
+  }
+  await failure(s, 'prepare_order', { storeId: '123', items: [{ goodsId: '123', quantity: 1 }] }, /尚未绑定/);
+  assert.ok(r.requests.every(x => x.path === PATHS.member));
+  r.mock.override.set(PATHS.member, () => ok(JSON.rawJSON('9223372036854775807')));
+  assert.equal((await bind(s)).customerIdLast4, '***5807');
+  await place(s, await prepare(s));
+  assert.match(r.requests.find(x => x.path === PATHS.create).raw, /"userId":9223372036854775807\b/);
+});
+
+test('§4 会员 ID 的小数与指数按十进制整数取尾号，短编号仍隐藏', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  for (const [value, last4] of [[JSON.rawJSON('12341873.0'), '***1873'],
+    [JSON.rawJSON('7.6541873e7'), '***1873'], ['76551873.0', '***1873'],
+    [JSON.rawJSON('1234567.0'), '***'], ['00001234', '***1234']]) {
+    r.mock.override.set(PATHS.member, () => ok(value));
+    assert.equal((await bind(s)).customerIdLast4, last4);
   }
 });

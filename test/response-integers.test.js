@@ -52,3 +52,56 @@ test('R25 UNR-03/04/07 等值时间戳都参与唯一性判断，完整空页的
   assert.equal(empty.resolvedPendingWrites, 1);
   assert.match(empty.pendingWriteNote, /企迈侧没有建单/);
 });
+
+test('R23 裸数字创建回执按结果未知处理，同号的数字列表行不能认领或证明无单', async t => {
+  const { r, s, m } = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
+  const orderNo = '12345678901234567890';
+  m.override.set(PATHS.create, () => ok({ orderNo: JSON.rawJSON(orderNo) }));
+  const args = argsFor(await prepare(s));
+  await failure(s, 'place_order', args, /结果未知/);
+  await failure(s, 'place_order', args, /不能重复|令牌无效/);
+  assert.equal(r.requests.filter(x => x.path === PATHS.create).length, 1);
+  assert.equal(r.requests.filter(x => x.path === PATHS.orderDetail).length, 0);
+
+  const row = { orderNo: JSON.rawJSON(orderNo), userId: memberA,
+    orderAt: r.requests.find(x => x.path === PATHS.create).at, status: 10 };
+  m.orders = [row];
+  await delay(220);
+  const pending = await success(s, 'my_orders');
+  assert.equal(pending.count, 0);
+  assert.equal(pending.unresolvedPendingWrites, 1);
+  assert.equal(pending.resolvedPendingWrites, undefined);
+  m.orders = [{ ...row, orderNo }];
+  const verified = await success(s, 'my_orders');
+  assert.equal(verified.resolvedPendingWrites, 1);
+  assert.equal(verified.orders[0].orderNo, orderNo);
+});
+
+test('R23 纯数字字符串创建成功，同号裸数详情和状态回执均不可用', async t => {
+  const { s, m } = await withBound(t);
+  const orderNo = '12345678901234567890';
+  m.override.set(PATHS.create, () => ok({ orderNo }));
+  const numericRow = { orderNo: JSON.rawJSON(orderNo), userId: memberA, status: 10, actualAmount: 1985 };
+  m.override.set(PATHS.orderDetail, () => ok(numericRow));
+  const receipt = await place(s, await prepare(s));
+  assert.equal(receipt.placed, true);
+  assert.equal(receipt.orderNo, orderNo);
+  assert.equal(receipt.readbackFailed, true);
+  assert.equal(receipt.qmaiActualAmountYuan, undefined);
+  m.override.set(PATHS.orderStatus, () => ok(numericRow));
+  await failure(s, 'get_order_status', { orderNo }, /订单号与查询不符/);
+  m.override.set(PATHS.orderStatus, () => ok({ ...numericRow, orderNo }));
+  assert.equal((await success(s, 'get_order_status', { orderNo })).status, 10);
+});
+
+test('§4 读回与列表的大额整数分保留最后一分，包括负差额', async t => {
+  const { s, m } = await withBound(t);
+  m.override.set(PATHS.orderDetail, ({ orderNo }) => ok({ orderNo, userId: memberA, actualAmount: 9007199254740985 }));
+  const receipt = await place(s, await prepare(s));
+  assert.equal(receipt.qmaiActualAmountYuan, '90071992547409.85');
+  assert.equal(receipt.diffYuan, '90071992547389.85');
+  m.orders = [{ orderNo: receipt.orderNo, userId: memberA, actualAmount: 9007199254740985 }];
+  assert.equal((await success(s, 'my_orders')).orders[0].actualAmountYuan, '90071992547409.85');
+  m.override.set(PATHS.orderDetail, ({ orderNo }) => ok({ orderNo, userId: memberA, actualAmount: 1999 }));
+  assert.equal((await place(s, await prepare(s))).diffYuan, '-0.01');
+});

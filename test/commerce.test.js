@@ -13,7 +13,7 @@ import { checkOrderFields } from '../server/commerce.js';
 
 import {
   memberA, memberB, phone, goodsId, skuId, shop, basket, number, ok, setup, success, failure,
-  bind, prepare, argsFor, place, count, bookFile, withBound
+  bind, prepare, argsFor, place, count, bookFile, bookRecords, withBound
 } from '../test-support/commerce.js';
 
 test('绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01', async t => {
@@ -191,7 +191,7 @@ test('同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED
   await bind(other, 'FAKE_CARD_B','card');
   await failure(other,'place_order',argsFor(await prepare(other)),/总单量/);
   const text = await readFile(bookFile(r),'utf8');
-  const [row] = JSON.parse(text).records;
+  const [row] = bookRecords(r);
   assert.match(row.memberHash,/^[0-9a-f]{64}$/);
   assert.match(row.key,/^[0-9a-f]{64}$/);
   assert.equal(row.state,'success');
@@ -358,10 +358,17 @@ test('未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/0
 });
 
 test('零元预估不占位 WRT-08', async t => {
-  const { r,s,m } = await withBound(t);
-  m.override.set(PATHS.item, () => ok([{ goodsId, name:'模拟商品', goodsSkuList:[{skuId,salePrice:100}],
-    attachGoodsList:[{attachGoodsId:'61',attachGoodsName:'模拟调价',attachGoodsPrice:-100}] }]));
-  const draft = await success(s,'prepare_order',{ storeId:shop,items:[{goodsId,quantity:1,attaches:['模拟调价']}] });
+  // 正常目录已拦截负加价。直接给下单层一份零元报价，单独检验发送前护栏。
+  const browseURL = new URL('../server/browse.js', import.meta.url).href;
+  const preload = `import { Browse } from ${JSON.stringify(browseURL)};
+    const quote = Browse.prototype.quote;
+    Browse.prototype.quote = async function (...args) {
+      return { ...await quote.apply(this, args), totalFen: 0 };
+    };`;
+  const { r, s } = await withBound(t, {
+    NODE_OPTIONS: '--import=data:text/javascript;base64,' + Buffer.from(preload).toString('base64')
+  });
+  const draft = await prepare(s);
   assert.equal(draft.estimatedTotalYuan,'0.00');
   await failure(s,'place_order',{confirmToken:draft.confirmToken,confirmAmountYuan:0.01},/超上限/);
   assert.equal(count(r,PATHS.create),0);
@@ -390,7 +397,7 @@ test('发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 
   await assertFault();
   await rm(file,{recursive:true});
   await assertFault();
-  await writeFile(file,'{"version":1,"records":[{');
+  await writeFile(file,'damaged sqlite header');
   await assertFault();
   await rename(file+'.backup',file);
   await r.restart();
@@ -446,8 +453,7 @@ test('强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/
   m.override.set(PATHS.create,()=>{arrived.resolve();return undefined;});
   const submitted=s.call('place_order',argsFor(await prepare(s))).catch(()=>null);
   await arrived.promise;
-  const journal=JSON.parse(await readFile(bookFile(r),'utf8'));
-  const [row]=journal.records;
+  const [row]=bookRecords(r);
   const [request]=r.requests.filter(req=>req.path===PATHS.create);
   assert.equal(row.state,'sent');
   assert.ok(Math.abs(row.time-request.at)<200);
@@ -485,7 +491,7 @@ test('强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/
   assert.notEqual(run('resolve',nextKey,'found',manualOrderNo,'同一张单').status,0);
   assert.equal(run('resolve',nextKey,'absent','门店复查无单').status,0);
   assert.deepEqual(JSON.parse(run('list').stdout),[]);
-  assert.ok((await readFile(bookFile(r),'utf8')).includes('门店复查无单'));
+  assert.equal(bookRecords(r).find(row => row.key === nextKey).operatorNote, '门店复查无单');
 });
 
 // 两个服务各用自己的端口与客户端，共享被测账本目录和同一个模拟上游。
@@ -549,9 +555,9 @@ test('恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/
   assert.equal(result.unresolvedPendingWrites,2);
   assert.match(result.pendingWriteNote,/小程序「我的订单」付款/);
   assert.match(result.pendingWriteNote,/联系门店/);
-  const saved=JSON.parse(await readFile(bookFile(r),'utf8'));
-  assert.equal(saved.records.find(row=>row.time===early).orderNo,number(19));
-  assert.equal(saved.records.find(row=>row.time===recent).state,'sent');
+  const saved=bookRecords(r);
+  assert.equal(saved.find(row=>row.time===early).orderNo,number(19));
+  assert.equal(saved.find(row=>row.time===recent).state,'sent');
   assert.equal((await success(s,'my_orders')).unresolvedPendingWrites,2);
 });
 
@@ -606,7 +612,7 @@ test('UNR-03 商品名称、编号和杯数随发送记录恢复，畸形时间�
     { goodsId, quantity: 1 }, { goodsId, quantity: 2 }
   ] });
   await failure(s, 'place_order', argsFor(draft), /结果未知/);
-  const at = JSON.parse(await readFile(bookFile(r), 'utf8')).records[0].time;
+  const at = bookRecords(r)[0].time;
   await r.restart();
   const again = await r.session();
   await bind(again);
@@ -633,7 +639,7 @@ test('UNR-03 商品名称、编号和杯数随发送记录恢复，畸形时间�
   m.orders = [{ ...candidate, itemList: [{ goodsName: '测试茶', num: 3 }] }];
   const matched = await success(again, 'my_orders');
   assert.equal(matched.resolvedPendingWrites, 1);
-  const [record] = JSON.parse(await readFile(bookFile(r), 'utf8')).records;
+  const [record] = bookRecords(r);
   const writes = (await readFile(join(r.logDir,'write.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
   const audit = writes.find(row => row.outcome === 'resolved');
   assert.equal(audit.requestKey,record.key);
@@ -646,7 +652,7 @@ test('PRE-11 自动认领与停服人工裁决均按发出时刻提醒再下单'
   const { r, s, m } = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '60000' });
   m.override.set(PATHS.create, () => ok({}));
   await failure(s, 'place_order', argsFor(await prepare(s)), /结果未知/);
-  const first = JSON.parse(await readFile(bookFile(r), 'utf8')).records[0];
+  const first = bookRecords(r)[0];
   await delay(1100);
   m.orders = [{ orderNo: number(91), userId: memberA, orderAt: first.time }];
   assert.equal((await success(s, 'my_orders')).resolvedPendingWrites, 1);
@@ -655,7 +661,7 @@ test('PRE-11 自动认领与停服人工裁决均按发出时刻提醒再下单'
   assert.equal(next.recentOrder.orderTime, beijingTime(first.time));
   assert.equal(next.recentOrder.estimatedTotalYuan, '20.00');
   await failure(s, 'place_order', argsFor(next), /结果未知/);
-  const second = JSON.parse(await readFile(bookFile(r), 'utf8')).records.at(-1);
+  const second = bookRecords(r).at(-1);
   await r.stop();
   await delay(1100);
   const cli = fileURLToPath(new URL('../server/ledger-cli.js', import.meta.url));
@@ -758,78 +764,6 @@ test('BND-02 R24 会员查询支持标量编号，未知形态报告查询失败
   assert.equal((await prepare(s)).member.via, 'phone');
 });
 
-function failSnapshotConfirmation(state) {
-  // 注入实际子进程的 fs，不修改产品代码。先真实执行 rename，再让目录同步失败。
-  const code = `import fs from 'node:fs';
-import {basename} from 'node:path';
-import {syncBuiltinESMExports} from 'node:module';
-const rename = fs.renameSync, fsync = fs.fsyncSync;
-let armed = false;
-fs.renameSync = (from, to) => {
-  rename(from, to);
-  if (basename(to) !== 'orders.json') return;
-  const rows = JSON.parse(fs.readFileSync(to, 'utf8')).records;
-  armed = rows.some(row => row.state === ${JSON.stringify(state)});
-  if (armed && process.platform === 'win32') throw Error('模拟替换后确认失败');
-};
-fs.fsyncSync = fd => {
-  if (armed && fs.fstatSync(fd).isDirectory()) { armed = false; throw Error('模拟目录同步失败'); }
-  return fsync(fd);
-};
-syncBuiltinESMExports();`;
-  return '--import=data:text/javascript;base64,' + Buffer.from(code).toString('base64');
-}
-
-async function checkLateFailure(t, state) {
-  const {r, s, m} = await withBound(t, {
-    NODE_OPTIONS:failSnapshotConfirmation(state), LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1',
-    LICHA_ORDER_MATCH_WINDOW_MS:'30000'
-  });
-  if (state === 'failed') m.override.set(PATHS.create, () => ({status:false,code:30005}));
-  if (state === 'found') m.override.set(PATHS.create, () => ok({}));
-  const draft = await prepare(s);
-  if (state === 'success') {
-    assert.equal((await place(s,draft)).orderNo,number(1));
-  } else if (state === 'found') {
-    await failure(s,'place_order',argsFor(draft),/结果未知/);
-    const time = r.requests.find(req=>req.path===PATHS.create).at;
-    m.orders = [{userId:memberA,orderNo:number(601),orderAt:time,storeId:shop,status:10}];
-    const report = await success(s,'my_orders');
-    assert.equal(report.unresolvedPendingWrites,1);
-    assert.equal(report.resolvedPendingWrites,undefined);
-    assert.match(report.pendingWriteNote,/没能保存/);
-  } else {
-    await failure(s,'place_order',argsFor(draft),state === 'sent' ? /没有发出/ : /这一单没有创建/);
-  }
-  // 直接观察到候选快照已换上，内存业务已收到写失败；此处模拟立即断电式退出。
-  assert.equal(JSON.parse(await readFile(bookFile(r),'utf8')).records[0].state,state);
-  await failure(s,'prepare_order',basket,/账本不可用/);
-  const writes = state === 'sent' ? 0 : 1;
-  assert.equal(count(r,PATHS.create),writes);
-  await r.stop('SIGKILL');
-  delete r.env.NODE_OPTIONS;
-  await r.start();
-  const current=await r.session(s.device);
-  await bind(current);
-  m.override.delete(PATHS.create);
-  m.orders=[];
-  const rows = JSON.parse(await readFile(bookFile(r),'utf8')).records;
-  if (state === 'sent') {
-    assert.deepEqual(rows,[]);
-    assert.equal((await place(current,await prepare(current))).placed,true);
-  } else {
-    assert.equal(rows.length,1);
-    assert.equal(rows[0].state,state === 'found' ? 'unknown' : 'sent');
-    await failure(current,'place_order',argsFor(await prepare(current)),/状态未知/);
-  }
-  assert.equal(count(r,PATHS.create),1);
-}
-
-test('LED-03 发送前记录已替换后确认失败，重启恢复空额',t=>checkLateFailure(t,'sent'));
-test('LED-03 成功终态已替换后确认失败，重启保留发送前记录',t=>checkLateFailure(t,'success'));
-test('LED-03 明确失败终态已替换后确认失败，重启仍保留占额',t=>checkLateFailure(t,'failed'));
-test('LED-03 未决认领已替换后确认失败，重启保留未决',t=>checkLateFailure(t,'found'));
-
 test('LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单', async t => {
   const {r,s} = await withBound(t);
   const receipt = await place(s,await prepare(s));
@@ -870,8 +804,8 @@ test('LED-08 运维按固定字段列未决，R23 不合格单号及未知请求
   await failure(s,'place_order',argsFor(await prepare(s)),/结果未知/);
   const cli=fileURLToPath(new URL('../server/ledger-cli.js',import.meta.url));
   const run=(...args)=>spawnSync(process.execPath,[cli,...args],{cwd:r.cwd,env:r.env,encoding:'utf8'});
-  const bytes=await readFile(bookFile(r),'utf8');
-  const [row]=JSON.parse(bytes).records;
+  const bytes=await readFile(bookFile(r));
+  const [row]=bookRecords(r);
   const locked=run('list');
   assert.notEqual(locked.status,0);
   assert.match(locked.stderr,/其他实例/);
@@ -885,7 +819,7 @@ test('LED-08 运维按固定字段列未决，R23 不合格单号及未知请求
     const attempt=run('resolve',key,'found',no,'模拟门店记录');
     assert.notEqual(attempt.status,0);
     assert.match(attempt.stderr,/订单号格式无效|没有这笔未决/);
-    assert.equal(await readFile(bookFile(r),'utf8'),bytes);
+    assert.deepEqual(await readFile(bookFile(r)),bytes);
   }
   assert.equal(run('resolve',row.key,'found','FAKEORDER0012','模拟门店记录').status,0);
   assert.deepEqual(JSON.parse(run('list').stdout),[]);
@@ -895,7 +829,7 @@ test('LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态', 
   const {r,s} = await withBound(t);
   await place(s,await prepare(s));
   await r.stop();
-  const path = join(r.dataDir,'.ledger-lock.sqlite');
+  const path = bookFile(r);
   await writeFile(path,'');
   await r.start();
   const customer = await r.session();
@@ -923,61 +857,3 @@ test('LED-06 账本目录不可写时启动失败，恢复写权限后可接管'
   await bind(resumed);
   assert.equal((await prepare(resumed)).recentOrder.orderNo,receipt.orderNo);
 });
-
-function failAfterUndoDeletion(failure) {
-  const code = `import fs from 'node:fs';
-import {join, basename} from 'node:path';
-import {DatabaseSync} from 'node:sqlite';
-import {syncBuiltinESMExports} from 'node:module';
-const failure = ${JSON.stringify(failure)};
-let removed = false;
-const db = DatabaseSync.prototype, exec = db.exec, prepare = db.prepare, rename = fs.renameSync;
-db.exec = function(sql) {
-  const result = exec.call(this,sql);
-  if (sql === 'COMMIT') {
-    if (prepare.call(this,'SELECT 1 FROM pending_snapshot WHERE id=1').get()) throw Error('撤销记录仍在');
-    removed = true;
-    fs.writeFileSync(join(process.env.LICHA_DATA_DIR,'mock-undo-deleted'),'1');
-    throw Error('模拟 SQLite 已提交删除后报告错误');
-  }
-  return result;
-};
-db.prepare = function(sql) {
-  if (removed && failure !== 'delete' && sql.startsWith('INSERT OR REPLACE INTO pending_snapshot')) throw Error('模拟数据库仍不可写');
-  return prepare.call(this,sql);
-};
-fs.renameSync = function(from,to) {
-  if (removed && failure === 'quarantine' && basename(to) === 'orders.json') throw Error('模拟快照恢复也失败');
-  return rename(from,to);
-};
-syncBuiltinESMExports();`;
-  return '--import=data:text/javascript;base64,' + Buffer.from(code).toString('base64');
-}
-
-async function checkUncertainCommit(t, failureMode) {
-  const {r,s} = await withBound(t, {
-    NODE_OPTIONS:failAfterUndoDeletion(failureMode), LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1'
-  });
-  const prior = await readFile(bookFile(r),'utf8');
-  await failure(s,'place_order',argsFor(await prepare(s)),/没有发出/);
-  assert.equal(await readFile(join(r.dataDir,'mock-undo-deleted'),'utf8'),'1');
-  assert.equal(count(r,PATHS.create),0);
-  await r.stop('SIGKILL');
-  delete r.env.NODE_OPTIONS;
-  await r.start();
-  const restarted = await r.session(s.device);
-  await bind(restarted);
-  if (failureMode === 'quarantine') {
-    assert.equal(await readFile(join(r.dataDir,'.orders-need-review'),'utf8'),prior);
-    await failure(restarted,'prepare_order',basket,/账本不可用/);
-    assert.equal(count(r,PATHS.create),0);
-  } else {
-    assert.equal(await readFile(bookFile(r),'utf8'),prior);
-    assert.equal((await place(restarted,await prepare(restarted))).placed,true);
-    assert.equal(count(r,PATHS.create),1);
-  }
-}
-
-test('LED-03 撤销记录已删除才报错，重启从重建的撤销记录恢复',t=>checkUncertainCommit(t,'delete'));
-test('LED-03 提交后数据库持续报错，重启保留直接恢复的旧文件',t=>checkUncertainCommit(t,'restore'));
-test('LED-03 提交报错且两个恢复出口都失败，重启保留现场并拒绝下单',t=>checkUncertainCommit(t,'quarantine'));
