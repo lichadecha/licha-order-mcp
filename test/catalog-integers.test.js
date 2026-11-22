@@ -158,3 +158,87 @@ test('R25 目录中的状态、排序、库存和标记同样按原文判整数'
   assert.equal(card.skus[0].stock, null);
   assert.equal(card.practices[0].required, false);
 });
+
+test('R25 R3 菜单编号能打开等值详情，组单多行只现读一次且照选中的规格筛券、创建', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  await bind(s);
+  const padded = '00076543210';
+  r.mock.override.set(PATHS.categories, () => ok([]));
+  r.mock.override.set(PATHS.search, () => ok([{ ...product(), goodsId: padded }]));
+  const row = product();
+  row.goodsId = raw('76543210.0');
+  row.goodsSkuList = [{ skuId: '000205', salePrice: 2000 }, { skuId: 206, salePrice: 3000 }];
+  r.mock.override.set(PATHS.item, () => ok([row]));
+  r.mock.override.set(PATHS.stores, () => ok({ list: [{ id: 301, code: '01', name: '测试门店' }] }));
+  const menu = await success(s, 'get_menu', { storeId, keyword: '测试茶' });
+  const goodsId = menu.items[0].goodsId;
+  const card = await success(s, 'get_item_detail', { storeId, goodsId });
+  assert.equal(card.goodsId, exact);
+  assert.equal((await success(s, 'get_item_detail', detailArgs)).goodsId, exact);
+  assert.equal(count(r, PATHS.item), 1);
+
+  const basket = { storeId, items: [{ goodsId, skuId: '205', quantity: 1 },
+    { goodsId: exact, skuId: '000206', quantity: 1 }] };
+  assert.equal((await success(s, 'preview_order', basket)).totalYuan, '50.00');
+  const draft = await success(s, 'prepare_order', basket);
+  assert.equal(draft.estimatedTotalYuan, '50.00');
+  assert.equal(count(r, PATHS.item), 2);
+  const coupons = r.requests.find(req => req.path === PATHS.coupons);
+  assert.deepEqual(coupons.params.tradeMarks.map(line => line.tradeMark), [exact, exact]);
+  await place(s, draft);
+  const created = r.requests.find(req => req.path === PATHS.create).params.items;
+  assert.deepEqual(created.map(line => [line.goodsId, line.skuId]), [[76543210, 205], [76543210, 206]]);
+});
+
+test('R25 PRE-07 按找店给出的前导零编号组单，保留对应店名与筛券所用门店编码', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  await bind(s);
+  r.mock.override.set(PATHS.stores, () => ok({ list: [{ id: '00301', code: '005', name: '测试门店', openStatus: 1 }] }));
+  r.mock.override.set(PATHS.storeStatus, () => ok({}));
+  r.mock.override.set(PATHS.item, () => ok([product()]));
+  r.mock.override.set(PATHS.coupons, ({ multiMark }) => ok(multiMark === '005'
+    ? [{ title: '门店券', unUseStatus: 1, userCouponCanDisAmount: 1 }] : []));
+  const { store } = await success(s, 'find_store', { query: '测试门店' });
+  assert.equal(store.openStatusText, '营业中');
+  const draft = await success(s, 'prepare_order', { ...args, storeId: store.storeId });
+  assert.equal(draft.store.name, '测试门店');
+  assert.equal(draft.coupons.predicted.title, '门店券');
+  assert.equal(count(r, PATHS.coupons), 1);
+});
+
+for (const [kind, setConflict] of [
+  ['规格', row => { row.goodsSkuList = [
+    { skuId: '000205', salePrice: 3000, specName: '大杯' },
+    { skuId: 205, salePrice: 2000, specName: '小杯' },
+    { skuId: 999, salePrice: 1500, specName: '迷你杯' }
+  ]; }],
+  ['做法分组', row => row.sortedPracticeList.push({
+    practiceName: '甜度', practiceId: '000402', practiceValueList: [{ practiceValue: '全糖', practiceValueId: 999 }]
+  })],
+  ['做法', row => row.sortedPracticeList.push({
+    practiceName: '甜度', practiceId: 999, practiceValueList: [{ practiceValue: '全糖', practiceValueId: '000403' }]
+  })],
+  ['加料', row => row.attachGoodsList.push({ attachGoodsName: '椰果', attachGoodsId: '000' + max })]
+]) {
+  test(`R25 BRW-08 PRE-03 同商品的${kind}编号数值重复时阻止预估与组单`, async t => {
+    const r = await setup(t);
+    const s = await r.session();
+    await bind(s);
+    const row = product();
+    setConflict(row);
+    r.mock.override.set(PATHS.item, () => ok([row]));
+    // 冲突影响整个商品，即使这行没选冲突项也不能签令牌。
+    const selections = kind === '规格' ? [{ skuId: '000205' }, { skuId: '205' }, { skuId: '999' }] : [{}];
+    for (const options of selections) {
+      const basket = { storeId, items: [{ goodsId: exact, quantity: 1, ...options }] };
+      const preview = await success(s, 'preview_order', basket);
+      assert.equal(preview.ok, false);
+      assert.match(preview.error.message, new RegExp(kind + '使用同一编号'));
+      await failure(s, 'prepare_order', basket, new RegExp(kind + '使用同一编号'));
+    }
+    assert.equal(count(r, PATHS.coupons), 0);
+    assert.equal(count(r, PATHS.create), 0);
+  });
+}

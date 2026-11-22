@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PATHS } from '../server/qmai.js';
 import {
-  argsFor, failure, goodsId, memberA, memberB, number, ok, place, prepare, shop, success, withBound
+  argsFor, bookRecords, failure, goodsId, memberA, memberB, number, ok, place, prepare, shop, success, withBound
 } from '../test-support/commerce.js';
 
 async function unknownOrder(service) {
@@ -111,6 +111,27 @@ test('UNR-04/07 匹配窗已过，整页只有能按时间排除的行时确认�
   assert.match(result.pendingWriteNote, /企迈侧没有建单/);
 });
 
+test('UNR-04 重复旧单不能补足总数，换成一张新单后认领新单', async t => {
+  const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
+  const { r, m, s } = service;
+  await unknownOrder(service);
+  const [{ time }] = bookRecords(r);
+  const old = candidate(time - 3600000);
+  m.orders = [old, old];
+  await delay(250);
+  const pending = await success(s, 'my_orders');
+  assert.equal(pending.unresolvedPendingWrites, 1);
+  assert.equal(pending.resolvedPendingWrites, undefined);
+  assert.doesNotMatch(pending.pendingWriteNote, /可以重新走 prepare_order/);
+  await failure(s, 'place_order', argsFor(await prepare(s)), /先调用 my_orders/);
+
+  m.orders = [old, candidate(time, 2)];
+  const matched = await success(s, 'my_orders');
+  assert.equal(matched.resolvedPendingWrites, 1);
+  assert.equal(matched.unresolvedPendingWrites, undefined);
+  assert.equal(bookRecords(r)[0].orderNo, number(2));
+});
+
 test('QRY-04 非约定的订单列表结构报查询失败，空数组可正常显示', async t => {
   const { m, s } = await withBound(t);
   m.override.set(PATHS.orderList, () => ok({ list: [candidate(Date.now())], total: 5 }));
@@ -119,7 +140,7 @@ test('QRY-04 非约定的订单列表结构报查询失败，空数组可正常�
   assert.equal((await success(s, 'my_orders')).count, 0);
 });
 
-test('UNR-07 唯一候选状态缺失时只确认建单，不断言支付状态', async t => {
+test('UNR-07 匹配订单缺少状态时提示去小程序核对状态', async t => {
   const service = await withBound(t);
   const { m, s } = service;
   const at = await unknownOrder(service);

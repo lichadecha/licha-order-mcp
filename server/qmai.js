@@ -67,6 +67,8 @@ export function parseResponse(raw, path) {
     // R23：大整数保留原文之前，先排除以 JSON 数字返回的订单号。
     if ((orderRead || path === PATHS.create) && key === 'orderNo') return null;
     const token = context.source;
+    if ((path === PATHS.create && key === 'payAmount')
+      || (path === PATHS.coupons && key === 'userCouponCanDisAmount')) return token;
     if (catalogPaths.has(path) && /[.eE]/.test(token)
       && (key === 'id' || key.endsWith('Id') || catalogIntegers.has(key) || Array.isArray(this))) {
       // 做法和加料的数值价格仍以数值透传；只有精确的小整数才能使用解析后的 Number。

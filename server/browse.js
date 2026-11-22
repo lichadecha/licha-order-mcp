@@ -1,5 +1,5 @@
 import {PATHS, readHint} from './qmai.js';
-import {beijingTime, decimalId, digest, projectText, yuan} from './common.js';
+import {beijingTime, decimalId, digest, projectText, responseId, yuan} from './common.js';
 import {itemCard, menuItem, id, list, numeric} from './catalog.js';
 import {priceLine, SelectionError} from './price.js';
 
@@ -81,7 +81,7 @@ export class Browse {
           };
           const searchable = [row.name, row.address, row.fullAddress, row.cityName, store.shopCode]
             .filter(value => typeof value === 'string').map(normalize);
-          records.set(storeId, {store, rawCode, searchable, status:numeric(row.openStatus)});
+          records.set(decimalId(storeId), {store, rawCode, searchable, status:numeric(row.openStatus)});
         }
         if (data.list.length < pageSize || records.size === previous) break;
       }
@@ -91,11 +91,12 @@ export class Browse {
 
   async storeForOrder(storeId) {
     const directory = await this.#directory();
-    const record = directory.records.get(String(storeId));
+    const record = directory.records.get(decimalId(storeId));
     if (record) return {name:record.store.name, shopCode:record.rawCode};
   }
 
   async #liveStatus(storeId) {
+    storeId = decimalId(storeId);
     const key = ['status', storeId];
     const ttl = this.config.LICHA_CACHE_STORE_STATUS_MS;
     let hours;
@@ -149,7 +150,7 @@ export class Browse {
     const via = category ? 'category' : 'search';
     const params = {storeId, ...channel, includeProperties:['SKU','LABEL'],
       ...(category ? {frontCategoryId:category.frontCategoryId} : {name:keyword})};
-    const {items,count} = await this.#cached([via,storeId,category?.frontCategoryId ?? keyword],
+    const {items,count} = await this.#cached([via,storeId,category ? decimalId(category.frontCategoryId) : keyword],
       category ? this.config.LICHA_CACHE_CATEGORIES_MS : this.config.LICHA_CACHE_SEARCH_MS, async () => {
         const rows = await this.#read(category ? PATHS.categoryItems : PATHS.search, params,
           category ? '按分类查商品失败' : '搜索失败', '换个商品名试试');
@@ -164,12 +165,13 @@ export class Browse {
   }
 
   #item(storeId, goodsId, fresh = false) {
-    return this.#cached(['item',String(storeId),goodsId], this.config.LICHA_CACHE_ITEM_MS, async () => {
-      if (!decimalId(goodsId)) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
-      const result = await this.#read(PATHS.item, {storeId, goodsIds:[goodsId], ...channel,
+    const key = responseId(goodsId);
+    if (!key) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
+    return this.#cached(['item',String(storeId),key], this.config.LICHA_CACHE_ITEM_MS, async () => {
+      const result = await this.#read(PATHS.item, {storeId, goodsIds:[id(goodsId)], ...channel,
         includeProperties:['SKU','PRACTICE','ATTACH','LABEL','CATEGORY']}, '商品详情查询失败', '换个商品试试');
       const row = Array.isArray(result) ? result[0] : null;
-      if (id(row?.goodsId) !== goodsId) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
+      if (responseId(row?.goodsId) !== key) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
       return {row, card:itemCard(row)};
     }, fresh);
   }
@@ -180,15 +182,16 @@ export class Browse {
     let totalFen = 0;
     try {
       for (const input of items) {
-        if (!seen.has(input.goodsId)) {
+        const key = responseId(input.goodsId);
+        if (!seen.has(key)) {
           try {
-            seen.set(input.goodsId, await this.#item(storeId, input.goodsId, preparing));
+            seen.set(key, await this.#item(storeId, input.goodsId, preparing));
           } catch (error) {
             if (error.kind === 'credentials') throw error;
             throw new SelectionError('商品查询失败：' + (error.reason ?? error.message), '换个商品试试');
           }
         }
-        const {row,card} = seen.get(input.goodsId);
+        const {row,card} = seen.get(key);
         const {line, item, tradeMark, lineFen} = priceLine(row, card, input, preparing);
         totalFen += lineFen;
         if (!Number.isSafeInteger(totalFen)) throw new SelectionError('商品价格无法计算', '换个商品试试');

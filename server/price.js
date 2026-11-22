@@ -1,4 +1,4 @@
-import {yuan, projectText} from './common.js';
+import {yuan, projectText, responseId} from './common.js';
 import {id, list, optionPrice} from './catalog.js';
 
 export class SelectionError extends Error {
@@ -14,14 +14,24 @@ function requireId(item, part, name, value) {
   }
 }
 
+function rejectDuplicateIds(options, field, kind, itemName) {
+  const seen = new Set();
+  for (const option of options) {
+    const key = responseId(option[field]);
+    if (key === null) continue;
+    if (seen.has(key)) throw new SelectionError(`「${itemName}」有多个${kind}使用同一编号，没法确定是哪一个`, '请换个商品或稍后再试');
+    seen.add(key);
+  }
+}
+
 function selectSku(card, input) {
   if (!card.available) throw new SelectionError(`「${card.name}」${card.unavailableReason}`, '换一款试试');
   if (input.skuId === undefined && card.skus.length > 1) {
     throw new SelectionError(`「${card.name}」有 ${card.skus.length} 个规格`, '可选：' + card.skus.map(s => s.specName).join('、'));
   }
-  const matches = input.skuId === undefined ? card.skus : card.skus.filter(s => s.skuId === input.skuId);
-  if (matches.length > 1) throw new SelectionError(`「${card.name}」有多个规格使用同一编号，没法确定是哪一个`, '换个规格或商品');
-  const [sku] = matches;
+  const key = responseId(input.skuId);
+  const sku = input.skuId === undefined ? card.skus[0]
+    : key && card.skus.find(option => responseId(option.skuId) === key);
   if (!sku) throw new SelectionError(`「${card.name}」没有这个规格`, '重新选一下规格');
   if (sku.priceFen === null) throw new SelectionError(`「${card.name}」这个规格暂时没有价格`, '换个规格或商品');
   if (!sku.available) throw new SelectionError(`「${card.name}」该规格暂时估清`, '换个规格或商品');
@@ -78,6 +88,12 @@ function selectPractices(row, card, requested) {
 }
 
 export function priceLine(row, card, input, preparing) {
+  const groups = list(row.sortedPracticeList);
+  const rawAttaches = list(row.attachGoodsList);
+  rejectDuplicateIds(card.skus, 'skuId', '规格', card.name);
+  rejectDuplicateIds(groups, 'practiceId', '做法分组', card.name);
+  rejectDuplicateIds(groups.flatMap(group => list(group.practiceValueList)), 'practiceValueId', '做法', card.name);
+  rejectDuplicateIds(rawAttaches, 'attachGoodsId', '加料', card.name);
   const sku = selectSku(card, input);
   const selected = selectPractices(row, card, input.practices ?? []);
   let unitFen = sku.priceFen;
@@ -94,7 +110,6 @@ export function priceLine(row, card, input, preparing) {
     unitFen += value.priceFen;
   }
   const attaches = [], attachByIndex = new Map();
-  const rawAttaches = list(row.attachGoodsList);
   for (const name of input.attaches ?? []) {
     const candidates = rawAttaches.map((option,index) => ({option,index}))
       .filter(({option,index}) => option.attachGoodsName === name || card.attaches[index].name === name);
@@ -128,6 +143,6 @@ export function priceLine(row, card, input, preparing) {
     lineFen, line:{name:card.name, specName:sku.specName, practices, attaches, unitPriceYuan:yuan(unitFen),
       quantity:input.quantity, lineTotalYuan:yuan(lineFen)},
     item:{goodsId:card.goodsId, skuId:sku.skuId, num:input.quantity, practiceList, attachList:[...attachByIndex.values()]},
-    tradeMark:{tradeMark:card.goodsId, num:input.quantity, price:unitFen / 100}
+    tradeMark:{tradeMark:card.goodsId, num:input.quantity, price:JSON.rawJSON(yuan(unitFen))}
   };
 }

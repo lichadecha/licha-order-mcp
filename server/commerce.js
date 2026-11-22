@@ -341,7 +341,8 @@ export async function createCommerce(config, qmai, browse, logs) {
       row, time: rowTime(row), products: listedProducts(row),
       store: Object.hasOwn(row, 'storeId') ? responseId(row.storeId) : undefined
     }));
-    const complete = total !== null && total <= rows.length && !discarded
+    const distinctOrderNos = new Set(rows.map(orderNumber).filter(Boolean));
+    const complete = total !== null && total <= distinctOrderNos.size && !discarded
       && evidence.every(entry => entry.time !== null && entry.store !== null && entry.products !== null);
     const known = book.knownOrders();
     const found = [];
@@ -371,7 +372,7 @@ export async function createCommerce(config, qmai, browse, logs) {
         {device,memberId:b.id,order:match,ledgerRecord:record});
     }
     if (found.length) {
-      notes.push(`核对结果：此前 ${found.length} 笔结果未知的下单请求，在企迈侧确实建了单（${found.map(orderNumber).join('、')}）。不要重下。`
+      notes.push(`核对结果：此前 ${found.length} 笔结果未知的下单请求，在企迈侧查到了与它吻合的订单（${found.map(orderNumber).join('、')}），按这张处理，不要重下。`
         + reconciledPaymentNote(found));
     }
     if (absent) notes.push(`核对结果：此前 ${absent} 笔结果未知的下单请求，在这段时间里没有对应订单——企迈侧没有建单，可以重新走 prepare_order 组单。`);

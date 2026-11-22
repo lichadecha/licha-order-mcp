@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PATHS } from '../server/qmai.js';
-import { argsFor, bind, failure, memberA, number, ok, place, prepare, setup, success, withBound } from '../test-support/commerce.js';
+import { argsFor, basket, bind, failure, memberA, number, ok, place, prepare, setup, success, withBound } from '../test-support/commerce.js';
 
 test('R25 BND-02/03 WRT-18 QRY-03 金额分、状态与会员编号按原文的整数值读取', async t => {
   const r = await setup(t);
@@ -104,4 +104,55 @@ test('§4 读回与列表的大额整数分保留最后一分，包括负差额'
   assert.equal((await success(s, 'my_orders')).orders[0].actualAmountYuan, '90071992547409.85');
   m.override.set(PATHS.orderDetail, ({ orderNo }) => ok({ orderNo, userId: memberA, actualAmount: 1999 }));
   assert.equal((await place(s, await prepare(s))).diffYuan, '-0.01');
+});
+
+test('§4 创建回执的元、详情的分与券的抵扣金额逐分一致', async t => {
+  const { s, m } = await withBound(t);
+  const amount = '90071992547409.85';
+  const orderNo = number(42);
+  m.override.set(PATHS.create, () => ok({ orderNo, payAmount: JSON.rawJSON(amount) }));
+  m.override.set(PATHS.orderDetail, () => ok({ orderNo, userId: memberA, actualAmount: 9007199254740985 }));
+  m.couponRows = [{ title: '金额核对券', unUseStatus: 1, userCouponCanDisAmount: JSON.rawJSON(amount) }];
+  const draft = await prepare(s);
+  assert.equal(draft.coupons.predicted.canDisYuan, amount);
+  const receipt = await place(s, draft);
+  assert.equal(receipt.qmaiActualAmountYuan, amount);
+  assert.equal(receipt.qmaiPayAmountYuanFromCreate, receipt.qmaiActualAmountYuan);
+});
+
+test('§4 券抵扣按原文四舍五入，支持指数、字符串和整分进位', async t => {
+  const { s, m } = await withBound(t);
+  const cases = [
+    ['4.999999999999999999e-3', '0.00'], ['5e-3', '0.01'],
+    ['199.499999999999999999e-2', '1.99'], ['1.995', '2.00'],
+    ['90071992547409.914', '90071992547409.91'], ['90071992547409.915', '0.00']
+  ];
+  for (const encode of [JSON.rawJSON, String]) {
+    m.couponRows = cases.map(([amount], i) => ({
+      title: '测试券' + i, unUseStatus: 1, userCouponCanDisAmount: encode(amount)
+    }));
+    const { coupons } = await prepare(s);
+    assert.deepEqual(coupons.usable.map(coupon => coupon.canDisYuan), cases.map(([, expected]) => expected));
+    assert.equal(coupons.predicted.title, '测试券4');
+  }
+});
+
+test('R25 金额上界可用，超出一分的售价、回执和列表金额均无效', async t => {
+  const { r, s, m } = await withBound(t, { LICHA_MAX_ORDER_AMOUNT_FEN: '9007199254740991' });
+  const limitYuan = '90071992547409.91';
+  m.price = 9007199254740991;
+  assert.equal((await prepare(s)).estimatedTotalYuan, limitYuan);
+  assert.match(r.requests.find(request => request.path === PATHS.coupons).raw, /"price":90071992547409\.91[,}]/);
+  m.price = JSON.rawJSON('9007199254740992');
+  await failure(s, 'prepare_order', basket, /非售卖条目|没有价格/);
+
+  m.price = 2000;
+  const orderNo = number(7);
+  m.override.set(PATHS.create, () => ok({ orderNo, payAmount: JSON.rawJSON('90071992547409.92') }));
+  m.override.set(PATHS.orderDetail, () => ok({ orderNo, userId: memberA, actualAmount: 9007199254740991 }));
+  const receipt = await place(s, await prepare(s));
+  assert.equal(receipt.qmaiPayAmountYuanFromCreate, undefined);
+  assert.equal(receipt.qmaiActualAmountYuan, limitYuan);
+  m.orders = [{ orderNo, userId: memberA, actualAmount: JSON.rawJSON('9007199254740992') }];
+  assert.equal((await success(s, 'my_orders')).orders[0].actualAmountYuan, null);
 });

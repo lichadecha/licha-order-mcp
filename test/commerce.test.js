@@ -561,6 +561,31 @@ test('恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/
   assert.equal((await success(s,'my_orders')).unresolvedPendingWrites,2);
 });
 
+test('UNR-03/07 有单说明列出吻合订单，按支付状态顺序附上三个尾句', async t => {
+  const r = await setup(t, { LICHA_ORDER_MATCH_WINDOW_MS: '1000' });
+  await r.stop();
+  const now = Date.now();
+  const ledger = new Ledger(r.dataDir);
+  try {
+    for (const [i, status] of [10, 60, null].entries()) {
+      const time = now - (3 - i) * 10000;
+      ledger.update({ time, day: beijingTime(time).slice(0, 10), key: digest('request' + i),
+        memberHash: digest(memberA), storeId: shop, totalFen: 2000, state: 'sent' });
+      r.mock.orders.push({ userId: memberA, orderNo: number(i + 1), orderAt: time, status });
+    }
+  } finally {
+    ledger.close();
+  }
+  await r.start();
+  const s = await r.session();
+  await bind(s);
+  const result = await success(s, 'my_orders');
+  assert.equal(result.resolvedPendingWrites, 3);
+  assert.equal(result.pendingWriteNote, `核对结果：此前 3 笔结果未知的下单请求，在企迈侧查到了与它吻合的订单（${[1, 2, 3].map(number).join('、')}），按这张处理，不要重下。`
+    + '请引导顾客去小程序「我的订单」付款。其中 1 笔不是待支付状态，按小程序订单页显示的为准。'
+    + '其中 1 笔状态未查清，请在小程序「我的订单」核对状态。');
+});
+
 test('迟到的订单列表只核对查询开始时的未决 UNR-05', async t => {
   const {r,s,m} = await withBound(t);
   const other = await r.session();

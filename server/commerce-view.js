@@ -1,17 +1,20 @@
 import { beijingTime, digest, integerDigits, projectText, responseId, yuan } from './common.js';
 
-export function numeric(value) {
-  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
 export function toFen(value) {
-  const n = numeric(value);
-  if (n === null) return null;
-  const [mantissa, exponent = '0'] = n.toString().split('e');
-  const rounded = Math.round(Number(mantissa + 'e' + (Number(exponent) + 2)));
-  return Number.isSafeInteger(rounded) ? rounded : null;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(String(value).trim());
+  if (!match) return null;
+  const [, sign, whole, fraction = '', exponent = '0'] = match;
+  const digits = (whole + fraction).replace(/^0+/, '');
+  if (!digits) return 0;
+  if (sign) return null;
+  // 小数点右移两位后，截取整分，只用下一位决定四舍五入。
+  const point = digits.length - fraction.length + Number(exponent) + 2;
+  if (point < 0) return 0;
+  if (point > String(Number.MAX_SAFE_INTEGER).length) return null;
+  const wholeFen = BigInt(digits.slice(0, point).padEnd(point, '0'));
+  const fen = digits[point] >= '5' ? wholeFen + 1n : wholeFen;
+  return fen <= Number.MAX_SAFE_INTEGER ? Number(fen) : null;
 }
 
 export function nonnegativeInteger(value) {
@@ -39,7 +42,7 @@ export function couponView(rows, totalFen, hasCode) {
       unusable.push({ title, reason: projectText(row?.unUseDesc) || '本单不可用' });
       continue;
     }
-    const fen = Math.max(0, toFen(row.userCouponCanDisAmount) ?? 0);
+    const fen = toFen(row.userCouponCanDisAmount) ?? 0;
     const type = nonnegativeInteger(row.couponCenterType);
     const entry = { title, canDisYuan: yuan(fen), ...(type !== null && { couponCenterType: type }) };
     usable.push(entry);
@@ -143,7 +146,7 @@ export function placedView(created, detail, readError, draft, binding) {
     result.warning = `金额与预估不一致：企迈实付 ¥${yuan(actual)}，本地预估 ¥${yuan(draft.totalFen)}，差额 ¥${yuan(diff)}。请先向顾客说清这个差额并核对。`;
   }
   const createFen = toFen(created.payAmount);
-  if (createFen !== null && createFen >= 0) result.qmaiPayAmountYuanFromCreate = yuan(createFen);
+  if (createFen !== null) result.qmaiPayAmountYuanFromCreate = yuan(createFen);
   result.nextStep = actual > 0
     ? `订单已创建但尚未支付。请把企迈实付金额${applied ? '与优惠（按 couponApplied.note）' : ''}如实告诉顾客，${result.warning ? '先说清金额差额并核对，再' : ''}引导顾客去小程序「我的订单」完成付款——我们不代付、不碰任何支付凭据。`
     : `这单读回的实付是 ¥0.00。${applied ? '请按 couponApplied.note 如实说明优惠，' : ''}请让顾客到小程序「我的订单」确认这一单的状态；不要说「去付款」。`;
