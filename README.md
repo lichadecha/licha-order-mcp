@@ -3,16 +3,16 @@
 服务端启动命令（Node 22.13 或更高的 22.x，先设置下表中的环境变量）
 
 ```text
-node "/home/ccuser/projects/lichadecha/mcp-next/server/main.js"
+node "/绝对路径/licha-order-mcp/server/main.js"
 ```
 
 顾客端薄壳启动命令（Node 18 及以上，标准输入输出连接 MCP 客户端）
 
 ```text
-node "/home/ccuser/projects/lichadecha/mcp-next/bin/licha-order-mcp.js"
+node "/绝对路径/licha-order-mcp/bin/licha-order-mcp.js"
 ```
 
-以上是本次仓库的绝对路径。迁移后替换为安装位置，两条命令均可从其他工作目录运行。Windows 客户端可将 `command` 配为 `node`，`args` 填一个元素，例如 `C:\licha\bin\licha-order-mcp.js`。本轮内置服务地址是待替换的占位地址，本机使用时指定 `LICHA_MCP_URL` 和与服务端匹配的 `LICHA_ACCESS_KEY`。
+把 `/绝对路径/licha-order-mcp` 换成仓库实际所在位置，两条命令均可从其他工作目录运行。Windows 客户端可将 `command` 配为 `node`，`args` 填一个元素，例如 `C:\licha\bin\licha-order-mcp.js`。本轮内置服务地址是待替换的占位地址，本机使用时指定 `LICHA_MCP_URL` 和与服务端匹配的 `LICHA_ACCESS_KEY`。
 
 ## 安装与自测
 
@@ -106,9 +106,9 @@ npm test
 在服务所在机器停服，将 `LICHA_DATA_DIR` 设为该实例账本目录的**绝对路径**。以下命令使用本仓库的实际位置。替换尖括号内的参数，说明用双引号括起，避免填入联系方式或凭证。
 
 ```text
-node "/home/ccuser/projects/lichadecha/mcp-next/server/ledger-cli.js" list
-node "/home/ccuser/projects/lichadecha/mcp-next/server/ledger-cli.js" resolve <请求键> found <订单号> "门店已核实该单"
-node "/home/ccuser/projects/lichadecha/mcp-next/server/ledger-cli.js" resolve <请求键> absent "门店已核实没有对应订单"
+node "/绝对路径/licha-order-mcp/server/ledger-cli.js" list
+node "/绝对路径/licha-order-mcp/server/ledger-cli.js" resolve <请求键> found <订单号> "门店已核实该单"
+node "/绝对路径/licha-order-mcp/server/ledger-cli.js" resolve <请求键> absent "门店已核实没有对应订单"
 ```
 
 `list` 将 JSON 数组写到标准输出，无未决时输出 `[]`。每项含 `key`（请求键）、`member`（会员摘要）、`storeId`、`requestedAt`（北京时间）和 `estimatedFen`（预估金额，分）。用其中的 `key` 裁决一笔未决。登记有单时，订单号须为 12 至 40 位 ASCII 英文字母或数字，且尚未被认领。命令成功返回 0。请求键不存在、订单号不合格或已被认领、服务占着账本等错误会保留账本结论，向标准错误写明原因并返回非零。裁决完成后按原配置启动服务。
