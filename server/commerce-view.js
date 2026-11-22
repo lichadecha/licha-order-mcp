@@ -1,4 +1,4 @@
-import { beijingTime, decimalId, digest, projectText, yuan } from './common.js';
+import { beijingTime, digest, integerDigits, projectText, responseId, yuan } from './common.js';
 
 export function numeric(value) {
   if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
@@ -15,9 +15,10 @@ export function toFen(value) {
 }
 
 export function nonnegativeInteger(value) {
-  if (typeof value !== 'number' && !(typeof value === 'string' && /^\d+$/.test(value))) return null;
-  const n = Number(value);
-  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+  const digits = integerDigits(value);
+  if (digits === null) return null;
+  const n = Number(digits);
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 export function couponView(rows, totalFen, hasCode) {
@@ -34,12 +35,12 @@ export function couponView(rows, totalFen, hasCode) {
   let best = 0;
   for (const row of rows) {
     const title = projectText(row?.title) || '（未命名的券）';
-    if (numeric(row?.unUseStatus) !== 1) {
+    if (nonnegativeInteger(row?.unUseStatus) !== 1) {
       unusable.push({ title, reason: projectText(row?.unUseDesc) || '本单不可用' });
       continue;
     }
     const fen = Math.max(0, toFen(row.userCouponCanDisAmount) ?? 0);
-    const type = numeric(row.couponCenterType);
+    const type = nonnegativeInteger(row.couponCenterType);
     const entry = { title, canDisYuan: yuan(fen), ...(type !== null && { couponCenterType: type }) };
     usable.push(entry);
     if (fen > 0 && (!winner || (type === 2 && winner.couponCenterType !== 2)
@@ -73,8 +74,7 @@ function discountView(detail, prediction, actualFen) {
     for (const row of detail.discountList) {
       if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
       const fen = nonnegativeInteger(row.discountAmount);
-      const rawType = decimalId(row.discountType);
-      const type = rawType ? Number(rawType) : null;
+      const type = nonnegativeInteger(row.discountType);
       const name = projectText(row.discountName) || '优惠';
       const summary = projectText(row.discountSummary);
       const entry = { name, ...(summary && { summary }), amountYuan: fen === null ? null : yuan(fen) };
@@ -125,7 +125,7 @@ export function placedView(created, detail, readError, draft, binding) {
   let problem;
   if (!detail || !Object.keys(detail).length) problem = `没读到门店系统的最终金额（${readError || '响应为空'}）`;
   else if (detail.orderNo !== orderNo) problem = '读回的内容对不上这一单，已丢弃';
-  else if (decimalId(detail.userId) !== binding.id) problem = '读回的订单归属校验不通过，内容已丢弃';
+  else if (responseId(detail.userId) !== binding.id) problem = '读回的订单归属校验不通过，内容已丢弃';
   else if (actual === null) problem = '读回里没有可用的实付金额';
   if (problem) {
     result.readbackFailed = true;
@@ -175,8 +175,8 @@ export function reconciledPaymentNote(rows) {
 }
 
 export function rowTime(row) {
-  const value = row?.orderAt ?? row?.createTime;
-  return (typeof value === 'string' || typeof value === 'number') && /^\d{13}$/.test(value) ? Number(value) : null;
+  const digits = integerDigits(row?.orderAt ?? row?.createTime);
+  return digits?.length === 13 ? Number(digits) : null;
 }
 
 export function orderNumber(row) {
@@ -198,11 +198,11 @@ export function listedProducts(row) {
   for (const item of row.itemList) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
     if ([item.itemName, item.goodsName].some(name => name != null && typeof name !== 'string')) return null;
-    const goodsId = decimalId(item.goodsId);
+    const goodsId = responseId(item.goodsId);
     const name = productName(item);
-    const quantity = Number(decimalId(item.num));
+    const quantity = nonnegativeInteger(item.num);
     if ((Object.hasOwn(item, 'goodsId') && !goodsId) || (!goodsId && !name)
-      || !Number.isSafeInteger(quantity) || quantity < 1) return null;
+      || quantity === null || quantity < 1) return null;
     items.push({ goodsId, nameHash: name ? digest(name) : null, quantity });
   }
   return items;
@@ -232,7 +232,8 @@ export function orderView(row, unverified) {
   const items = [];
   for (const item of Array.isArray(row?.itemList) ? row.itemList : []) {
     const name = projectText(productName(item));
-    if (name) items.push(name + (numeric(item.num) > 1 ? ' ×' + numeric(item.num) : ''));
+    const quantity = nonnegativeInteger(item?.num);
+    if (name) items.push(name + (quantity > 1 ? ' ×' + quantity : ''));
   }
   const time = rowTime(row);
   const amount = nonnegativeInteger(row?.actualAmount);

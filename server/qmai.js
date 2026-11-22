@@ -2,7 +2,7 @@ import {createHmac, randomInt} from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import {setTimeout as delay} from 'node:timers/promises';
-import {projectText} from './common.js';
+import {integerDigits, projectText} from './common.js';
 import {consumeSendReceipt} from './ledger.js';
 
 export const PATHS = Object.freeze({
@@ -46,16 +46,28 @@ export function checkSignature() {
 }
 
 const orderReadPaths = new Set([PATHS.orderList, PATHS.orderDetail, PATHS.orderStatus]);
+const transactionPaths = new Set([...orderReadPaths, PATHS.member, PATHS.coupons, PATHS.create]);
 const orderIntegerFields = new Set(['userId', 'total', 'status', 'actualAmount', 'discountAmount',
   'discountType', 'goodsId', 'num', 'storeId', 'orderAt', 'createTime']);
 
 export function parseResponse(raw, path) {
   const orderRead = orderReadPaths.has(path);
-  return JSON.parse(raw, (key, value, context) => {
+  return JSON.parse(raw, function (key, value, context) {
+    if (key === 'code' && this.status === false && transactionPaths.has(path)) {
+      const token = typeof value === 'number' ? context.source : value;
+      if (typeof token === 'string' && /[.eE]/.test(token)) {
+        const digits = integerDigits(token);
+        if (digits === null) return null;
+        return typeof value === 'number' ? Number(digits) : digits;
+      }
+    }
     if (typeof value !== 'number') return value;
+    // 状态回执的订单号只接受字符串，数字不能经大整数转换变成合格单号。
+    if (path === PATHS.orderStatus && key === 'orderNo') return null;
     const token = context.source;
     // 大整数直接取原文。交易证据中的分数和指数也保留词法，让整数校验能识别舍入前的值。
     const integerField = (orderRead && orderIntegerFields.has(key))
+      || (path === PATHS.coupons && (key === 'unUseStatus' || key === 'couponCenterType'))
       || (path === PATHS.member && (key === 'customerId' || key === 'data'));
     return /^-?\d{15,}$/.test(token) || (integerField && /[.eE]/.test(token)) ? token : value;
   });

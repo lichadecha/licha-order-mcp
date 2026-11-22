@@ -1,5 +1,5 @@
 import { currentQuotaDay, issueConfirmation } from './logs.js';
-import { beijingTime, decimalId, digest, tail, yuan } from './common.js';
+import { beijingTime, decimalId, digest, integerDigits, responseId, tail, yuan } from './common.js';
 import { PATHS, readHint } from './qmai.js';
 import { Ledger } from './ledger.js';
 import { couponView, listedProducts, sameProducts, nonnegativeInteger, orderNumber, orderView, placedView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
@@ -34,13 +34,14 @@ function queryError(error, fallback) {
 }
 
 const memberView = b => ({ last4: b.identifierTail, via: b.via });
-const bindingView = b => ({ bound: true, customerIdLast4: tail(b.id), boundVia: b.via, boundAt: beijingTime(b.created) });
+const bindingView = b => ({ bound: true, customerIdLast4: b.customerIdTail, member: memberView(b),
+  boundVia: b.via, boundAt: beijingTime(b.created) });
 const pendingCount = rows => `${rows.length} 笔状态未知${rows[0]?.time ? '，最早一笔发生在 ' + beijingTime(rows[0].time) : ''}`;
-const owner = row => decimalId(row?.userId);
+const owner = row => responseId(row?.userId);
 
 export async function createCommerce(config, qmai, browse, logs) {
   const book = new Ledger(config.LICHA_DATA_DIR);
-  if (book.fault) console.error('安全账本不可用，需要人工检查；已停用下单。');
+  if (book.fault) console.error(book.faultReason ?? '安全账本不可用，需要人工检查；已停用下单。');
   const bindings = new Map();
   const drafts = new Map();
   const flights = new Map();
@@ -65,10 +66,10 @@ export async function createCommerce(config, qmai, browse, logs) {
     let count = 0;
     const now = Date.now();
     for (const draft of drafts.values()) {
-      if (draft.state === 'ready' && now < draft.expires && match(draft)) {
+      if (draft.state === 'ready' && match(draft)) {
+        if (now < draft.expires) count++;
         draft.state = state;
         delete draft.params;
-        count++;
       }
     }
     return count;
@@ -110,10 +111,10 @@ export async function createCommerce(config, qmai, browse, logs) {
     }
     const wrapped = data !== null && typeof data === 'object' && Object.hasOwn(data, 'customerId');
     const value = wrapped ? data.customerId : data;
-    if ((wrapped && value === null) || value === 0 || (typeof value === 'string' && /^0*$/.test(value.trim()))) {
+    const id = integerDigits(value);
+    if ((wrapped && value === null) || id === '0' || (typeof value === 'string' && /^0*$/.test(value.trim()))) {
       reject('not_member', notMember);
     }
-    const id = decimalId(value);
     if (!id) reject('invalid_response', bindFailed);
     const previous = bindings.get(device);
     if (previous?.id === id) {
@@ -123,14 +124,15 @@ export async function createCommerce(config, qmai, browse, logs) {
     const pending = previous ? unresolved(previous.hash) : [];
     if (pending.length) reject('unresolved', `暂时不能换人：上一次下单请求的结果还没核对清楚（${pendingCount(pending)}）。\n先用「看看我最近的订单」把那一单核对掉，再换人——否则那笔单到底成没成就没人能确认了。`);
     const created = Date.now();
-    const binding = { id, hash: digest(id), via: codeType, identifierTail: tail(clean), created, touched: created,
-      ...(codeType === 'phone' && { phone: clean }) };
+    const binding = { id, hash: digest(id), customerIdTail: tail(value), identifierTail: tail(clean),
+      via: codeType, created, touched: created, ...(codeType === 'phone' && { phone: clean }) };
     const discarded = previous ? supersede(draft => draft.device === device && draft.hash === previous.hash, 'rebound') : 0;
     bindings.set(device, binding);
     logs.access({event: previous ? 'rebind' : 'bind', discarded}, {device, memberId:id, previousMemberId:previous?.id});
     if (!previous) return bindingView(binding);
-    return { ...bindingView(binding), rebound: true, previousCustomerIdLast4: tail(previous.id),
-      discardedPendingOrders: discarded, note: `已从${tail(previous.id)}换成${tail(id)}。` +
+    return { ...bindingView(binding), rebound: true, previousCustomerIdLast4: previous.customerIdTail,
+      previousMember: memberView(previous), discardedPendingOrders: discarded,
+      note: `已从${previous.identifierTail}换成${binding.identifierTail}。` +
         (discarded ? `原来那位顾客还没确认的 ${discarded} 张单已作废，需要重新组单。` : '') };
   }
 
@@ -298,8 +300,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     try { row = await qmai.read(PATHS.orderStatus, { orderNo }); }
     catch (error) { throw Error(queryError(error, '查询失败：查无此单或接口异常')); }
     if (!row || typeof row !== 'object') throw Error('查询失败：查无此单或接口异常');
-    const returnedNumber = orderNumber(row);
-    if (returnedNumber && returnedNumber !== orderNo) throw Error('查询失败：返回的订单号与查询不符');
+    if (Object.hasOwn(row, 'orderNo') && orderNumber(row) !== orderNo) throw Error('查询失败：返回的订单号与查询不符');
     if (owner(row) !== b.id) {
       logs.access({event:'ownership_rejected', orderNo}, {device,memberId:b.id});
       throw Error('无法查询：该订单不属于当前绑定的会员');
@@ -321,24 +322,24 @@ export async function createCommerce(config, qmai, browse, logs) {
     catch (error) { throw Error('查询订单列表失败：' + queryError(error, '接口异常')); }
     if (!Array.isArray(data?.data)) throw Error('查询订单列表失败：接口异常');
     const rows = data.data;
-    const owned = rows.filter(row => orderNumber(row) && (!Object.hasOwn(row, 'userId') || owner(row) === b.id));
-    const discarded = rows.length - owned.length;
-    if (discarded) logs.access({event:'ownership_rejected', count:discarded}, {device,memberId:b.id});
-    const visible = owned.filter(row => {
+    const inRange = rows.filter(row => {
       const time = rowTime(row);
       return time === null || (start <= time && time <= end);
     });
-    const outOfRange = owned.length - visible.length;
+    const outOfRange = rows.length - inRange.length;
+    if (outOfRange) logs.access({event:'orders_out_of_range', count:outOfRange}, {device,memberId:b.id});
+    const visible = inRange.filter(row => orderNumber(row) && (!Object.hasOwn(row, 'userId') || owner(row) === b.id));
+    const discarded = inRange.length - visible.length;
+    if (discarded) logs.access({event:'ownership_rejected', count:discarded}, {device,memberId:b.id});
     const list = visible.slice(0, 10).map(row => orderView(row, !Object.hasOwn(row, 'userId')));
     const result = { days, count: list.length, member: memberView(b), ...(discarded && { discardedNotOwned: discarded }),
-      ...(outOfRange && { discardedOutOfRange: outOfRange }),
       orders: list, note: `只列出最近 ${days} 天、最多 10 条本人订单。要看某一单的最新状态用 get_order_status。` };
     const total = nonnegativeInteger(data.total);
     const evidence = visible.map(row => ({
       row, time: rowTime(row), products: listedProducts(row),
-      store: Object.hasOwn(row, 'storeId') ? decimalId(row.storeId) : undefined
+      store: Object.hasOwn(row, 'storeId') ? responseId(row.storeId) : undefined
     }));
-    const complete = total !== null && total <= rows.length && !discarded && !outOfRange
+    const complete = total !== null && total <= rows.length && !discarded
       && evidence.every(entry => entry.time !== null && entry.store !== null && entry.products !== null);
     const known = book.knownOrders();
     const found = [];

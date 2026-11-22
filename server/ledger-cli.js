@@ -27,7 +27,7 @@ function run() {
   }
   const book = new Ledger(directory, {initializeIfEmpty:false});
   try {
-    if (book.fault) throw Error('安全账本不可用，需要人工检查');
+    if (book.fault) throw Error(book.faultReason ?? '安全账本不可用，需要人工检查');
     if (action === 'list') {
       const unresolved = [...book.records.values()].filter(row => ['sent', 'unknown'].includes(row.state));
       console.log(JSON.stringify(unresolved.map(row => ({

@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PATHS } from '../server/qmai.js';
 import {
@@ -59,7 +61,7 @@ test('UNR-03 QRY-04 第十一行也参与唯一性判断，顾客仅看到十行
   assert.match((await success(s, 'my_orders')).pendingWriteNote, new RegExp(number(11)));
 });
 
-test('QRY-04 UNR-02 查询范围外的行计数、丢弃，未来五分钟的订单不能认领未决', async t => {
+test('QRY-04 UNR-02 查询范围外的行丢弃，未来五分钟的订单不能认领未决', async t => {
   const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '600000' });
   const { m, s } = service;
   m.override.set(PATHS.orderList, ({ orderAtStart, orderAtEnd }) => ok({
@@ -67,17 +69,46 @@ test('QRY-04 UNR-02 查询范围外的行计数、丢弃，未来五分钟的订
   }));
   const history = await success(s, 'my_orders', { days: 1 });
   assert.deepEqual(history.orders, []);
-  assert.equal(history.discardedOutOfRange, 2);
+  assert.equal(history.count, 0);
   const at = await unknownOrder(service);
   m.override.delete(PATHS.orderList);
   m.orders = [candidate(at + 300000)];
   const result = await success(s, 'my_orders', { days: 1 });
   assert.equal(result.count, 0);
-  assert.equal(result.discardedOutOfRange, 1);
   assert.equal(result.unresolvedPendingWrites, 1);
   assert.doesNotMatch(result.pendingWriteNote, /小程序「我的订单」付款/);
   m.orders = [candidate(at)];
   assert.equal((await success(s, 'my_orders', { days: 1 })).resolvedPendingWrites, 1);
+});
+
+test('OUT-01 QRY-04 本人及他人的越界行都只写日志，不进入列表出参', async t => {
+  const { r, s, m } = await withBound(t);
+  m.override.set(PATHS.orderList, ({ orderAtStart, orderAtEnd }) => ok({
+    data: [candidate(orderAtStart - 1), { ...candidate(orderAtEnd + 1, 2), userId: memberB },
+      candidate(orderAtStart, 3), candidate(orderAtEnd, 4)], total: 4
+  }));
+  const verified = await success(s, 'my_orders', { days: 1 });
+  assert.deepEqual(Object.keys(verified).sort(), ['count', 'days', 'member', 'note', 'orders']);
+  assert.equal(verified.count, 2);
+  assert.deepEqual(verified.orders.map(row => row.orderNo), [number(3), number(4)]);
+  const access = (await readFile(join(r.logDir, 'access.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.equal(access.find(row => row.event === 'orders_out_of_range')?.count, 2);
+});
+
+test('UNR-04/07 匹配窗已过，整页只有能按时间排除的行时确认无单', async t => {
+  const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '200' });
+  const { m, s } = service;
+  await unknownOrder(service);
+  await delay(300);
+  let total = 2;
+  m.override.set(PATHS.orderList, ({ orderAtStart }) => ok({ total, data: [candidate(orderAtStart - 86400000)] }));
+  assert.equal((await success(s, 'my_orders', { days: 90 })).unresolvedPendingWrites, 1);
+  total = 1;
+  const result = await success(s, 'my_orders', { days: 90 });
+  assert.equal(result.count, 0);
+  assert.equal(result.resolvedPendingWrites, 1);
+  assert.equal(result.unresolvedPendingWrites, undefined);
+  assert.match(result.pendingWriteNote, /企迈侧没有建单/);
 });
 
 test('QRY-04 非约定的订单列表结构报查询失败，空数组可正常显示', async t => {
@@ -111,4 +142,20 @@ test('QRY-02 QRY-03 状态接口回传另一合格单号时拒绝，省略单号
   }
   m.override.delete(PATHS.orderStatus);
   assert.equal((await success(s, 'get_order_status', { orderNo })).status, 10);
+});
+
+test('QRY-02/03 状态回执的单号已提供但不合格时，拒绝返回状态和付款提示', async t => {
+  const { m, s } = await withBound(t);
+  const requested = number(1);
+  for (const orderNo of [number(2) + ' ', [number(2)], null, '']) {
+    m.override.set(PATHS.orderStatus, () => ok({ orderNo, userId: memberA, status: 10 }));
+    const error = await failure(s, 'get_order_status', { orderNo: requested }, /查询失败/);
+    assert.ok(!error.includes(number(2)));
+    assert.doesNotMatch(error, /待支付|付款/);
+  }
+  const digits = '9000000000000001';
+  m.override.set(PATHS.orderStatus, () => ok({ orderNo: JSON.rawJSON(digits), userId: memberA, status: 10 }));
+  await failure(s, 'get_order_status', { orderNo: digits }, /查询失败/);
+  m.override.set(PATHS.orderStatus, () => ok({ orderNo: requested, userId: memberA, status: 10 }));
+  assert.equal((await success(s, 'get_order_status', { orderNo: requested })).status, 10);
 });

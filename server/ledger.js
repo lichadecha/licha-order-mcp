@@ -10,6 +10,8 @@ import { orderNumber } from './commerce-view.js';
 
 const checksum = text => createHash('sha256').update(text).digest('hex');
 const bookName = 'orders.json';
+const memberHashVersion = 'sha256-canonical-decimal-v1';
+const digestCutover = '安全账本的会员摘要口径未标明或不兼容。请按规格 §8 第 8 项停掉旧版写入，核清未决请求与当日额度后用空账本切换。';
 // 保留已部署版本的文件名，库中保存快照撤销记录。
 const journalName = '.ledger-lock.sqlite';
 const reviewName = '.orders-need-review';
@@ -76,7 +78,7 @@ export class Ledger {
       const files = readdirSync(this.directory);
       const fresh = files.length === 0;
       if (fresh && !initializeIfEmpty) return;
-      if (!fresh && (!files.includes(journalName) || !files.includes(bookName) || files.includes(reviewName))) {
+      if (!fresh && (!files.includes(journalName) || !files.includes(bookName))) {
         throw Error('账本组成不完整或需要人工核对');
       }
       if (fresh) closeSync(openSync(this.journalFile, 'wx', 0o600));
@@ -94,26 +96,39 @@ export class Ledger {
       )`);
       this.journalIdentity = statSync(this.journalFile);
       if (fresh) {
-        this.#save(new Map(), true);
+        this.#save(new Map(), {initial:true});
       } else {
-        let bytes = readFileSync(this.file, 'utf8');
+        const current = readFileSync(this.file);
         const pending = this.journal.prepare('SELECT previous, candidate_hash FROM pending_snapshot WHERE id=1').get();
-        if (pending) {
-          // 两次提交之间退出时，只接受日志记载的旧、候选两种现场。
-          if (bytes !== pending.previous && checksum(bytes) !== pending.candidate_hash) throw Error('快照与撤销记录不符');
-          bytes = pending.previous;
+        const hasReview = files.includes(reviewName);
+        const previous = pending ? Buffer.from(pending.previous, 'utf8') : current;
+        if (hasReview && !readFileSync(join(this.directory, reviewName)).equals(previous)) {
+          throw Error('人工核对标记无法与撤销记录核实');
         }
+        // 两次提交之间退出时，只接受日志记载的旧、候选两种现场。
+        if (pending && !current.equals(previous) && checksum(current) !== pending.candidate_hash) throw Error('快照与撤销记录不符');
+        const bytes = new TextDecoder('utf-8', {fatal:true, ignoreBOM:true}).decode(previous);
         const envelope = JSON.parse(bytes);
         if (envelope.version !== 1 || !Array.isArray(envelope.records)
           || envelope.checksum !== checksum(JSON.stringify(envelope.records))
           || !envelope.records.every(validateRecord)) throw Error('损坏');
-        this.records = new Map(envelope.records.map(row => [row.key, row]));
-        if (this.records.size !== envelope.records.length) throw Error('重复');
+        if (envelope.memberHashVersion !== memberHashVersion
+          && (envelope.records.length || Object.hasOwn(envelope, 'memberHashVersion'))) {
+          this.faultReason = digestCutover;
+          throw Error(digestCutover);
+        }
+        const recovered = new Map(envelope.records.map(row => [row.key, row]));
+        if (recovered.size !== envelope.records.length) throw Error('重复');
+        if (pending) this.#replaceFile(bytes);
+        if (hasReview) {
+          unlinkSync(join(this.directory, reviewName));
+          this.#syncDirectory();
+        }
         if (pending) {
-          this.#replaceFile(bytes);
           this.journal.exec('DELETE FROM pending_snapshot WHERE id=1');
         }
         this.lastBytes = bytes;
+        this.records = recovered;
         for (const record of this.records.values()) rememberAuditFields(record);
       }
     } catch {
@@ -146,23 +161,23 @@ export class Ledger {
     try { fsyncSync(directory); } finally { closeSync(directory); }
   }
 
-  #save(records, initial = false) {
+  #save(records, {initial = false, beforeSend = false} = {}) {
     if (this.fault) throw Error('安全账本不可用，需要人工检查');
     try {
       const journalFile = statSync(this.journalFile);
       if (journalFile.dev !== this.journalIdentity.dev || journalFile.ino !== this.journalIdentity.ino) throw Error('账本数据库已替换');
       const rows = [...records.values()];
-      const bytes = JSON.stringify({ version: 1, records: rows, checksum: checksum(JSON.stringify(rows)) }) + '\n';
+      const bytes = JSON.stringify({ version: 1, memberHashVersion, records: rows, checksum: checksum(JSON.stringify(rows)) }) + '\n';
       if (!initial) {
         const prior = openSync(this.file, 'r+');
         try {
-          if (readFileSync(prior, 'utf8') !== this.lastBytes) throw Error('账本已更改');
+          if (!readFileSync(prior).equals(Buffer.from(this.lastBytes))) throw Error('账本已更改');
         } finally { closeSync(prior); }
         // SQLite 单语句事务先确认撤销记录，替换、同步任一步失败都保留它。
         this.journal.prepare('INSERT INTO pending_snapshot VALUES (1, ?, ?)').run(this.lastBytes, checksum(bytes));
       }
       this.#replaceFile(bytes);
-      if (!initial) this.#confirmSnapshot(bytes);
+      if (!initial) this.#confirmSnapshot(bytes, beforeSend);
       this.records = records;
       this.lastBytes = bytes;
     } catch {
@@ -171,11 +186,15 @@ export class Ledger {
     }
   }
 
-  #confirmSnapshot(candidate) {
-    // SQLite 可能在提交生效后才报错。先同步独立标记，确保持续只读时也能拒绝启动写路径。
+  #confirmSnapshot(candidate, beforeSend) {
+    // 独立标记保留写前快照，启动时可与 SQLite 撤销行交叉核验。
     const review = join(this.directory, reviewName);
     writeFileSync(review, this.lastBytes, {flag:'wx', mode:0o600, flush:true});
     this.#syncDirectory();
+    if (beforeSend) {
+      this.#confirmSending(candidate, review);
+      return;
+    }
     try {
       this.journal.exec('DELETE FROM pending_snapshot WHERE id=1');
     } catch (error) {
@@ -194,6 +213,37 @@ export class Ledger {
     } catch { this.fault = true; }
   }
 
+  #confirmSending(candidate, review) {
+    // 清理期间 SQLite 删除仍在事务中。即使 unlink 已生效才报错，撤销行也能随回滚恢复。
+    this.journal.exec('BEGIN IMMEDIATE');
+    try {
+      this.journal.exec('DELETE FROM pending_snapshot WHERE id=1');
+      unlinkSync(review);
+      this.#syncDirectory();
+    } catch (error) {
+      this.journal.exec('ROLLBACK');
+      throw error;
+    }
+    try {
+      this.journal.exec('COMMIT');
+    } catch (error) {
+      // COMMIT 可能已经生效才报错。优先恢复撤销行或原文件。
+      try { this.journal.exec('ROLLBACK'); } catch { /* 事务可能已结束。 */ }
+      try {
+        this.#restoreOnUncertainCommit(candidate);
+      } catch {
+        try {
+          writeFileSync(review, this.lastBytes, {flag:'wx', mode:0o600, flush:true});
+          this.#syncDirectory();
+        } catch {
+          // 目录只读也能写已有快照；回写中断时，截断或校验不符将阻止加载。
+          writeFileSync(this.file, this.lastBytes, {flag:'w', flush:true});
+        }
+      }
+      throw error;
+    }
+  }
+
   #restoreOnUncertainCommit(candidate) {
     try {
       this.journal.prepare('INSERT OR REPLACE INTO pending_snapshot VALUES (1, ?, ?)').run(this.lastBytes, checksum(candidate));
@@ -202,9 +252,9 @@ export class Ledger {
     this.#replaceFile(this.lastBytes);
   }
 
-  #persistRecord(record) {
+  #persistRecord(record, options) {
     if (!validateRecord(record)) throw Error('账本记录无效');
-    this.#save(new Map(this.records).set(record.key, record));
+    this.#save(new Map(this.records).set(record.key, record), options);
     rememberAuditFields(record);
   }
 
@@ -214,7 +264,7 @@ export class Ledger {
 
   recordSending(record, attempt) {
     if (record.state !== 'sent' || this.records.has(record.key)) throw Error('发送前记录无效或重复');
-    this.#persistRecord(record);
+    this.#persistRecord(record, {beforeSend:true});
     const receipt = Object.freeze({});
     sendReceipts.set(receipt, attempt);
     return receipt;

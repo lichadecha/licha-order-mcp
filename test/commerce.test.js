@@ -934,7 +934,7 @@ let removed = false;
 const db = DatabaseSync.prototype, exec = db.exec, prepare = db.prepare, rename = fs.renameSync;
 db.exec = function(sql) {
   const result = exec.call(this,sql);
-  if (sql === 'DELETE FROM pending_snapshot WHERE id=1') {
+  if (sql === 'COMMIT') {
     if (prepare.call(this,'SELECT 1 FROM pending_snapshot WHERE id=1').get()) throw Error('撤销记录仍在');
     removed = true;
     fs.writeFileSync(join(process.env.LICHA_DATA_DIR,'mock-undo-deleted'),'1');

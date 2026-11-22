@@ -44,7 +44,7 @@ export async function setup(t, env = {}) {
       }
     }
   });
-  return { ...r, mock };
+  return Object.assign(r, { mock });
 }
 export async function success(s, tool, args) {
   const result = await s.call(tool, args);
