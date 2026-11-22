@@ -1,0 +1,225 @@
+import { beijingTime, digest, projectText, yuan } from './common.js';
+
+export function numeric(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+export function toFen(value) {
+  const n = numeric(value);
+  if (n === null) return null;
+  const [mantissa, exponent = '0'] = n.toString().split('e');
+  const rounded = Math.round(Number(mantissa + 'e' + (Number(exponent) + 2)));
+  return Number.isSafeInteger(rounded) ? rounded : null;
+}
+
+function amountFen(value) {
+  const n = numeric(value);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+export function couponView(rows, totalFen, hasCode) {
+  const usable = [];
+  const unusable = [];
+  const output = { available: Array.isArray(rows), usable, unusable };
+  if (!output.available) {
+    output.note = hasCode
+      ? '券信息暂时没查到；下单后以门店系统读回的实付为准，如有优惠会在读回里体现。'
+      : '这家门店暂时查不了券；下单后以门店系统读回的实付为准。';
+    return output;
+  }
+  let winner;
+  let best = 0;
+  for (const row of rows) {
+    const title = projectText(row?.title) || '（未命名的券）';
+    if (numeric(row?.unUseStatus) !== 1) {
+      unusable.push({ title, reason: projectText(row?.unUseDesc) || '本单不可用' });
+      continue;
+    }
+    const fen = Math.max(0, toFen(row.userCouponCanDisAmount) ?? 0);
+    const type = numeric(row.couponCenterType);
+    const entry = { title, canDisYuan: yuan(fen), ...(type !== null && { couponCenterType: type }) };
+    usable.push(entry);
+    if (fen > 0 && (!winner || (type === 2 && winner.couponCenterType !== 2)
+      || ((type === 2) === (winner.couponCenterType === 2) && fen > best))) {
+      winner = entry;
+      best = fen;
+    }
+  }
+  if (winner) {
+    const payAfterYuan = yuan(Math.max(0, totalFen - best));
+    output.predicted = { title: winner.title, canDisYuan: winner.canDisYuan, payAfterYuan,
+      basis: winner.couponCenterType === 2 ? 'auto_type' : 'max_discount' };
+    output.note = `顾客有 ${usable.length} 张券可用于本单。念单时要加一句：「系统默认会用你的『${winner.title}』，省 ${winner.canDisYuan} 元，实付大约 ¥${payAfterYuan}」。这是按企迈默认用券规则的预测，下单后以读回为准。`;
+  } else if (usable.length) {
+    output.note = '查到可用券但抵扣金额都为 0，念单时不用提券。';
+  } else {
+    output.note = `顾客没有可用于本单的券${unusable.length ? '（' + unusable.length + ' 张不可用）' : ''}，念单时不用提券。`;
+  }
+  return output;
+}
+
+// 企迈契约 §4 提供了这些非券类型；新类型需有依据才能分类。
+const otherDiscountTypes = new Set([3, 5, 6, 8, 10, 12, 21, 70, 71]);
+
+function discountView(detail, prediction, actualFen) {
+  const items = [];
+  if (Array.isArray(detail.discountList)) {
+    for (const row of detail.discountList) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+      const fen = amountFen(row.discountAmount);
+      const rawType = decimalId(row.discountType);
+      const type = rawType ? Number(rawType) : null;
+      const name = projectText(row.discountName) || '优惠';
+      const summary = projectText(row.discountSummary);
+      const entry = { name, ...(summary && { summary }), amountYuan: fen === null ? null : yuan(fen) };
+      if (type === 2 || otherDiscountTypes.has(type)) entry.isCoupon = type === 2;
+      items.push(entry);
+    }
+  }
+  if (!prediction && !items.length) return;
+  const result = { items };
+  const description = items.map(item => (item.summary || item.name)
+    + (item.amountYuan === null ? '（金额未知）' : `（抵 ¥${item.amountYuan}）`)).join('；');
+  const coupons = items.filter(item => item.isCoupon);
+  if (coupons.length) {
+    if (!prediction) result.note = `门店系统自动使用了优惠券：${description}。请如实告知顾客「系统自动用了你的券」，不是算错。`;
+    else {
+      result.matchesPrediction = coupons.some(item => [item.name, item.summary].some(text => text?.includes(prediction.title)));
+      result.note = result.matchesPrediction ? `与组单时告知的一致：${description}。`
+        : `与组单时告知的不一致——念单时说的是「${prediction.title}」，实际用的是：${description}。${actualFen > 0 ? '请如实更正后再引导付款。' : '请如实更正。'}`;
+    }
+  } else if (items.some(item => item.isCoupon === undefined)) {
+    result.note = `门店系统自动给了优惠：${description}。读回里看不出这是不是优惠券，请如实告知顾客有这笔优惠。`;
+  } else if (items.length) {
+    result.note = `门店系统自动给了优惠：${description}。这不是用券，请如实告知顾客。`;
+    if (prediction) {
+      result.matchesPrediction = false;
+      result.note += `念单时说的「${prediction.title}」没有被使用。`;
+    }
+  } else if (amountFen(detail.discountAmount) === 0) {
+    result.matchesPrediction = false;
+    result.note = `组单时预测会用「${prediction.title}」，读回显示这单没有任何优惠——请按读回实付如实告知，别再说用了券。`;
+  } else {
+    result.note = `组单时预测会用「${prediction.title}」，但读回里没取到优惠明细，无法确认是否用券；请按读回实付如实告知。`;
+  }
+  return result;
+}
+
+export function placedView(created, detail, readError, draft, binding) {
+  const { orderNo } = created;
+  const actual = amountFen(detail?.actualAmount);
+  const result = { placed: true, orderNo };
+  let problem;
+  if (!detail || !Object.keys(detail).length) problem = `没读到门店系统的最终金额（${readError || '响应为空'}）`;
+  else if (detail.orderNo !== orderNo) problem = '读回的内容对不上这一单，已丢弃';
+  else if (decimalId(detail.userId) !== binding.id) problem = '读回的订单归属校验不通过，内容已丢弃';
+  else if (actual === null) problem = '读回里没有可用的实付金额';
+  if (problem) {
+    result.readbackFailed = true;
+    result.readbackNote = `订单已创建成功（订单号 ${orderNo}），但${problem}。请让顾客在小程序「我的订单」核对金额后再付款。`;
+    result.nextStep = '订单已创建，但最终金额没有核实，不要向顾客报金额。请让顾客在小程序「我的订单」核对金额后再付款——我们不代付、不碰任何支付凭据。';
+    return result;
+  }
+  result.estimatedTotalYuan = yuan(draft.totalFen);
+  result.qmaiActualAmountYuan = yuan(actual);
+  const diff = actual - draft.totalFen;
+  result.diffYuan = yuan(diff);
+  const applied = discountView(detail, draft.prediction, actual);
+  if (applied) result.couponApplied = applied;
+  if (Math.abs(diff) > Math.min(100, Math.round(draft.totalFen / 20))) {
+    result.warning = `金额与预估不一致：企迈实付 ¥${yuan(actual)}，本地预估 ¥${yuan(draft.totalFen)}，差额 ¥${yuan(diff)}。请先向顾客说清这个差额并核对。`;
+  }
+  const createFen = toFen(created.payAmount);
+  if (createFen !== null && createFen >= 0) result.qmaiPayAmountYuanFromCreate = yuan(createFen);
+  result.nextStep = actual > 0
+    ? `订单已创建但尚未支付。请把企迈实付金额${applied ? '与优惠（按 couponApplied.note）' : ''}如实告诉顾客，${result.warning ? '先说清金额差额并核对，再' : ''}引导顾客去小程序「我的订单」完成付款——我们不代付、不碰任何支付凭据。`
+    : `这单读回的实付是 ¥0.00。${applied ? '请按 couponApplied.note 如实说明优惠，' : ''}请让顾客到小程序「我的订单」确认这一单的状态；不要说「去付款」。`;
+  return result;
+}
+
+const statuses = new Map([[10, '待支付'], [15, '支付中'], [20, '已支付'], [30, '待备餐'],
+  [40, '待取餐'], [50, '已完成'], [60, '已取消'], [70, '已关闭']]);
+export function statusView(raw, hints = false) {
+  const status = numeric(raw);
+  const statusText = status === null ? '状态未知' : statuses.get(status) ?? `未知状态(${status})`;
+  if (!hints) return { status, statusText };
+  let paymentHint = '这张单的状态暂时没查清，请按小程序订单页显示的为准。';
+  if (status === 10) paymentHint = '这张单还没付款，请引导顾客去小程序「我的订单」完成付款。';
+  if (status === 15) paymentHint = '这张单正在支付中，请顾客在小程序里看支付结果。';
+  if ([20, 30, 40].includes(status)) paymentHint = `这张单已经付款（当前「${statusText}」），按小程序订单页的提示取餐即可。`;
+  if ([50, 60, 70].includes(status)) paymentHint = `这张单已经是「${statusText}」，不需要再付款。`;
+  return { status, statusText, paymentHint };
+}
+
+export function decimalId(value) {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return String(value);
+  return typeof value === 'string' && /^\d+$/.test(value) && /[1-9]/.test(value) ? value : null;
+}
+
+export function rowTime(row) {
+  const value = row?.orderAt ?? row?.createTime;
+  return (typeof value === 'string' || typeof value === 'number') && /^\d{13}$/.test(value) ? Number(value) : null;
+}
+
+export function orderNumber(row) {
+  return typeof row?.orderNo === 'string' && /^[A-Za-z0-9]{12,40}$/.test(row.orderNo) ? row.orderNo : '';
+}
+
+function productName(item) {
+  for (const name of [item?.itemName, item?.goodsName]) {
+    if (typeof name === 'string' && name.trim()) return name;
+  }
+  return '';
+}
+
+// undefined 表示上游没有提供商品字段，null 表示字段形状有误。
+export function listedProducts(row) {
+  if (!Object.hasOwn(row, 'itemList')) return undefined;
+  if (!Array.isArray(row.itemList)) return null;
+  const items = [];
+  for (const item of row.itemList) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    if ([item.itemName, item.goodsName].some(name => name != null && typeof name !== 'string')) return null;
+    const goodsId = decimalId(item.goodsId);
+    const name = productName(item);
+    const quantity = Number(decimalId(item.num));
+    if ((Object.hasOwn(item, 'goodsId') && !goodsId) || (!goodsId && !name)
+      || !Number.isSafeInteger(quantity) || quantity < 1) return null;
+    items.push({ goodsId, nameHash: name ? digest(name) : null, quantity });
+  }
+  return items;
+}
+
+export function sameProducts(expected, observed) {
+  if (observed === undefined) return true;
+  if (!expected || !observed) return false;
+  const quantities = new Map();
+  for (const product of expected) {
+    quantities.set(product.goodsId, (quantities.get(product.goodsId) || 0) + product.quantity);
+  }
+  for (const item of observed) {
+    const matches = expected.filter(product => (!item.goodsId || product.goodsId === item.goodsId)
+      && (!item.nameHash || item.nameHash === product.nameHash));
+    const ids = new Set(matches.map(product => product.goodsId));
+    if (ids.size !== 1) return false;
+    const [id] = ids;
+    const remaining = quantities.get(id) - item.quantity;
+    if (remaining < 0) return false;
+    quantities.set(id, remaining);
+  }
+  return [...quantities.values()].every(count => count === 0);
+}
+
+export function orderView(row, unverified) {
+  const items = [];
+  for (const item of Array.isArray(row?.itemList) ? row.itemList : []) {
+    const name = projectText(productName(item));
+    if (name) items.push(name + (numeric(item.num) > 1 ? ' ×' + numeric(item.num) : ''));
+  }
+  const time = rowTime(row);
+  const amount = amountFen(row?.actualAmount);
+  return { orderNo: orderNumber(row), ...statusView(row?.status), actualAmountYuan: amount === null ? null : yuan(amount),
+    ...(time && { orderTime: beijingTime(time) }), items, ...(unverified && { unverified: true }) };
+}

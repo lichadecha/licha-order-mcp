@@ -1,0 +1,27 @@
+{
+  "name": "licha-order-mcp",
+  "version": "1.0.0",
+  "description": "李茶的茶点单 MCP 顾客端薄壳",
+  "type": "module",
+  "bin": {
+    "licha-order-mcp": "bin/licha-order-mcp.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "rebuild:runtimes": "node scripts/build-runtimes.js"
+  },
+  "overrides": {
+    "@hono/node-server": "^1.19.9"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "eventsource-parser": "3.1.1",
+    "esbuild": "0.28.2"
+  }
+}
