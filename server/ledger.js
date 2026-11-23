@@ -27,6 +27,7 @@ const isDigest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(val
 function validateRecord(record) {
   return record && isDigest(record.key) && isDigest(record.memberHash)
     && typeof record.storeId === 'string' && decimalId(record.storeId) !== null
+    && (record.couponChoice === undefined || record.couponChoice === 'none' || record.couponChoice === 'default')
     && (record.products === undefined || (Array.isArray(record.products) && record.products.length >= 1
       && record.products.length <= 20 && record.products.every(item => item && typeof item.goodsId === 'string'
         && decimalId(item.goodsId) === item.goodsId && (item.nameHash === null || isDigest(item.nameHash))
@@ -42,7 +43,10 @@ function validateRecord(record) {
 
 const persistedFields = new WeakMap();
 function rememberAuditFields(record) {
-  persistedFields.set(record, Object.freeze({requestKey:record.key, quotaDate:record.day}));
+  // v1.8 的旧记录只可能是默认用券。
+  persistedFields.set(record, Object.freeze({
+    requestKey:record.key, quotaDate:record.day, couponChoice:record.couponChoice ?? 'default'
+  }));
 }
 export function persistedAuditFields(record) {
   return persistedFields.get(record);

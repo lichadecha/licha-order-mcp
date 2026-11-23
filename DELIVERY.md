@@ -1,8 +1,19 @@
-# 李茶的茶点单 MCP v1.8 交付清单
+# 李茶的茶点单 MCP v1.9 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.8 订单列表的下单时间
+## v1.9 这单不用券
+
+**已验证（本地模拟企迈）**
+
+- `prepare_order` 的 `couponChoice` 只接受 `default` 和 `none`。缺省和显式默认都按原规则筛券、预测。同一份完整请求样本在 v1.8 基线 `a7aaf35` 和本版均通过，覆盖字段、取值和长编号的 JSON 数字类型。不用券时筛券请求为 0 次，创建请求只在顶层增加 R26 三项，字段错层、缺项或值不符会在签发令牌前被拒绝。[组单与创建请求](test/coupon-preparation.test.js)
+- 用券选择和完整请求一起登记。即使同一会员换设备重新组单，旧令牌也会作废。提交时重新核对登记的选择，企迈明确拒绝不用券时只发一次创建请求。[换选择与提交](test/order-preparation.test.js)
+- 不用券的读回覆盖五种证据情形。确定用了券且实付大于零时，先请顾客决定是否接受该金额。实付为零时引导核对订单状态。读回失败会提醒核对金额和用券。默认用券沿用预测比对。[读回与付款指引](test/coupon-readback.test.js)
+- 写审计从本设备签发的令牌取用券选择，未命中时省略该字段。未决请求在重启后核对仍保留原选择，v1.8 账本按默认用券处理。[写审计与恢复](test/coupon-audit.test.js)
+
+**全量回归。** Linux、Node 22.23.1，使用假凭证和本机回环模拟企迈运行 `npm test`。原有 153 项与新增 15 项共 168 项全部通过，失败、跳过和取消均为 0。
+
+## v1.8 订单列表的下单时间（历史记录）
 
 6.1.6 列表行优先读取 `createdAt`，按北京时间解析到该秒的起点。缺失或为 null 时沿用 `orderAt`、`createTime` 的 13 位毫秒。已提供的时间格式错误或日期不存在时，本人订单仍可展示，省略下单时间，该行也不能用于认领或证明无单。订单展示、查询起止边界、UNR-03 匹配窗和 UNR-04 完整性判断共用这一取法。[实现](server/commerce-view.js) · [格式和兼容测试](test/order-query.test.js)
 
@@ -165,7 +176,8 @@
 | --- | --- |
 | SHL-01、SHL-02、SHL-07 | Windows、macOS 真机和两种实际 AI 客户端未验证，Windows 跳过 POSIX 权限位断言。此前版本在 Linux Node 18.0.0 离线安装后完成过握手、列工具和查询；本轮薄壳在 Node 18 上未复测。生产地址与公开标签安装待定（P5）。 |
 | LED-03、LED-06 | 已用进程强杀、同步错误注入与磁盘文件损坏验证恢复。物理断电、损坏的存储硬件以及网络文件系统锁语义未验证。部署目标为本机持久化文件系统。 |
-| BND-10、PRE-06、PRE-07、WRT-17/19 | 未连接真实企迈、未创建或付款。真实身份持有证明、非零加价的价格单位、默认或指定用券及全额抵扣后状态仍待真实环境核实（P1、P2）。 |
+| PRE-12、WRT-20、P1 | 本服务在真实企迈下单后的用券和实付仍待联调。契约 §3.10.4 记录的 11-23 两笔探针测试覆盖一张普通券，自动生效类券和非券活动的表现仍待验证。指定用哪张券排在第二版。 |
+| BND-10、PRE-06、WRT-19 | 真实身份持有证明、非零加价的价格单位及全额抵扣后的订单状态仍待真实环境核实。 |
 | SES-04、WRT-09、§8 | 实际开放时的绑定时长和额度仍待确认（P3、P4）。生产部署、旧版停单及人工清算未执行。 |
 | 独立验收 | 第五轮黑盒结果由负责人提供。v1.4 尚未经新一轮独立黑盒复验。本地只使用假钥匙与回环 HTTP。 |
 | 品牌 Skill 话术 | 根目录 `SKILL.md` 已使用 `member.last4`。本轮验证到 MCP 工具出参，未验证实际 AI 客户端的口播。 |
@@ -187,7 +199,7 @@
 
 ## 逐项实现与测试
 
-下表列出规格 §5 的全部 105 个 ID。链接指向实现模块与测试定义，同一端到端用例可验证多条规则。测试中使用的故障、时钟偏移和假钥匙均不属于生产配置。
+下表列出规格 §5 的全部 107 个 ID。链接指向实现模块与测试定义，同一端到端用例可验证多条规则。测试中使用的故障、时钟偏移和假钥匙均不属于生产配置。
 
 ### 会话和设备
 
@@ -256,6 +268,7 @@
 | PRE-09 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | PRE-10 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | PRE-11 | [server/commerce.js](server/commerce.js) · prepare | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[PRE-11 自动认领与停服人工裁决均按发出时刻提醒再下单](test/commerce.test.js#L651) |
+| PRE-12 | [server/tools.js](server/tools.js) · [prepare](server/commerce.js) | [可选入参、两种创建请求和查券次数](test/coupon-preparation.test.js) · [跨设备换选择](test/order-preparation.test.js) |
 
 ### 下单
 
@@ -280,6 +293,7 @@
 | WRT-17 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229)<br>[WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额](test/commerce.test.js#L718) |
 | WRT-18 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229) |
 | WRT-19 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229)<br>[WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额](test/commerce.test.js#L718) |
+| WRT-20 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [五种证据、实付分支和读回失败](test/coupon-readback.test.js) |
 
 ### 账本
 

@@ -2,9 +2,59 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PATHS } from '../server/qmai.js';
 import {
-  argsFor, basket, bookRecords, failure, memberA, number, ok, place, prepare,
+  argsFor, basket, bind, bookRecords, count, failure, memberA, number, ok, place, prepare,
   shop, skuId, success, withBound
 } from '../test-support/commerce.js';
+
+test('PRE-09/12 WRT-01/10 同一会员跨设备切换用券选择后只有新版能提交', async t => {
+  const { r, s, m } = await withBound(t);
+  const other = await r.session();
+  await bind(other);
+  const original = await prepare(s);
+  const revised = await success(other, 'prepare_order', { ...basket, couponChoice: 'none' });
+  assert.equal(revised.supersededPendingOrders, 1);
+  await failure(s, 'place_order', argsFor(original), /被更新的一版替代/);
+  await failure(other, 'place_order', { ...argsFor(revised), couponChoice: 'default' }, /多余的：couponChoice/);
+  assert.equal(count(r, PATHS.create), 0);
+
+  // 签发后上游已换规格，提交仍应发送顾客确认的规格、杯数与用券选择。
+  m.override.set(PATHS.item, () => ok([{ goodsId: basket.items[0].goodsId, name: '测试茶',
+    goodsSkuList: [{ skuId: '12345', salePrice: 3000, clearStatus: 1 }] }]));
+  const reads = count(r, PATHS.item);
+  assert.equal((await place(other, revised)).couponApplied.matchesChoice, true);
+  const [create] = r.requests.filter(request => request.path === PATHS.create);
+  assert.equal(create.params.items[0].skuId, skuId);
+  assert.equal(create.params.items[0].num, 1);
+  assert.deepEqual(create.params.lastSelect, { type: -1, value: '' });
+  assert.equal(count(r, PATHS.item), reads);
+  assert.equal(count(r, PATHS.create), 1);
+
+  const unused = await success(other, 'prepare_order', { ...basket, couponChoice: 'none' });
+  const restored = await prepare(s);
+  assert.equal(restored.supersededPendingOrders, 1);
+  await failure(other, 'place_order', argsFor(unused), /被更新的一版替代/);
+  await place(s, restored);
+  const latest = r.requests.filter(request => request.path === PATHS.create).at(-1);
+  assert.equal(latest.params.items[0].skuId, 12345);
+  assert.ok(!Object.hasOwn(latest.params, 'lastSelect'));
+  assert.equal(count(r, PATHS.create), 2);
+});
+
+test('R26 WRT-10/12/14 不用券被明确拒绝只发送一次，令牌作废并释放名额', async t => {
+  const { r, s, m } = await withBound(t, { LICHA_MAX_ORDERS_PER_DAY: '1' });
+  m.override.set(PATHS.create, () => ({ status: false, code: 100002, message: '模拟拒绝' }));
+  const draft = await success(s, 'prepare_order', { ...basket, couponChoice: 'none' });
+  await failure(s, 'place_order', argsFor(draft), /下单失败：模拟拒绝/);
+  await failure(s, 'place_order', argsFor(draft), /确认令牌无效/);
+  assert.equal(count(r, PATHS.create), 1);
+  assert.equal(count(r, PATHS.orderDetail), 0);
+  assert.equal(r.requests.find(request => request.path === PATHS.create).params.attendCouponType, 1);
+  assert.equal(bookRecords(r)[0].state, 'failed');
+  m.override.delete(PATHS.create);
+  const next = await success(s, 'prepare_order', { ...basket, couponChoice: 'none' });
+  assert.equal((await place(s, next)).placed, true);
+  assert.equal(count(r, PATHS.create), 2);
+});
 
 test('WRT-17 OUT-02 按完整券名及摘要比对，类型不明的同名优惠保留不确定', async t => {
   const { s, m } = await withBound(t);

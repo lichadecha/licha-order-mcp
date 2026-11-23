@@ -54,7 +54,7 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
     state.times = state.times.filter(t => t > now - 60000);
     if (state.times.length >= config.LICHA_RATE_CALLS_PER_DEVICE_PER_MIN) {
       logs.access({event:'rate_limited',reason:'device_calls'},source);
-      if (commerce && name === 'place_order') logs.write({outcome:'rejected',reason:'device_rate'},source);
+      if (commerce && name === 'place_order') commerce.logPlaceRejection('device_rate',args.confirmToken,s.device);
       return toolError('操作太频繁，请稍等一下再试。');
     }
     state.times.push(now);
@@ -65,12 +65,12 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
       if (name === 'place_order') {
         const extra = extraPlaceField(args);
         if (extra !== undefined) {
-          logs.write({outcome:'rejected',reason:'WRT-01'},source);
+          commerce.logPlaceRejection('WRT-01',args.confirmToken,s.device);
           return toolError('place_order 只接受 confirmToken 与 confirmAmountYuan 两个参数（收到多余的：' + projectText(extra) + '）。会员身份只能由服务端按设备绑定注入，不接受调用方传入。');
         }
       }
       if (!validators.get(name)(args) || (Object.hasOwn(args,'storeId') && !decimalId(args.storeId))) {
-        if (name === 'place_order') logs.write({outcome:'rejected',reason:'invalid_arguments'},source);
+        if (name === 'place_order') commerce.logPlaceRejection('invalid_arguments',args.confirmToken,s.device);
         if (name === 'bind_member') logs.access({event:'bind_rejected',reason:'invalid_arguments'},source);
         return toolError('工具参数的类型、取值或必填字段不符合要求。');
       }
