@@ -110,7 +110,7 @@ test('QRY-02/04 WRT-18 UNR-03 R25 原始会员编号有非零小数或指数溢�
     assert.equal(list.unresolvedPendingWrites, 1);
     for (const member of [token, `{"customerId":${token}}`]) {
       r.mock.override.set(PATHS.member, (_, { res }) => rawReply(member, res));
-      await failure(unbound, 'bind_member', { code: phone, codeType: 'phone' }, /查询会员信息/);
+      await failure(unbound, 'bind_member', { code: phoneB, codeType: 'phone' }, /查询会员信息/);
     }
   }
 });

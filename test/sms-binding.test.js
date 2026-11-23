@@ -129,7 +129,7 @@ function timedBinding(t, sms) {
     LICHA_SMS_CODE_TTL_SEC:30, LICHA_SMS_COOLDOWN_SEC:60, LICHA_SESSION_IDLE_TTL_MS:1800000,
     LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR:2, LICHA_RATE_BINDS_GLOBAL_PER_MIN:2};
   return createBindingFlow({config, bindings:new Map(), qmai:{read:async () => ({customerId:123}), sms},
-    logs:{access() {}}, book:{recordSmsSending() { return {}; }}});
+    logs:{access() {}}, book:{checkSmsAllowed() {}, recordSmsSending() { return {}; }}});
 }
 
 test('BND-11 验证码在有效期边界作废，过期提示优先于格式预检', async t => {

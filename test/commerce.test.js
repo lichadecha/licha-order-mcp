@@ -818,12 +818,13 @@ test('BND-02 R24 会员查询支持标量编号，未知形态报告查询失败
   assert.equal(first.customerIdLast4, '***');
   payload = memberA;
   assert.equal((await bind(s, phoneB)).customerIdLast4, '***1234');
+  const lookup = { code: '13900000003', codeType: 'phone' }; // 用尚未发码的号码检验会员查询回执。
   for (const shape of [{}, { id: memberA }, [memberA], true, null, { customerId: [memberA] }]) {
     payload = shape;
-    await failure(s, 'bind_member', { code: phone, codeType: 'phone' }, /查询会员信息时出了点问题/);
+    await failure(s, 'bind_member', lookup, /查询会员信息时出了点问题/);
   }
   payload = '0';
-  await failure(s, 'bind_member', { code: phone, codeType: 'phone' }, /去微信搜/);
+  await failure(s, 'bind_member', lookup, /去微信搜/);
   assert.equal((await prepare(s)).member.via, 'phone');
 });
 

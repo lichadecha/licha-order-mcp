@@ -13,6 +13,35 @@ function fixedClock(time) {
   return '--import=data:text/javascript;base64,' + Buffer.from('Date.now=()=>' + time).toString('base64');
 }
 
+for (const [reason, elapsed, message] of [
+  ['同号冷却中', 0, /请 60 秒后再试/],
+  ['已达每小时上限', 60_000, /请约 59 分钟后再试/],
+  ['已达每天上限', 3600_000, /请明天再试/]
+]) {
+  test('BND-11/12 ' + reason + '，拒绝绑定第一步且上游请求为零', async t => {
+    const r = await setup(t, {NODE_OPTIONS:fixedClock(start), LICHA_SMS_COOLDOWN_SEC:'60',
+      LICHA_SMS_PER_PHONE_PER_HOUR:'1', LICHA_SMS_PER_PHONE_PER_DAY:'1'});
+    const first = await success(await r.session(), 'bind_member', args);
+    assert.equal(first.verificationSent, true);
+    assert.deepEqual(r.requests.map(req => req.path), [PATHS.member, PATHS.smsSend]);
+    r.env.NODE_OPTIONS = fixedClock(start + elapsed);
+    await r.restart();
+    const before = r.requests.length;
+    await failure(await r.session(), 'bind_member', args, message);
+    assert.equal(r.requests.length - before, 0);
+  });
+}
+
+test('BND-11/12 账本故障时拒绝绑定第一步，上游请求为零', async t => {
+  const r = await setup(t);
+  await r.stop();
+  const db = new DatabaseSync(bookFile(r));
+  try { db.exec('DROP TABLE sms_sends'); } finally { db.close(); }
+  await r.start();
+  await failure(await r.session(), 'bind_member', args, /安全账本不可用，暂时不能发验证码/);
+  assert.equal(r.requests.length, 0);
+});
+
 for (const outcome of ['发出', '拒绝', '结果不明']) {
   test('BND-12/13 ' + outcome + '均跨设备计入发码上限；重启清除待验证并保留限频', async t => {
     const daily = outcome === '结果不明';

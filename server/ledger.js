@@ -221,8 +221,7 @@ export class Ledger {
     return receipt;
   }
 
-  recordSmsSending(phone, attempt, config, now = Date.now()) {
-    const phoneHash = digest(phone);
+  #withSmsAllowance(phoneHash, config, now, onAllowed) {
     let limit;
     try {
       limit = this.#withWritableBook(() => {
@@ -232,16 +231,28 @@ export class Ledger {
           .all(phoneHash, cutoff);
         const reason = smsLimit(history.map(row => row.sent_at), config, now);
         if (reason) return reason;
-        this.db.exec('BEGIN IMMEDIATE');
-        this.db.prepare('DELETE FROM sms_sends WHERE sent_at<=?').run(cutoff);
-        this.db.prepare('INSERT INTO sms_sends (phone_hash, sent_at, checksum) VALUES (?, ?, ?)')
-          .run(phoneHash, now, smsChecksum(phoneHash, now));
-        this.db.exec('COMMIT');
+        onAllowed?.(cutoff);
       });
     } catch {
       throw Object.assign(Error(smsUnavailable), {kind:'sms_ledger'});
     }
     if (limit) throw Object.assign(Error(limit), {kind:'sms_limit'});
+  }
+
+  checkSmsAllowed(phone, config, now = Date.now()) {
+    this.#withSmsAllowance(digest(phone), config, now);
+  }
+
+  recordSmsSending(phone, attempt, config, now = Date.now()) {
+    const phoneHash = digest(phone);
+    // 查询会员期间，其他设备可能已给同一号码发码，落盘前须重新检查。
+    this.#withSmsAllowance(phoneHash, config, now, cutoff => {
+      this.db.exec('BEGIN IMMEDIATE');
+      this.db.prepare('DELETE FROM sms_sends WHERE sent_at<=?').run(cutoff);
+      this.db.prepare('INSERT INTO sms_sends (phone_hash, sent_at, checksum) VALUES (?, ?, ?)')
+        .run(phoneHash, now, smsChecksum(phoneHash, now));
+      this.db.exec('COMMIT');
+    });
     const receipt = Object.freeze({});
     smsReceipts.set(receipt, {attempt, phoneHash});
     return receipt;

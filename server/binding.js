@@ -56,6 +56,11 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
     if (pending.length) reject(source, 'unresolved', `暂时不能换人：上一次下单请求的结果还没核对清楚（${pendingCount(pending)}）。\n先用「看看我最近的订单」把那一单核对掉，再换人——否则那笔单到底成没成就没人能确认了。`);
   }
 
+  function rejectSmsAttempt(source, error) {
+    logs.access({event:'sms_send', outcome:error.kind === 'sms_limit' ? 'rate_limited' : 'ledger_fault'}, source);
+    reject(source, error.kind, error.message);
+  }
+
   async function findMember(source) {
     if (!config.QMAI_OPEN_ID || !config.QMAI_OPEN_KEY || !config.QMAI_GRANT_CODE) {
       reject(source, 'credentials', MISSING_CREDENTIALS);
@@ -65,6 +70,11 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
     globalBindTimes = globalBindTimes.filter(time => time > now - 60000);
     if (local.length >= config.LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR || globalBindTimes.length >= config.LICHA_RATE_BINDS_GLOBAL_PER_MIN) {
       reject(source, 'rate_limit', '绑定尝试太频繁，请稍后再试。');
+    }
+    try {
+      book.checkSmsAllowed(source.phone, config, now);
+    } catch (error) {
+      rejectSmsAttempt(source, error);
     }
     local.push(now);
     bindTimes.set(source.device, local);
@@ -113,8 +123,7 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
       }});
     } catch (error) {
       if (error.kind === 'sms_limit' || error.kind === 'sms_ledger') {
-        logs.access({event:'sms_send', outcome:error.kind === 'sms_limit' ? 'rate_limited' : 'ledger_fault'}, source);
-        reject(source, error.kind, error.message);
+        rejectSmsAttempt(source, error);
       }
       if (sentAt === undefined || error.kind === 'business') {
         logs.access({event:'sms_send', outcome:error.kind === 'business' ? 'rejected' : 'not_sent'}, source);
