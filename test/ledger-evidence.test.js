@@ -63,7 +63,7 @@ test('LED-02/08 SQLite 未知版本拒绝打开业务，不自动重写版本或
   assert.deepEqual(await readdir(r.dataDir), [basename(file)]);
   const db = new DatabaseSync(file);
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
     db.exec('PRAGMA user_version=99');
   } finally { db.close(); }
   const bytes = await readFile(file);

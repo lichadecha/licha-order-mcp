@@ -400,11 +400,12 @@ test('UPS-01 R21 损坏的密钥封装不作为普通字符串签名', () => {
     e=>e.message === '配置无效：QMAI_OPEN_KEY');
 });
 
-test('BRW-04 分类商品业务失败照抄原因，传输失败给通用提示', async () => {
+test('BRW-04 分类商品失败保留前缀，业务拒绝给原因，超时、断连和 HTTP 错误给对应提示', async () => {
   for (const [kind,message,expected] of [
     ['business','分类不可用','按分类查商品失败：分类不可用'],
-    ['timeout','','门店系统这会儿反应慢，刚才那一步没查到结果，稍等几秒我再帮你问一次。'],
-    ['network','','网络异常，稍后再试']
+    ['timeout','','按分类查商品失败：未知错误（门店系统这会儿反应慢，刚才那一步没查到结果，稍等几秒我再帮你问一次。）'],
+    ['network','','按分类查商品失败：未知错误（网络异常，稍后再试）'],
+    ['http','HTTP 503','按分类查商品失败：未知错误（网络异常，稍后再试）']
   ]) {
     const browse = new Browse({LICHA_CACHE_CATEGORIES_MS:1000}, {async read(path) {
       if (path === PATHS.categories) return [{frontCategoryId:1,categoryName:'奶茶'}];

@@ -28,6 +28,8 @@ test('绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/
   }
   assert.equal(r.requests.length, 0);
   const first = await bind(s, '138 0000 0000');
+  assert.equal(r.requests.find(req => req.path === PATHS.smsSend).params.customerPhone, phone);
+  assert.equal(r.requests.find(req => req.path === PATHS.smsCheck).params.phone, phone);
   assert.equal(first.customerIdLast4, '***1234');
   assert.equal(first.boundVia, 'phone');
   const draft = await prepare(s);
@@ -394,6 +396,7 @@ test('发送前账本故障时停止创建、已绑定仍可查单、重启后�
   await failure(second,'place_order',argsFor(b),/安全账本不可用/);
   await failure(s,'prepare_order',basket,/安全账本不可用/);
   assert.equal((await success(s,'my_orders')).count,0);
+  assert.equal((await success(s,'get_order_status',{orderNo:number(1)})).orderNo, number(1));
   assert.equal(count(r,PATHS.create),0);
   const assertFault = async () => {
     await r.restart();
@@ -401,6 +404,7 @@ test('发送前账本故障时停止创建、已绑定仍可查单、重启后�
     await failure(resumed,'bind_member',{code:phone,codeType:'phone'},/安全账本不可用/);
     assert.equal((await success(resumed,'preview_order',basket)).ok,true);
     await failure(resumed,'my_orders',{},/尚未绑定/);
+    await failure(resumed,'get_order_status',{orderNo:number(1)},/尚未绑定/);
   };
   await assertFault();
   await rm(file,{recursive:true});

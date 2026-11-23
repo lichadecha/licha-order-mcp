@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {join} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
 import {createBindingFlow} from '../server/binding.js';
 import {digest} from '../server/common.js';
 import {PATHS} from '../server/qmai.js';
@@ -13,6 +14,12 @@ const send = (s, code = phone) => success(s, 'bind_member', args(code));
 const verify = (s, code = phone) => success(s, 'bind_member', args(code, mockCaptcha));
 const denied = (s, code, captcha, message) => failure(s, 'bind_member', args(code, captcha), message);
 const missing = /还没给这个手机号发过验证码/;
+
+function sentPhoneHashes(r) {
+  const db = new DatabaseSync(bookFile(r), {readOnly:true});
+  try { return db.prepare('SELECT phone_hash FROM sms_sends ORDER BY rowid').all().map(row => row.phone_hash); }
+  finally { db.close(); }
+}
 
 test('BND-11 工具契约、两步回执、同设备跨会话和幂等免验', async t => {
   const r = await setup(t, {LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR:'1'});
@@ -99,26 +106,41 @@ test('BND-07/11 发码后原会员新增未决，校验通过也拒绝换人并�
   assert.equal(r.requests.length, before);
 });
 
-test('BND-11/14 未完成的校验不扣次数，错误与认不出的 data 都扣次并可作废', async t => {
-  const r = await setup(t, {LICHA_SMS_MAX_WRONG:'2'});
+test('R27/BND-11/14 逐笔计数并审计错码和未知回执，超时、断线、5xx 不扣次数', async t => {
+  const r = await setup(t, {LICHA_SMS_MAX_WRONG:'7'});
   const s = await r.session();
   await send(s);
   await denied(s, phone, 'abc', /验证码格式不对/);
   assert.equal(count(r, PATHS.smsCheck), 0);
-  r.mock.override.set(PATHS.smsCheck, (_params, {res}) => { res.statusCode = 503; res.end(); });
-  await denied(s, phone, mockCaptcha, /仍然有效/);
+  for (const failure of [res => { res.writeHead(503); res.end(); }, res => res.destroy(), () => {}]) {
+    r.mock.override.set(PATHS.smsCheck, (_params, {res}) => { failure(res); });
+    await denied(s, phone, mockCaptcha, /仍然有效/);
+  }
   r.mock.override.set(PATHS.smsCheck, () => ({status:false}));
-  await denied(s, phone, mockCaptcha, /还可以再试 1 次/);
-  r.mock.override.set(PATHS.smsCheck, () => ({status:true, data:{valid:true}}));
-  await denied(s, phone, mockCaptcha, /次数太多，这条已作废/);
+  assert.equal(await denied(s, phone, mockCaptcha, /验证码不对/), '验证码不对，还可以再试 6 次。请顾客核对短信里的数字再报一次。');
+  const unknownReplies = [
+    () => ({status:true, data:{valid:true}}), () => ({}), () => ({status:'false'}),
+    (_params, {res}) => { res.end('{'); },
+    (_params, {res}) => { res.writeHead(400); res.end('{"status":false}'); },
+    (_params, {res}) => { res.writeHead(404); res.end('{"status":true}'); }
+  ];
+  for (const [index, reply] of unknownReplies.entries()) {
+    r.mock.override.set(PATHS.smsCheck, reply);
+    const remaining = unknownReplies.length - index - 1;
+    const expected = remaining ? `这次没能确认验证码（门店系统的回复认不出来），按报错算了一次，还可以再试 ${remaining} 次。`
+      : '验证码报错次数太多，这条已作废。请先只带手机号调用一次 bind_member，重新发一条。';
+    assert.equal(await denied(s, phone, mockCaptcha, /验证码/), expected);
+  }
   await denied(s, phone, mockCaptcha, missing);
-  assert.equal(count(r, PATHS.smsCheck), 3);
+  assert.equal(count(r, PATHS.smsCheck), 10);
   const access = (await readFile(join(r.logDir,'access.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   const checks = access.filter(row => row.event === 'sms_check');
-  assert.deepEqual(checks.map(row => row.outcome), ['request_failed','wrong','wrong','invalidated']);
+  assert.deepEqual(checks.map(row => row.outcome),
+    ['request_failed','request_failed','request_failed','wrong',...unknownReplies.map(() => 'unrecognized'),'invalidated']);
+  const [hash] = sentPhoneHashes(r);
   for (const row of checks) {
     assert.equal(row.deviceHash, digest(s.device));
-    assert.equal(row.phoneHash, digest(phone));
+    assert.equal(row.phoneHash, hash);
     assert.equal(row.memberHash, undefined);
   }
 });
@@ -129,7 +151,7 @@ function timedBinding(t, sms) {
     LICHA_SMS_CODE_TTL_SEC:30, LICHA_SMS_COOLDOWN_SEC:60, LICHA_SESSION_IDLE_TTL_MS:1800000,
     LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR:2, LICHA_RATE_BINDS_GLOBAL_PER_MIN:2};
   return createBindingFlow({config, bindings:new Map(), qmai:{read:async () => ({customerId:123}), sms},
-    logs:{access() {}}, book:{checkSmsAllowed() {}, recordSmsSending() { return {}; }}});
+    logs:{access() {}}, book:{phoneHash:() => 'mock-phone-hash', checkSmsAllowed() {}, recordSmsSending() { return {}; }}});
 }
 
 test('BND-11 发码结果不明时按秒告知重发时间', async t => {
@@ -158,8 +180,10 @@ test('BND-13/14 真实工具回包、三本日志及账本不暴露手机号和�
   const output = [await send(s), await denied(s, phone, undefined, /太频繁/), await verify(s), await send(s)];
   const draft = await prepare(s);
   output.push(await place(s, draft));
-  r.mock.override.set(PATHS.smsSend, () => ({status:false, code:mockCaptcha, message:`短信服务拒绝 ${mockCaptcha} ${phoneB}`}));
-  output.push(await denied(s, phoneB, undefined, /短信服务拒绝/));
+  r.mock.override.set(PATHS.smsSend, () => ({status:false, code:mockCaptcha, message:`短信服务拒绝 ${mockCaptcha} ${phoneB}，2 分钟后再试`}));
+  const refusal = await denied(s, phoneB, undefined, /短信服务拒绝/);
+  assert.equal(refusal, '验证码没发出去（短信服务拒绝 *** ***，2 分钟后再试）。请稍后再试，或直接在小程序里下单。');
+  output.push(refusal);
   const thirdPhone = '18811112223';
   r.mock.override.set(PATHS.member, () => ok({customerId:1234}));
   r.mock.override.set(PATHS.smsSend, (_params, {res}) => { res.end('{'); });
@@ -173,11 +197,22 @@ test('BND-13/14 真实工具回包、三本日志及账本不暴露手机号和�
   const rows = files[2].trim().split('\n').map(JSON.parse);
   assert.deepEqual(rows.filter(row => row.event === 'sms_send').map(row => row.outcome),
     ['sent','rate_limited','rejected','unknown']);
-  for (const row of rows.filter(row => row.event.startsWith('sms_') || row.reason === 'sms_exempt')) {
+  const hashes = sentPhoneHashes(r);
+  assert.equal(new Set(hashes).size, 3);
+  const events = rows.filter(row => row.event.startsWith('sms_') || row.reason === 'sms_exempt');
+  assert.deepEqual(events.map(row => row.phoneHash),
+    [hashes[0], hashes[0], hashes[0], hashes[0], hashes[1], hashes[2], hashes[2]]);
+  for (const row of events) {
     assert.equal(row.deviceHash, digest(s.device));
-    assert.ok([phone, phoneB, thirdPhone].some(value => row.phoneHash === digest(value)));
+    assert.ok([phone, phoneB, thirdPhone].every(value => row.phoneHash !== digest(value)));
     assert.equal(row.memberHash, undefined);
   }
+  const ledger = new DatabaseSync(bookFile(r), {readOnly:true});
+  try {
+    const {secret} = ledger.prepare('SELECT secret FROM sms_key').get();
+    assert.ok(!JSON.stringify(output).includes(secret));
+    assert.ok(files.every(file => !file.includes(secret)));
+  } finally { ledger.close(); }
   const db = await readFile(bookFile(r));
   for (const secret of [phone, phoneB, thirdPhone, mockCaptcha]) {
     assert.ok(!JSON.stringify(output).includes(secret));
@@ -186,7 +221,7 @@ test('BND-13/14 真实工具回包、三本日志及账本不暴露手机号和�
   }
 });
 
-test('BND-11 发码回执或校验故障等到有效期结束，不再提示验证码可用', async t => {
+test('BND-11 发码时已过期不建待验证，准时送验后超时按请求失败，下一次重新判断到期', async t => {
   let slowSend = true;
   const flow = timedBinding(t, async (path, _, opts) => {
     if (path === PATHS.smsSend) {
@@ -201,6 +236,7 @@ test('BND-11 发码回执或校验故障等到有效期结束，不再提示验�
   await assert.rejects(flow.bind(args(phone, mockCaptcha),'device'), missing);
   slowSend = false;
   assert.equal((await flow.bind(args(phone),'device')).verificationSent, true);
+  await assert.rejects(flow.bind(args(phone, mockCaptcha),'device'), /验证码暂时没校验成功/);
   await assert.rejects(flow.bind(args(phone, mockCaptcha),'device'), /验证码已过期/);
   await assert.rejects(flow.bind(args(phone, mockCaptcha),'device'), missing);
 });

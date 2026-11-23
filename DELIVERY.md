@@ -1,8 +1,19 @@
-# 李茶的茶点单 MCP v1.11.1 交付清单
+# 李茶的茶点单 MCP v1.11.2 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.11.1 查会员前检查发码条件
+## v1.11.2 短信额度、校验与账本升级
+
+- **发码。** 查会员前在本地检查账本、同号冷却、滚动小时、按号自然日和全服务自然日额度。发码落账时再复核全部档位。`LICHA_SMS_GLOBAL_PER_DAY` 默认 100，须为正整数。限频回复选解除最晚的一档，全服务与按号日额并列时选全服务。访问审计记录命中档位，当天首次因全服务日额拒绝另记 `sms_global_day_exhausted`。[账本边界](test/sms-ledger.test.js) · [并发、跨午夜与首拒审计](test/sms-binding-recovery.test.js)
+- **账本。** SQLite 格式 4 用同库生成的 32 字节随机密钥计算手机号 HMAC-SHA256，访问审计与发码记录使用同一摘要。格式 2、3 自动迁移，保留订单、已占额度、未决、防重与认领记录，丢弃格式 3 的旧短信记录。重启沿用已提交的密钥、发码记录和日额首拒标记。运行中账本故障后，有效绑定仍可查单。启动即故障时，绑定已清空，顾客须到小程序查单。[迁移与损坏](test/sms-ledger.test.js) · [查单与恢复](test/commerce.test.js)
+- **校验。** 以第二步到达时刻判断有效期。R27 的四种肯定形态算通过，明确不通过与认不出的回执有不同提示，均计一次报错。只有超时、连接失败和 HTTP 5xx 保留次数。短信出口的上游文案遮盖连续 4 位及以上数字，保留 1 至 3 位。[短信出口](test/sms-gateway.test.js) · [逐次报错与过期边界](test/sms-binding.test.js)
+- **工具回执。** 提交多余字段时按段遮盖字段路径。按分类查商品遇传输失败时带工具前缀和对应提示语。默认用券与预测不一致且读回实付为零时，回执以「请如实更正。」结束。
+
+**全量回归。** Node 22.23.1、本机回环模拟企迈，连续三次运行完整 `npm test`。第一次 250 通过、0 失败，第二次 250 通过、0 失败，第三次 250 通过、0 失败。三次跳过、取消均为 0。真实短信回执与商家短信单价仍待实测。
+
+**规格文字冲突。** BND-12 与工具契约 §5 表格写有全服务日额命中即用专属文案，§5 末段要求四档按解除最晚者选文案。按本轮任务第 2 项采用末段规则。接近午夜时，冷却或滚动小时可能比日额更晚解除。只要命中全服务日额，当天首拒仍单独记审计。
+
+## v1.11.1 查会员前检查发码条件（历史记录）
 
 第一步绑定先检查手机号冷却、滚动一小时上限、北京时间当天上限及账本状态。四种拒绝情形各有一项回归测试，均断言上游请求为零。确认是会员后，发码前再次核对限频并落盘。[绑定回归测试](test/sms-binding-recovery.test.js)
 
@@ -248,7 +259,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | SES-02 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77)<br>[SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64)<br>[SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单](test/session.test.js#L269) |
 | SES-03 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77)<br>[SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64) |
 | SES-04 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64)<br>[SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单](test/session.test.js#L269) |
-| SES-05 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[SES-05 SES-09 跨会话共用滑动窗口；重启清除限流与绑定](test/session.test.js#L86) |
+| SES-05 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[SES-05 SES-09 跨会话共用滑动窗口；重启清除限流与绑定](test/session.test.js#L86) · [重启清除设备状态及查询限流，保留发码记录](test/sms-binding-recovery.test.js#L94) |
 | SES-06 | [server/session.js](server/session.js) · makeEndpoint | [SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64)<br>[SES-06 已进入会话的 POST 在接收消息期间保持活动](test/session.test.js#L224)<br>[SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单](test/session.test.js#L269) |
 | SES-07 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L27)<br>[SES-07 正在接收握手的连接占名额，中止后只归还一次](test/session.test.js#L207) |
 | SES-08 | [server/session.js](server/session.js) · dispatch | [SES-08 同设备跨会话按到达次序执行，其他设备可以继续查询](test/session.test.js#L104)<br>[SES-08 SES-09 上一个绑定仍在等待时，同设备超额请求立即返回](test/session.test.js#L124) |
@@ -259,7 +270,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
 | ORD-01 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L27) |
-| ORD-02 | [server/qmai.js](server/qmai.js) · readPaths、Qmai.write、Qmai.sms · [账本发送凭据](server/ledger.js) | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12)<br>[ORD-02 增加路径常量不会自动获得读权限](test/write-gate.test.js#L37) |
+| ORD-02 | [server/qmai.js](server/qmai.js) · readPaths、Qmai.write、Qmai.sms · [账本发送凭据](server/ledger.js) | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12)<br>[ORD-02 增加路径常量不会自动获得读权限](test/write-gate.test.js#L37) · [短信出口、关停与落盘凭据](test/sms-gateway.test.js#L81) |
 | ORD-03 | [server/qmai.js](server/qmai.js) · Qmai.read、Qmai.write、Qmai.sms | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292) |
 
 ### 浏览与算价
@@ -291,8 +302,8 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | BND-08 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | BND-09 | [server/binding.js](server/binding.js) | [绑定查询限流不计预检与限流拒绝 BND-09](test/commerce.test.js#L66)<br>[BND-09 格式预检、设备一小时与全局一分钟滑窗分别计数，在边界释放](test/window.test.js#L70) |
 | BND-10 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-11 | [两步绑定](server/binding.js) | [待验证、换绑、失败与作废](test/sms-binding.test.js) |
-| BND-12 | [发码计数与落盘凭据](server/ledger.js) | [三层限频](test/sms-ledger.test.js) · [并发、重启与故障](test/sms-binding-recovery.test.js) |
+| BND-11 | [两步绑定](server/binding.js) | [待验证、换绑、失败与作废](test/sms-binding.test.js) · [第二步到达时刻与跨期排队](test/window.test.js#L57) |
+| BND-12 | [发码计数与落盘凭据](server/ledger.js) | [四档限频与 HMAC](test/sms-ledger.test.js) · [并发、重启与故障](test/sms-binding-recovery.test.js) |
 | BND-13 | [设备待验证](server/binding.js) | [重启失效](test/sms-binding-recovery.test.js) · [出参与日志隐私](test/sms-binding.test.js) |
 | BND-14 | [访问审计](server/logs.js) | [发码和校验分类、手机号与设备摘要](test/sms-binding.test.js) |
 
@@ -301,7 +312,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
 | PRE-01 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| PRE-02 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377) |
+| PRE-02 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [运行时故障仍可查单，重启发现损坏后可浏览、无法绑定](test/commerce.test.js#L387) |
 | PRE-03 | [server/browse.js](server/browse.js) · quote、#item | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164)<br>[BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读缓存](test/browse.test.js#L318) |
 | PRE-04 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164) |
 | PRE-05 | [server/price.js](server/price.js) · priceLine | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164) |
@@ -323,12 +334,12 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | WRT-03 | [server/commerce.js](server/commerce.js) · place | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | WRT-04 | [server/commerce.js](server/commerce.js) · place | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | WRT-05 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读](test/commerce.test.js#L135) · [两位小数与一分容差](test/commerce.test.js#L886) |
-| WRT-06 | [server/commerce.js](server/commerce.js) · place | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377) |
+| WRT-06 | [server/commerce.js](server/commerce.js) · place | [运行时故障仍可查单，重启发现损坏后可浏览、无法绑定](test/commerce.test.js#L387) |
 | WRT-07 | [server/commerce.js](server/commerce.js) · place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 | WRT-08 | [server/commerce.js](server/commerce.js) · place | [零元预估不占位 WRT-08](test/commerce.test.js#L360) |
 | WRT-09 | [server/commerce.js](server/commerce.js) · place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39) |
 | WRT-10 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[WRT-10 持久防重记录命中时归还占位，不再请求创建](test/commerce.test.js#L583) |
-| WRT-11 | [server/commerce.js](server/commerce.js) · place · [recordSending](server/ledger.js) · [Qmai.write](server/qmai.js) | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377)<br>[WRT-11 等待实际发送名额超时，账本空且个人、全局占位都释放](test/quota-time.test.js#L99)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12) |
+| WRT-11 | [server/commerce.js](server/commerce.js) · place · [recordSending](server/ledger.js) · [Qmai.write](server/qmai.js) | [运行时故障仍可查单，重启发现损坏后可浏览、无法绑定](test/commerce.test.js#L387)<br>[WRT-11 等待实际发送名额超时，账本空且个人、全局占位都释放](test/quota-time.test.js#L99)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12) |
 | WRT-12 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201) |
 | WRT-13 | [server/commerce.js](server/commerce.js) · place | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135) |
 | WRT-14 | [server/commerce.js](server/commerce.js) · place · [orderNumber](server/commerce-view.js) | [资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[WRT-14 QRY-04 R23 占位文字不算订单号；列表逐行校验 12 至 40 位英数](test/commerce.test.js#L680) |
@@ -345,11 +356,11 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
 | LED-01 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448) |
-| LED-02 | [server/ledger.js](server/ledger.js) · Ledger 校验库格式、记录摘要与内容 | [发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03](test/commerce.test.js#L377)<br>[LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单](test/commerce.test.js#L767)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L828) |
+| LED-02 | [server/ledger.js](server/ledger.js) · Ledger 校验库格式、记录摘要与内容 | [运行时故障仍可查单，重启发现损坏后可浏览、无法绑定](test/commerce.test.js#L387)<br>[损坏账本仍可独占和浏览，拒绝新绑定](test/commerce.test.js#L835)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L895) |
 | LED-03 | [SQLite 事务与发送凭据](server/ledger.js) · [下单和核对答复](server/commerce.js) | [实际 COMMIT 被拒、已提交却报错、两处强杀](test/ledger-recovery.test.js) · [初建强杀、版本与记录校验](test/ledger-evidence.test.js) |
 | LED-04 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448) |
 | LED-05 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448) |
-| LED-06 | [server/ledger.js](server/ledger.js) · Ledger 取得与释放目录锁 | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[全新目录双实例并发抢锁、别名与死亡接管 LED-06](test/commerce.test.js#L518)<br>[LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单](test/commerce.test.js#L767)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L828)<br>[LED-06 账本目录不可写时启动失败，恢复写权限后可接管](test/commerce.test.js#L842) |
+| LED-06 | [server/ledger.js](server/ledger.js) · Ledger 取得与释放目录锁 | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[全新目录双实例并发抢锁、别名与死亡接管 LED-06](test/commerce.test.js#L518)<br>[损坏账本仍可独占和浏览，拒绝新绑定](test/commerce.test.js#L835)<br>[LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态](test/commerce.test.js#L895)<br>[LED-06 账本目录不可写时启动失败，恢复写权限后可接管](test/commerce.test.js#L842) |
 | LED-07 | [server/ledger.js](server/ledger.js) · Ledger，占位与状态转换见 commerce.js 的 place | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39) |
 | LED-08 | [server/ledger-cli.js](server/ledger-cli.js) · run | [强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06](test/commerce.test.js#L448)<br>[LED-08 运维按固定字段列未决，R23 不合格单号及未知请求退出非零且账本不变](test/commerce.test.js#L801) |
 
@@ -382,7 +393,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | --- | --- | --- |
 | LOG-01 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |
 | LOG-02 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |
-| LOG-03 | [server/logs.js](server/logs.js) · createLogs、issueConfirmation、currentQuotaDay · [企迈回执](server/qmai.js) · [已提交账本记录](server/ledger.js) | [WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39)<br>[LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142)<br>[LOG-03 写审计默认掩码，伪造的令牌、订单回执和账本对象不能取得全值](test/session.test.js#L297) |
+| LOG-03 | [server/logs.js](server/logs.js) · createLogs、issueConfirmation、currentQuotaDay · [企迈回执](server/qmai.js) · [已提交账本记录](server/ledger.js) | [WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写审计记录占额日](test/quota-time.test.js#L39)<br>[LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142)<br>[LOG-03 写审计默认掩码，伪造的令牌、订单回执和账本对象不能取得全值](test/session.test.js#L297) · [访问审计与账本 HMAC 一致](test/sms-binding.test.js#L177) |
 | LOG-04 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |
 | LOG-05 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-05 三本日志介质故障不改变业务结果](test/session.test.js#L180) |
 | LOG-06 | [server/logs.js](server/logs.js) · createLogs，调用点见 session.js、qmai.js、commerce.js | [LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏](test/session.test.js#L142) |

@@ -115,20 +115,30 @@ test('OUT-02 默认与指定单的创建错误、读回错误按待确认单遮�
   await checkLogs(r, ref);
 });
 
-test('WRT-01 多余字段路径只遮盖与本设备券编号相等的段，拒绝时没有创建请求', async t => {
+test('WRT-01 多余字段逐段投影，区分本设备券编号、普通字段与数组下标，原始参数被拒时零创建', async t => {
   const { r, s, m } = await withBound(t);
   m.couponRows = [available];
   const draft = await prepare(s);
   const { ref } = draft.coupons.usable[0];
   const sameDevice = await r.session(s.device);
+  const args = argsFor(draft);
   for (const [input, expected] of [
-    [{ ...argsFor(draft), [ref]: true }, '（券编号）'],
-    [{ ...argsFor(draft), confirmAmountYuan: { [ref]: 20 } }, 'confirmAmountYuan.（券编号）'],
-    [{ ...argsFor(draft), confirmAmountYuan: { userId: 1 } }, 'confirmAmountYuan.userId']
+    [{ ...args, [ref]: true }, '（券编号）'],
+    [{ ...args, confirmAmountYuan: { [ref]: 20 } }, 'confirmAmountYuan.（券编号）'],
+    [{ ...args, confirmAmountYuan: { userId: 1 } }, 'confirmAmountYuan.userId'],
+    [{ ...args, ['__proto__']: '原始字段' }, '__proto__'],
+    [{ ...args, ['a'.repeat(30) + '_-']: true }, 'a'.repeat(30) + '_-'],
+    ...['', 'a'.repeat(33), '045678', '13800000000', 'a1', '中文', 'x.y', 'x[0]', '换\n行']
+      .map(key => [{ ...args, [key]: true }, '（略）']),
+    [{ ...args, confirmToken: { '999': 1 } }, 'confirmToken.（略）'],
+    [{ ...args, confirmAmountYuan: [0] }, 'confirmAmountYuan[0]'],
+    [{ ...args, confirmAmountYuan: [[{ [ref]: true }]] }, 'confirmAmountYuan[0][0].（券编号）'],
+    [{ ...args, confirmToken: [...Array(999).fill(null), { '045678': true }] }, 'confirmToken[999].（略）'],
+    [{ ...args, confirmToken: [...Array(1000).fill(null), { userId: 1 }] }, 'confirmToken[（略）].userId']
   ]) {
     const message = await failure(sameDevice, 'place_order', input, /收到多余的/);
-    assert.ok(message.includes('收到多余的：' + expected + '）'));
-    assert.ok(!message.includes(ref));
+    assert.equal(message, 'place_order 只接受 confirmToken 与 confirmAmountYuan 两个参数（收到多余的：' + expected +
+      '）。会员身份只能由服务端按设备绑定注入，不接受调用方传入。');
   }
   assert.equal(count(r, PATHS.create), 0);
   await checkLogs(r, ref);

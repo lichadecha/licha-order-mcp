@@ -31,18 +31,29 @@ const noChallenge = '还没给这个手机号发过验证码，或者之前那�
 
 export function createBindingFlow({config, qmai, book, logs, bindings, unresolved, discardDrafts}) {
   const challenges = new Map();
+  const queuedChecks = new Map();
   const bindTimes = new Map();
   let globalBindTimes = [];
   const ttlSeconds = config.LICHA_SMS_CODE_TTL_SEC;
   const minutes = ttlSeconds / 60;
 
+  // 只要设备还有已到达的校验，清理器就保留其待验证内容，供设备队列按序处理。
+  function holdVerification(device) {
+    queuedChecks.set(device, (queuedChecks.get(device) ?? 0) + 1);
+    return () => {
+      const remaining = queuedChecks.get(device) - 1;
+      if (remaining) queuedChecks.set(device, remaining);
+      else queuedChecks.delete(device);
+    };
+  }
+
   function sweep(now) {
     for (const [device, times] of bindTimes) if (times.at(-1) <= now - 3600000) bindTimes.delete(device);
     for (const [device, challenge] of challenges) {
-      if (now < challenge.expires) continue;
+      if (now < challenge.expires || queuedChecks.has(device)) continue;
       // 留下摘要供同设备再次报码时解释过期原因。闲置会话回收周期后释放。
       if (now - challenge.expires >= config.LICHA_SESSION_IDLE_TTL_MS) challenges.delete(device);
-      else if (challenge.phone) challenges.set(device, {expires:challenge.expires, phoneHash:digest(challenge.phone)});
+      else if (challenge.phone) challenges.set(device, {expires:challenge.expires, phoneHash:challenge.phoneHash});
     }
   }
 
@@ -57,7 +68,9 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
   }
 
   function rejectSmsAttempt(source, error) {
-    logs.access({event:'sms_send', outcome:error.kind === 'sms_limit' ? 'rate_limited' : 'ledger_fault'}, source);
+    logs.access({event:'sms_send', outcome:error.kind === 'sms_limit' ? 'rate_limited' : 'ledger_fault',
+      tier:error.tier, tiers:error.tiers}, source);
+    if (error.firstGlobalRejection) logs.access({event:'sms_global_day_exhausted'}, source);
     reject(source, error.kind, error.message);
   }
 
@@ -134,12 +147,12 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
     }
     const old = challenges.get(device);
     if (old?.phone && old.expires > Date.now()) {
-      logs.access({event:'sms_check', outcome:'invalidated', reason:'replaced'}, {device, phone:old.phone});
+      logs.access({event:'sms_check', outcome:'invalidated', reason:'replaced'}, {device, phoneHash:old.phoneHash});
     }
     logs.access({event:'sms_send', outcome:verificationSent === true ? 'sent' : 'unknown'}, source);
     const expires = sentAt + ttlSeconds * 1000;
     if (Date.now() >= expires) rejectExpired(source);
-    challenges.set(device, {...member, phone, bizId, expires, wrong:0});
+    challenges.set(device, {...member, phone, phoneHash:source.phoneHash, bizId, expires, wrong:0});
     const last4 = phone.slice(-4);
     const cooldown = config.LICHA_SMS_COOLDOWN_SEC;
     const wait = cooldown % 60 === 0 ? `${cooldown / 60} 分钟` : `${cooldown} 秒`;
@@ -169,48 +182,51 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
         (discarded ? `原来那位顾客还没确认的 ${discarded} 张单已作废，需要重新组单。` : '') };
   }
 
-  async function verify(source, rawCaptcha, previous) {
+  async function verify(source, rawCaptcha, previous, arrivedAt) {
     const {device, phone} = source;
     const challenge = challenges.get(device);
-    if (!challenge || (challenge.phone !== phone && challenge.phoneHash !== digest(phone))) {
+    if (!challenge || challenge.phoneHash !== source.phoneHash) {
       reject(source, 'no_challenge', noChallenge);
     }
-    if (challenge.phoneHash || Date.now() >= challenge.expires) rejectExpired(source);
+    if (!challenge.phone || arrivedAt >= challenge.expires) rejectExpired(source);
     const captcha = rawCaptcha.replace(/\s+/gu, '');
     if (!/^\d{4,8}$/.test(captcha)) {
       reject(source, 'captcha_format', '验证码格式不对：请照短信里的数字原样报（4 到 8 位数字）。');
     }
-    let passed;
+    let result;
     try {
-      passed = await qmai.sms(PATHS.smsCheck, {phone, bizId:challenge.bizId, captcha});
+      result = await qmai.sms(PATHS.smsCheck, {phone, bizId:challenge.bizId, captcha});
     } catch {
       logs.access({event:'sms_check', outcome:'request_failed'}, source);
-      if (Date.now() >= challenge.expires) rejectExpired(source);
       reject(source, 'check_failed', '验证码暂时没校验成功（是我们这边的问题），这条验证码仍然有效，请稍等几秒再试一次。');
     }
-    if (passed) {
+    if (result === true) {
       challenges.delete(device);
       logs.access({event:'sms_check', outcome:'passed'}, source);
       return finish(source, previous, challenge);
     }
     const remaining = config.LICHA_SMS_MAX_WRONG - ++challenge.wrong;
-    logs.access({event:'sms_check', outcome:'wrong'}, source);
-    if (Date.now() >= challenge.expires) rejectExpired(source);
-    if (remaining > 0) reject(source, 'wrong', `验证码不对，还可以再试 ${remaining} 次。请顾客核对短信里的数字再报一次。`);
+    const outcome = result === false ? 'wrong' : 'unrecognized';
+    logs.access({event:'sms_check', outcome}, source);
+    if (remaining > 0) {
+      const message = outcome === 'wrong' ? `验证码不对，还可以再试 ${remaining} 次。请顾客核对短信里的数字再报一次。`
+        : `这次没能确认验证码（门店系统的回复认不出来），按报错算了一次，还可以再试 ${remaining} 次。`;
+      reject(source, outcome, message);
+    }
     challenges.delete(device);
     logs.access({event:'sms_check', outcome:'invalidated', reason:'max_wrong'}, source);
     reject(source, 'max_wrong', '验证码报错次数太多，这条已作废。请先只带手机号调用一次 bind_member，重新发一条。');
   }
 
-  function bind({code, codeType, captcha}, device) {
+  function bind({code, codeType, captcha}, device, arrivedAt = Date.now()) {
     if (codeType !== 'phone') reject({device}, 'unsupported_type', '目前只支持用注册会员的手机号绑定（会给这个号发一条短信验证码）。请顾客报手机号。');
     const phone = code.replace(/\s+/gu, '');
     if (!/^\d{11}$/.test(phone)) {
       reject({device}, 'format', `code 格式不正确：codeType=phone 要求去除空白后为 11 位纯数字（收到长度：${[...phone].length}，是否全为数字：${/^\d+$/.test(phone) ? '是' : '否'}）`);
     }
     const previous = bindings.get(device);
-    const source = {device, phone};
-    return captcha === undefined ? send(source, previous) : verify(source, captcha, previous);
+    const source = {device, phone, phoneHash:book.phoneHash(phone)};
+    return captcha === undefined ? send(source, previous) : verify(source, captcha, previous, arrivedAt);
   }
-  return {bind, sweep};
+  return {bind, sweep, holdVerification};
 }

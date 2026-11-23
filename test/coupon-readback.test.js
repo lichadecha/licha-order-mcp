@@ -105,6 +105,18 @@ test('WRT-17 默认用券仅在有优惠条目或预测时给出读回核对，�
 
 const activity = { discountType: 3, discountName: '满减', discountAmount: 100 };
 
+test('WRT-19 默认用券与预测不一致，零实付时只说请如实更正', () => {
+  const orderNo = number(1);
+  const draft = { totalFen: 2000, couponChoice: 'default', prediction: { title: '茶券', rawTitle: '茶券' } };
+  for (const [actualAmount, ending] of [[0, '请如实更正。'], [1, '请如实更正后再引导付款。']]) {
+    const detail = { orderNo, userId: memberA, actualAmount,
+      discountList: [{ discountType: 2, discountName: '活动券', discountAmount: 1999 }] };
+    const { couponApplied } = placedView({ orderNo }, detail, '', draft, { id: memberA });
+    assert.equal(couponApplied.matchesPrediction, false);
+    assert.equal(couponApplied.note, '与组单时告知的不一致——念单时说的是「茶券」，实际用的是：活动券（抵 ¥19.99）。' + ending);
+  }
+});
+
 function readDiscounts(couponChoice, discountList, discountAmount) {
   const orderNo = number(1);
   const detail = { orderNo, userId: memberA, actualAmount: 1800, discountAmount, discountList };

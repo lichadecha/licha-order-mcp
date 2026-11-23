@@ -21,7 +21,7 @@ test('§3.2 短信配置使用正整数、有效期上下界，绑定默认闲�
   assert.equal(config.LICHA_BINDING_IDLE_TTL_MS, 30 * 86400000);
   const defaults = {
     LICHA_SMS_CODE_TTL_SEC:300, LICHA_SMS_COOLDOWN_SEC:60,
-    LICHA_SMS_PER_PHONE_PER_HOUR:5, LICHA_SMS_PER_PHONE_PER_DAY:10, LICHA_SMS_MAX_WRONG:5
+    LICHA_SMS_PER_PHONE_PER_HOUR:5, LICHA_SMS_PER_PHONE_PER_DAY:10, LICHA_SMS_GLOBAL_PER_DAY:100, LICHA_SMS_MAX_WRONG:5
   };
   for (const [key, expected] of Object.entries(defaults)) {
     assert.equal(config[key], expected);
@@ -38,13 +38,14 @@ test('§3.2 短信配置使用正整数、有效期上下界，绑定默认闲�
   }
 });
 
-test('§3.2 开通下单但事件编号缺失、无效时服务退出并只报告变量名', async t => {
+test('§3.2 短信事件编号缺失、无效或全服务日额无效时拒绝启动', async t => {
   const r = await rig(t, {env:event});
-  for (const value of [undefined, 'FAKE_PRIVATE_EVENT_NUMBER']) {
-    const env = {...r.env, LICHA_SMS_EVENT_NO:value};
-    if (value === undefined) delete env.LICHA_SMS_EVENT_NO;
+  for (const [key, value] of [['LICHA_SMS_EVENT_NO', undefined], ['LICHA_SMS_EVENT_NO', 'FAKE_PRIVATE_EVENT_NUMBER'],
+    ['LICHA_SMS_GLOBAL_PER_DAY', '0']]) {
+    const env = {...r.env, [key]:value};
+    if (value === undefined) delete env[key];
     await assert.rejects(promisify(execFile)(process.execPath, [serverPath], {cwd:r.cwd, env, timeout:5000}),
-      error => error.code === 1 && error.stderr.includes('LICHA_SMS_EVENT_NO') && !error.stderr.includes('FAKE_PRIVATE_EVENT_NUMBER'));
+      error => error.code === 1 && error.stderr.includes(key) && !error.stderr.includes('FAKE_PRIVATE_EVENT_NUMBER'));
   }
 });
 
@@ -90,7 +91,7 @@ test('ORD-02 短信出口隔离、关停和一次性凭据绑定到实际发出�
     const disabled = new Qmai({...config, LICHA_ENABLE_ORDERING:false}, () => {});
     await assert.rejects(disabled.sms(path, params), /短信出口/);
   }
-  for (const path of [PATHS.create, PATHS.stores, 'v3/future/sms']) {
+  for (const path of [...Object.values(PATHS).filter(p => p !== PATHS.smsSend && p !== PATHS.smsCheck), 'v3/future/sms']) {
     await assert.rejects(api.sms(path, params), /短信出口/);
   }
   const send = beforeSend => api.sms(PATHS.smsSend, params, {beforeSend});
@@ -107,14 +108,15 @@ test('ORD-02 短信出口隔离、关停和一次性凭据绑定到实际发出�
   assert.deepEqual(r.requests[1].params, {bizId, captcha, phone});
 });
 
-test('R27 校验只接受四种肯定回执，模糊数据和明确失败均不通过', async t => {
+test('R27 校验只接受四种肯定回执，分别识别明确失败和未知回执', async t => {
   let response;
   const r = await rig(t, {env:event, upstream:() => response});
   const api = new Qmai(readConfig(r.env), () => {});
   const check = () => api.sms(PATHS.smsCheck, {phone, bizId, captcha});
   let attempts = 0;
   const cases = [[undefined,true], [null,true], [{},true], [true,true],
-    [false,false], [[],false], [['ok'],false], ['',false], [0,false], [{valid:true},false], [{status:true},false]];
+    [false,'unrecognized'], [[],'unrecognized'], [['ok'],'unrecognized'], ['','unrecognized'],
+    [0,'unrecognized'], [{valid:true},'unrecognized'], [{status:true},'unrecognized']];
   for (const [data, expected] of cases) {
     response = {status:true, data};
     assert.equal(await check(), expected);
@@ -123,7 +125,7 @@ test('R27 校验只接受四种肯定回执，模糊数据和明确失败均不�
   response = {status:false, code:0, data:true, message:'验证码不对'};
   assert.equal(await check(), false);
   response = {code:0, data:true};
-  await assert.rejects(check(), {kind:'invalid'});
+  assert.equal(await check(), 'unrecognized');
   assert.equal(r.requests.length, attempts + 2);
 });
 
@@ -151,12 +153,12 @@ test('R27 发码与校验遇 5xx、超时、连接中断、坏 JSON 都不重试
     reply = response;
     const before = r.requests.length;
     await assert.rejects(send(), {kind});
-    await assert.rejects(check(), {kind});
+    if (response === 'badJson') assert.equal(await check(), 'unrecognized');
+    else await assert.rejects(check(), {kind});
     assert.equal(r.requests.length, before + 2);
   }
-  reply = {status:false, code:captcha, message:'短信受限 ' + captcha + '，' + phone + ' ' + config.QMAI_OPEN_ID};
-  await assert.rejects(send(), error => error.kind === 'business' && error.message.includes('短信受限')
-    && [phone, captcha, config.QMAI_OPEN_ID].every(value => !error.message.includes(value)));
+  reply = {status:false, code:captcha, message:`短信受限，2 分钟后再试，12、123、1234、${captcha}、${phone}、${config.QMAI_OPEN_ID}`};
+  await assert.rejects(send(), {kind:'business', message:'短信受限，2 分钟后再试，12、123、***、***、***、***'});
   assert.equal(await check(), false);
   reply = {status:false};
   await assert.rejects(send(), {kind:'business', message:'短信服务暂时不可用'});

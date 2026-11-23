@@ -391,14 +391,14 @@ export async function createCommerce(config, qmai, browse, logs) {
     return result;
   }
 
-  async function call(name, args, device) {
+  async function call(name, args, device, arrivedAt) {
     sweep(Date.now());
     const current = bindings.get(device);
     if (current) current.busy = true;
     try {
       let result;
       if (name === 'place_order') result = await place(args, device);
-      else if (name === 'bind_member') result = await bindingFlow.bind(args, device);
+      else if (name === 'bind_member') result = await bindingFlow.bind(args, device, arrivedAt);
       else {
         const binding = requireBinding(name, device);
         const handler = { prepare_order: prepare, get_order_status: status, my_orders: orders }[name];
@@ -414,5 +414,6 @@ export async function createCommerce(config, qmai, browse, logs) {
   function isDeviceCouponRef(device, key) {
     return !!bindings.get(device)?.couponRefs.get(key);
   }
-  return { call, logPlaceRejection, isDeviceCouponRef, close() { clearInterval(cleanup); book.close(); } };
+  return { call, holdVerification:bindingFlow.holdVerification, logPlaceRejection, isDeviceCouponRef,
+    close() { clearInterval(cleanup); book.close(); } };
 }

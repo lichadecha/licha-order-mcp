@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   Server, StreamableHTTPServerTransport, CallToolRequestSchema, InitializeRequestSchema, ListToolsRequestSchema
 } from './protocol-runtime.js';
-import { decimalId, projectText, uuidPattern } from './common.js';
+import { decimalId, uuidPattern } from './common.js';
 import { tools, validators } from './tools.js';
 
 function json(res,status,body,headers = {}) {
@@ -16,10 +16,33 @@ function toolError(text) {
   return {isError:true,content:[{type:'text',text}]};
 }
 
-function extraPlaceField(args) {
+// SDK 仍会校验 tools/call 的协议形状。让 arguments 对象原样到达 WRT-01，
+// 避免 SDK 的 record 解码在检查前丢弃 __proto__ 等自有字段。
+const rawToolCall = CallToolRequestSchema.extend({
+  params:CallToolRequestSchema.shape.params.omit({arguments:true}).loose()
+});
+
+function extraPlaceField(args, isCouponRef) {
+  const field = key => {
+    if (isCouponRef(key)) return '（券编号）';
+    return /^[A-Za-z_-]{1,32}$/.test(key) ? key : '（略）';
+  };
   for (const [key,value] of Object.entries(args)) {
-    if (!['confirmToken','confirmAmountYuan'].includes(key)) return [key];
-    if (value && typeof value === 'object' && Object.keys(value).length) return [key, Object.keys(value)[0]];
+    if (!['confirmToken','confirmAmountYuan'].includes(key)) return field(key);
+    let path = key;
+    let child = value;
+    while (Array.isArray(child) && child.length) {
+      // 如果数组中带有对象字段，指出它实际所在的位置。
+      const found = child.findIndex(item => item && typeof item === 'object' && Object.keys(item).length);
+      const index = Math.max(0, found);
+      path += '[' + (index <= 999 ? index : '（略）') + ']';
+      child = child[index];
+    }
+    if (child && typeof child === 'object') {
+      const first = Object.keys(child)[0];
+      if (first !== undefined) return path + '.' + field(first);
+    }
+    if (path !== key) return path;
   }
 }
 
@@ -60,14 +83,15 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
     state.times.push(now);
     state.queued++;
     s.working++;
+    const releaseVerification = name === 'bind_member' && args.captcha !== undefined
+      ? commerce?.holdVerification(s.device) : undefined;
     const run = state.chain.then(async () => {
       if (!names.has(name)) return toolError('未开放该工具。');
       if (name === 'place_order') {
-        const extra = extraPlaceField(args);
-        if (extra !== undefined) {
+        const path = extraPlaceField(args, key => commerce.isDeviceCouponRef(s.device, key));
+        if (path !== undefined) {
           commerce.logPlaceRejection('WRT-01',args.confirmToken,s.device);
-          const path = extra.map(key => commerce.isDeviceCouponRef(s.device, key) ? '（券编号）' : key).join('.');
-          return toolError('place_order 只接受 confirmToken 与 confirmAmountYuan 两个参数（收到多余的：' + projectText(path) + '）。会员身份只能由服务端按设备绑定注入，不接受调用方传入。');
+          return toolError('place_order 只接受 confirmToken 与 confirmAmountYuan 两个参数（收到多余的：' + path + '）。会员身份只能由服务端按设备绑定注入，不接受调用方传入。');
         }
       }
       if (!validators.get(name)(args) || (Object.hasOwn(args,'storeId') && !decimalId(args.storeId))) {
@@ -80,7 +104,7 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
         const input = Object.hasOwn(args,'storeId')
           ? {...args,storeId:decimalId(args.storeId)} : args;
         const result = browsing.has(name)
-          ? await browse.call(name,input) : await commerce.call(name,input,s.device);
+          ? await browse.call(name,input) : await commerce.call(name,input,s.device,now);
         return {content:[{type:'text',text:JSON.stringify(result,null,2)}]};
       } catch (error) {
         return toolError(error.message);
@@ -88,7 +112,7 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
     });
     state.chain = run.catch(() => {});
     try { return await run; }
-    finally { state.queued--; s.working--; s.last = Date.now(); }
+    finally { releaseVerification?.(); state.queued--; s.working--; s.last = Date.now(); }
   }
 
   async function handle(req,res) {
@@ -161,7 +185,7 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
     });
     const s = {server,transport,device,working:0,last:Date.now()};
     server.setRequestHandler(ListToolsRequestSchema,async () => ({tools:available}));
-    server.setRequestHandler(CallToolRequestSchema,({params}) => dispatch(s,params.name,params.arguments ?? {}));
+    server.setRequestHandler(rawToolCall,({params}) => dispatch(s,params.name,params.arguments ?? {}));
     try {
       await server.connect(transport);
       await transport.handleRequest(req,res,body);

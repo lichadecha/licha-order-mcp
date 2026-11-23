@@ -46,7 +46,7 @@ export function createLogs(config) {
     return str === String(value) ? value : str;
   }
   function writer(file, dated) {
-    return (record, {device, phone, memberId, previousMemberId, confirmation, order, ledgerRecord, reservation} = {}) => {
+    return (record, {device, phoneHash, memberId, previousMemberId, confirmation, order, ledgerRecord, reservation} = {}) => {
       try {
         const row = clean('',record);
         row.time = beijingTime();
@@ -54,7 +54,9 @@ export function createLogs(config) {
         if (file === 'upstream.jsonl' && knownPaths.has(record.path)) row.path = record.path;
         if (dated && quotaDays.has(reservation)) row.quotaDate = reservation.day;
         if (device) row.deviceHash = digest(device);
-        if (phone) row.phoneHash = digest(phone);
+        if (file === 'access.jsonl' && typeof phoneHash === 'string' && /^[0-9a-f]{64}$/.test(phoneHash)) {
+          row.phoneHash = phoneHash;
+        }
         if (memberId) row.memberHash = digest(memberId);
         if (previousMemberId) row.previousMemberHash = digest(previousMemberId);
         if (confirmations.has(confirmation)) {

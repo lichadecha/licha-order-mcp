@@ -209,24 +209,27 @@ export class Qmai {
   async sms(path, {phone, bizId, captcha}, {beforeSend} = {}) {
     if (!smsPaths.has(path) || ![true, '1'].includes(this.config.LICHA_ENABLE_ORDERING)) throw Error('短信出口拒绝此请求');
     const c = this.config;
+    const maskText = value => {
+      for (const secret of [bizId, c.QMAI_OPEN_KEY, c.QMAI_OPEN_ID, c.QMAI_GRANT_CODE, ...c.LICHA_ACCESS_KEYS]) {
+        if (secret) value = value.replaceAll(secret, '***');
+      }
+      return value.replace(/\d{4,}/g, '***');
+    };
     if (path === PATHS.smsSend) {
       if (typeof beforeSend !== 'function') throw Error('短信出口要求发码前记账凭据');
       const params = {bizId, customerPhone:phone, eventNo:c.LICHA_SMS_EVENT_NO, expireTime:c.LICHA_SMS_CODE_TTL_SEC, source:3};
-      // 企迈可能将号码或自行生成的验证码写进拒绝文案。只投影去除数字和凭证后的说明。
-      const maskText = value => {
-        for (const secret of [bizId, c.QMAI_OPEN_KEY, c.QMAI_OPEN_ID, c.QMAI_GRANT_CODE, ...c.LICHA_ACCESS_KEYS]) {
-          if (secret) value = value.replaceAll(secret, '***');
-        }
-        return value.replace(/\d+/g, '***');
-      };
       await this.#attempt(path, params, {beforeSend, maskText});
       return true;
     }
     try {
-      const data = await this.#attempt(path, {bizId, captcha, phone}, {});
-      return data == null || data === true || (typeof data === 'object' && !Array.isArray(data) && Object.keys(data).length === 0);
+      const data = await this.#attempt(path, {bizId, captcha, phone}, {maskText});
+      if (data == null || data === true || (typeof data === 'object' && !Array.isArray(data) && Object.keys(data).length === 0)) return true;
+      return 'unrecognized';
     } catch (error) {
       if (error.kind === 'business') return false;
+      if (error.kind === 'invalid' || (error.kind === 'http' && !(error.statusCode >= 500 && error.statusCode < 600))) {
+        return 'unrecognized';
+      }
       throw error;
     }
   }

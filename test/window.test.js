@@ -4,7 +4,8 @@ import { mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { rig } from '../test-support/rig.js';
+import { mockCaptcha, rig } from '../test-support/rig.js';
+import { PATHS } from '../server/qmai.js';
 
 const baseTime = Date.UTC(2026, 0, 1, 12, 0, 57);
 const memberPath = 'v3/crm/customer/getCustomerIdByCode';
@@ -12,7 +13,7 @@ const valid = { codeType: 'phone', code: '13800000000' };
 const callsLimited = '操作太频繁，请稍等一下再试。';
 const bindsLimited = '绑定尝试太频繁，请稍后再试。';
 
-async function withClock(t, limits) {
+async function withClock(t, limits, upstream) {
   const dir = await mkdtemp(join(tmpdir(), 'licha-window-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const clockFile = join(dir, 'clock');
@@ -29,9 +30,9 @@ Date.now = () => Number(readFileSync(${JSON.stringify(clockFile)}, 'utf8'));
   const service = await rig(t, {
     nodeArgs: ['--import', pathToFileURL(preload).href],
     env: { LICHA_SESSION_IDLE_TTL_MS: '7200000', ...limits },
-    upstream: (path) => path === memberPath
+    upstream: upstream ?? (path => path === memberPath
       ? { code: 0, status: true, data: { customerId: 0 } }
-      : { code: 400, status: false },
+      : { code: 400, status: false }),
   });
   async function attempt(offset, session, expectedError, args = valid) {
     await at(offset);
@@ -50,8 +51,42 @@ Date.now = () => Number(readFileSync(${JSON.stringify(clockFile)}, 'utf8'));
       assert.equal(after, before + 1);
     }
   }
-  return { service, attempt };
+  return { service, attempt, at };
 }
+
+test('BND-11/SES-08 第二步在到期前到达，排队或回执跨过到期时刻仍以企迈回执为准', async t => {
+  const firstCheck = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  let checks = 0;
+  const {service, at} = await withClock(t, {LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:'3',
+    LICHA_SMS_CODE_TTL_SEC:'30', LICHA_WRITE_TIMEOUT_MS:'5000'}, async path => {
+    if (path === memberPath) return {status:true, data:1234};
+    if (path === PATHS.smsCheck && ++checks === 1) {
+      firstCheck.resolve();
+      await resume.promise;
+      return {status:false};
+    }
+    return {status:true};
+  });
+  const s = await service.session();
+  assert.equal((await s.call('bind_member', valid)).isError, undefined);
+  await at(29999);
+  const check = () => s.call('bind_member', {...valid, captcha:mockCaptcha});
+  const first = check();
+  await firstCheck.promise;
+  const later = [check(), check()];
+  try {
+    // 还剩一个调用名额。收到立即限流的回包即表明另一笔已排进同设备队列。
+    assert.equal((await Promise.race(later)).content[0].text, callsLimited);
+    await at(31000);
+    const other = await service.session();
+    await other.call('my_orders'); // 到期后触发清理，已排队的校验仍能取得原待验证。
+  } finally { resume.resolve(); }
+  assert.equal((await first).content[0].text, '验证码不对，还可以再试 4 次。请顾客核对短信里的数字再报一次。');
+  const bound = (await Promise.all(later)).find(result => !result.isError);
+  assert.equal(JSON.parse(bound.content[0].text).bound, true);
+  assert.equal(checks, 2);
+});
 
 test('SES-09 任意连续六十秒内跨会话计数，拒绝不延长窗口，另一台设备独立', async (t) => {
   const { service, attempt } = await withClock(t, { LICHA_RATE_CALLS_PER_DEVICE_PER_MIN: '2' });
