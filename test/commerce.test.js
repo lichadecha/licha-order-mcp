@@ -12,8 +12,8 @@ import { beijingTime, digest } from '../server/common.js';
 import { checkOrderFields } from '../server/commerce.js';
 
 import {
-  memberA, memberB, phone, goodsId, skuId, shop, basket, number, ok, setup, success, failure,
-  bind, prepare, argsFor, place, count, bookFile, bookRecords, withBound
+  memberA, memberB, phone, phoneB, goodsId, skuId, shop, basket, number, ok, setup, success, failure,
+  bind, bindAgain, prepare, argsFor, place, count, bookFile, bookRecords, withBound
 } from '../test-support/commerce.js';
 
 test('绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01', async t => {
@@ -23,18 +23,22 @@ test('绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/
   for (const [tool, args] of [['prepare_order', basket], ['get_order_status', { orderNo: 'x' }], ['my_orders', {}], ['place_order', nowhere]])
     await failure(s, tool, args, /未绑定/);
   await failure(s, 'bind_member', { code: 'bad-number', codeType: 'phone' }, /收到长度：10/);
-  await failure(s, 'bind_member', { code: '  AB ', codeType: 'card' }, /收到长度：2/);
+  for (const codeType of ['card', 'dynamic_code']) {
+    await failure(s, 'bind_member', { code: 'FAKE-CARD', codeType }, /目前只支持用注册会员的手机号/);
+  }
   assert.equal(r.requests.length, 0);
   const first = await bind(s, '138 0000 0000');
   assert.equal(first.customerIdLast4, '***1234');
   assert.equal(first.boundVia, 'phone');
   const draft = await prepare(s);
   assert.equal(draft.member.last4, '***0000');
-  for (const code of ['0000', '0001', '0002']) await failure(s, 'bind_member', { code, codeType: 'card' }, /去微信搜/);
+  for (const code of ['13900000000', '13900000001', '13900000002']) await failure(s, 'bind_member', { code, codeType: 'phone' }, /去微信搜/);
   r.mock.override.set(PATHS.member, () => ({ status: false }));
-  await failure(s, 'bind_member', { code: 'FAKE_CARD_B', codeType: 'card' }, /查询会员信息/);
+  await failure(s, 'bind_member', { code: phoneB, codeType: 'phone' }, /查询会员信息/);
   r.mock.override.delete(PATHS.member);
-  const same = await bind(s, 'FAKE_CARD_A', 'dynamic_code');
+  const callsBeforeIdempotent = r.requests.length;
+  const same = await success(s, 'bind_member', { code: phone, codeType: 'phone' });
+  assert.equal(r.requests.length, callsBeforeIdempotent);
   assert.equal(same.boundAt, first.boundAt);
   assert.equal(same.boundVia, first.boundVia);
   assert.equal(same.rebound, undefined);
@@ -43,23 +47,23 @@ test('绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/
   assert.equal(req.params.mobile, phone);
   assert.equal(req.params.reservePhone, phone);
   assert.equal(req.params.userId, memberA);
-  assert.equal(r.requests.find(x => x.params.customerCode?.code === 'FAKE_CARD_A').params.customerCode.type, 0);
   const old = await prepare(s);
-  const replacement = await bind(s, 'ABCD', 'card');
+  const replacement = await bind(s, phoneB);
   assert.equal(replacement.rebound, true);
   assert.equal(replacement.previousCustomerIdLast4, '***1234');
   assert.equal(replacement.discardedPendingOrders, 1);
   await failure(s, 'place_order', argsFor(old), /不属于/);
   const second = await prepare(s);
-  assert.deepEqual(second.member, { last4: '***', via: 'card' });
+  assert.deepEqual(second.member, { last4: '***8888', via: 'phone' });
   await place(s, second);
   const reqB = r.requests.filter(x => x.path === PATHS.create).at(-1);
-  assert.ok(!('mobile' in reqB.params) && !('reservePhone' in reqB.params));
-  await bind(s);
+  assert.equal(reqB.params.mobile, phoneB);
+  assert.equal(reqB.params.reservePhone, phoneB);
+  await bindAgain(s);
   await failure(s, 'place_order', argsFor(old), /无效/);
   for (const file of [bookFile(r), ...['access','upstream','write'].map(n => join(r.logDir,n + '.jsonl'))]) {
     const bytes = await readFile(file, 'utf8');
-    for (const secret of [phone, memberA, memberB, 'FAKE_CARD_A', s.device]) assert.ok(!bytes.includes(secret), file);
+    for (const secret of [phone, phoneB, memberA, memberB, 'FAKE-CARD', s.device]) assert.ok(!bytes.includes(secret), file);
   }
 });
 
@@ -68,8 +72,8 @@ test('绑定查询限流不计预检与限流拒绝 BND-09', async t => {
   const a = await r.session(), b = await r.session(), c = await r.session();
   await failure(a, 'bind_member', { code: 'invalid', codeType: 'phone' }, /格式/);
   await bind(a);
-  await failure(a, 'bind_member', { code: phone, codeType: 'phone' }, /太频繁/);
-  await bind(b);
+  await failure(a, 'bind_member', { code: phoneB, codeType: 'phone' }, /太频繁/);
+  await bind(b, phoneB);
   await failure(c, 'bind_member', { code: phone, codeType: 'phone' }, /太频繁/);
   assert.equal(count(r, PATHS.member), 2);
 });
@@ -77,8 +81,8 @@ test('绑定查询限流不计预检与限流拒绝 BND-09', async t => {
 test('设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03', async t => {
   const { r, s } = await withBound(t, { LICHA_CONFIRM_TOKEN_TTL_MS: '400' });
   const same = await r.session(s.device), other = await r.session();
+  await bindAgain(other);
   const first = await prepare(same);
-  await bind(other);
   const newer = await prepare(other);
   assert.equal(newer.supersededPendingOrders, 1);
   await failure(other, 'place_order', argsFor(first), /无效/);
@@ -89,7 +93,7 @@ test('设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03',
   await delay(410);
   await failure(same, 'place_order', argsFor(first), /无效/);
   assert.equal(count(r, PATHS.create), 0);
-  await bind(other, 'FAKE_CARD_B', 'card');
+  await bind(other, phoneB);
   const [draftA,draftB] = await Promise.all([prepare(same), prepare(other)]);
   const [orderA,orderB] = await Promise.all([place(same,draftA), place(other,draftB)]);
   assert.notEqual(orderA.orderNo, orderB.orderNo);
@@ -121,7 +125,7 @@ test('券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01
   m.code = '';
   await r.restart();
   const newSession = await r.session();
-  await bind(newSession);
+  await bindAgain(newSession);
   assert.match((await prepare(newSession)).coupons.note, /门店暂时查不了券/);
   assert.equal(count(r, PATHS.coupons) - before, 1);
 });
@@ -161,8 +165,8 @@ test('并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 
 test('同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05', async t => {
   const { r, s, m } = await withBound(t, { LICHA_MAX_ORDERS_PER_DAY:'1', LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1' });
   const a2 = await r.session(), b = await r.session();
-  await bind(a2);
-  await bind(b, 'FAKE_CARD_B','card');
+  await bindAgain(a2);
+  await bind(b, phoneB);
   const draftB = await prepare(b);
   const draftA = await prepare(s);
   const arrived = Promise.withResolvers(), release = Promise.withResolvers();
@@ -184,11 +188,11 @@ test('同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED
   await r.restart();
   const resumed = await r.session(s.device);
   await failure(resumed,'place_order',argsFor(draftA),/未绑定/);
-  await bind(resumed);
+  await bindAgain(resumed);
   await failure(resumed,'place_order',argsFor(draftA),/无效/);
   await failure(resumed,'place_order',argsFor(await prepare(resumed)),/每位会员每天最多 1 单/);
   const other = await r.session();
-  await bind(other, 'FAKE_CARD_B','card');
+  await bind(other, phoneB);
   await failure(other,'place_order',argsFor(await prepare(other)),/总单量/);
   const text = await readFile(bookFile(r),'utf8');
   const [row] = bookRecords(r);
@@ -308,13 +312,13 @@ test('查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08', asy
 test('未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08', async t => {
   const {r,s,m} = await withBound(t,{ LICHA_ORDER_MATCH_WINDOW_MS:'450', LICHA_MAX_ORDERS_PER_DAY:'10' });
   const b = await r.session();
-  await bind(b,'FAKE_CARD_B','card');
+  await bind(b, phoneB);
   // 已知成功的订单也处于匹配窗口。
   const prior = await place(s,await prepare(s));
   m.override.set(PATHS.create, () => ok({}));
   await failure(s,'place_order',argsFor(await prepare(s)),/结果未知/);
   m.override.delete(PATHS.create);
-  await failure(s,'bind_member',{code:'FAKE_CARD_B',codeType:'card'},/暂时不能换人/);
+  await failure(s,'bind_member',{code:phoneB,codeType:'phone'},/暂时不能换人/);
   await failure(s,'place_order',argsFor(await prepare(s)),/先调用 my_orders/);
   const status = await success(s,'get_order_status',{orderNo:prior.orderNo});
   assert.equal(status.unresolvedPendingWrites,1);
@@ -347,7 +351,7 @@ test('未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/0
   assert.ok(!confirmed.pendingWriteNote.includes('请引导顾客去'));
   await r.restart();
   const s2=await r.session(s.device);
-  await bind(s2);
+  await bindAgain(s2);
   m.override.set(PATHS.create,()=>ok({}));
   await failure(s2,'place_order',argsFor(await prepare(s2)),/结果未知/);
   candidate.orderAt=r.requests.filter(x=>x.path===PATHS.create).at(-1).at;
@@ -378,10 +382,10 @@ test('零元预估不占位 WRT-08', async t => {
   assert.equal(count(r,PATHS.create),0);
 });
 
-test('发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 WRT-06/11 LED-02/03', async t => {
+test('发送前账本故障时停止创建、已绑定仍可查单、重启后可浏览 PRE-02 WRT-06/11 LED-02/03', async t => {
   const { r,s } = await withBound(t);
   const second = await r.session();
-  await bind(second,'FAKE_CARD_B','card');
+  await bind(second, phoneB);
   const a = await prepare(s), b = await prepare(second);
   const file = bookFile(r);
   await rename(file,file+'.backup');
@@ -389,14 +393,14 @@ test('发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 
   await failure(s,'place_order',argsFor(a),/没有发出/);
   await failure(second,'place_order',argsFor(b),/安全账本不可用/);
   await failure(s,'prepare_order',basket,/安全账本不可用/);
+  assert.equal((await success(s,'my_orders')).count,0);
   assert.equal(count(r,PATHS.create),0);
   const assertFault = async () => {
     await r.restart();
     const resumed = await r.session(s.device);
-    await bind(resumed);
-    await failure(resumed,'prepare_order',basket,/安全账本不可用/);
+    await failure(resumed,'bind_member',{code:phone,codeType:'phone'},/安全账本不可用/);
     assert.equal((await success(resumed,'preview_order',basket)).ok,true);
-    assert.equal((await success(resumed,'my_orders')).count,0);
+    await failure(resumed,'my_orders',{},/尚未绑定/);
   };
   await assertFault();
   await rm(file,{recursive:true});
@@ -406,7 +410,7 @@ test('发送前账本故障时停止创建、重启后仍可浏览查单 PRE-02 
   await rename(file+'.backup',file);
   await r.restart();
   const recovered=await r.session();
-  await bind(recovered);
+  await bindAgain(recovered);
   await place(recovered,await prepare(recovered));
 });
 
@@ -428,7 +432,7 @@ test('已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04
   await rename(file+'.backup',file);
   await r.restart();
   const current=await r.session(s.device);
-  await bind(current);
+  await bindAgain(current);
   const draft=await prepare(current);
   await failure(current,'place_order',argsFor(draft),/状态未知/);
   m.orders=[{orderNo:number(99),userId:memberA,orderAt:at,status:10,storeId:shop}];
@@ -443,7 +447,7 @@ test('已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04
   await rename(file+'.backup',file);
   await r.restart();
   const verified=await r.session(s.device);
-  await bind(verified);
+  await bindAgain(verified);
   assert.equal((await success(verified,'my_orders')).resolvedPendingWrites,1);
   await failure(verified,'place_order',argsFor(await prepare(verified)),/每位会员每天最多 1 单/);
   assert.equal(count(r,PATHS.create),1);
@@ -452,7 +456,7 @@ test('已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04
 test('强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/07/08 UNR-05/06',async t=>{
   const {r,s,m}=await withBound(t,{LICHA_WRITE_TIMEOUT_MS:'4000'});
   const second=await r.session();
-  await bind(second);
+  await bindAgain(second);
   const arrived=Promise.withResolvers();
   m.override.set(PATHS.create,()=>{arrived.resolve();return undefined;});
   const submitted=s.call('place_order',argsFor(await prepare(s))).catch(()=>null);
@@ -469,7 +473,7 @@ test('强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/
   await submitted;
   await r.start();
   const restarted=await r.session();
-  await bind(restarted);
+  await bindAgain(restarted);
   await failure(restarted,'place_order',argsFor(await prepare(restarted)),/状态未知/);
   const cli=fileURLToPath(new URL('../server/ledger-cli.js',import.meta.url));
   const run=(...args)=>spawnSync(process.execPath,[cli,...args],{cwd:r.cwd,env:r.env,encoding:'utf8'});
@@ -483,7 +487,7 @@ test('强杀真实进程、跨重启人工核对及唯一认领 LED-01/04/05/06/
   assert.notEqual(run('resolve',row.key,'absent','重复核对').status,0);
   await r.start();
   const fixed=await r.session();
-  await bind(fixed);
+  await bindAgain(fixed);
   assert.equal((await success(fixed,'my_orders')).unresolvedPendingWrites,undefined);
   m.override.set(PATHS.create,()=>ok({}));
   await failure(fixed,'place_order',argsFor(await prepare(fixed)),/结果未知/);
@@ -503,6 +507,7 @@ async function secondInstance(t, first) {
   const second = await rig(t, {env:{LICHA_ENABLE_ORDERING:'0', QMAI_BASE_URL:first.env.QMAI_BASE_URL}});
   await second.stop();
   second.env.LICHA_ENABLE_ORDERING = '1';
+  second.env.LICHA_SMS_COOLDOWN_SEC = first.env.LICHA_SMS_COOLDOWN_SEC;
   second.env.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY = first.env.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY ?? '5';
   return second;
 }
@@ -530,7 +535,7 @@ test('全新目录双实例并发抢锁、别名与死亡接管 LED-06', async t
   await winner.stop('SIGKILL');
   await loser.start();
   const resumed = await loser.session();
-  await bind(resumed);
+  await bindAgain(resumed);
   const draft = await prepare(resumed);
   assert.equal(draft.recentOrder.orderNo,placed.orderNo);
   await failure(resumed,'place_order',argsFor(draft),/每位会员每天最多 1 单/);
@@ -593,7 +598,7 @@ test('UNR-03/07 有单说明列出吻合订单，按支付状态顺序附上三�
 test('迟到的订单列表只核对查询开始时的未决 UNR-05', async t => {
   const {r,s,m} = await withBound(t);
   const other = await r.session();
-  await bind(other);
+  await bindAgain(other);
   const fetching = Promise.withResolvers();
   const respond = Promise.withResolvers();
   m.override.set(PATHS.orderList, async () => { fetching.resolve(); return ok(await respond.promise); });
@@ -644,7 +649,7 @@ test('UNR-03 商品名称、编号和杯数随发送记录恢复，畸形时间�
   const at = bookRecords(r)[0].time;
   await r.restart();
   const again = await r.session();
-  await bind(again);
+  await bindAgain(again);
   const candidate = { orderNo: number(42), userId: memberA, storeId: shop, orderAt: at,
     status: 50, actualAmount: 3000 };
   await delay(260);
@@ -699,7 +704,7 @@ test('PRE-11 自动认领与停服人工裁决均按发出时刻提醒再下单'
   assert.equal(run.status, 0, run.stderr);
   await r.start();
   const again = await r.session();
-  await bind(again);
+  await bindAgain(again);
   const recent = (await prepare(again)).recentOrder;
   assert.equal(recent.orderNo, number(92));
   assert.equal(recent.orderTime, beijingTime(second.time));
@@ -757,7 +762,7 @@ test('QRY-04 两位会员各有一单，列表夹入缺少会员号的他人订�
   assert.equal(clean.note, '只列出最近 7 天、最多 10 条本人订单。要看某一单的最新状态用 get_order_status。');
 
   const other = await r.session();
-  await bind(other, 'FAKE_CARD_B', 'card');
+  await bind(other, phoneB);
   m.price = 3899;
   const placed = await place(other, await prepare(other));
   const foreign = m.orders.find(row => row.orderNo === placed.orderNo);
@@ -812,7 +817,7 @@ test('BND-02 R24 会员查询支持标量编号，未知形态报告查询失败
   const first = await bind(s);
   assert.equal(first.customerIdLast4, '***');
   payload = memberA;
-  assert.equal((await bind(s)).customerIdLast4, '***1234');
+  assert.equal((await bind(s, phoneB)).customerIdLast4, '***1234');
   for (const shape of [{}, { id: memberA }, [memberA], true, null, { customerId: [memberA] }]) {
     payload = shape;
     await failure(s, 'bind_member', { code: phone, codeType: 'phone' }, /查询会员信息时出了点问题/);
@@ -822,20 +827,19 @@ test('BND-02 R24 会员查询支持标量编号，未知形态报告查询失败
   assert.equal((await prepare(s)).member.via, 'phone');
 });
 
-test('LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览查单', async t => {
+test('LED-02 LED-06 逐个破坏已下单账本文件，单实例故障态与双实例唯一胜者仍可浏览、拒绝新绑定', async t => {
   const {r,s} = await withBound(t);
   const receipt = await place(s,await prepare(s));
+  assert.equal((await success(s,'my_orders')).orders[0].orderNo,receipt.orderNo);
   const second = await secondInstance(t,r);
   await r.stop();
   const files = await readdir(r.dataDir,{withFileTypes:true});
   assert.ok(files.some(entry => entry.isFile()),'真实下单后应有持久化文件');
   async function checkFault(instance) {
     const customer = await instance.session();
-    await bind(customer);
+    await failure(customer,'bind_member',{code:phone,codeType:'phone'},/安全账本不可用/);
     assert.equal((await success(customer,'preview_order',basket)).ok,true);
-    const list = await success(customer,'my_orders');
-    assert.equal(list.orders[0].orderNo,receipt.orderNo);
-    await failure(customer,'prepare_order',basket,/账本不可用/);
+    await failure(customer,'my_orders',{},/尚未绑定/);
     assert.equal(count(r,PATHS.create),1);
   }
   for (const file of files.filter(entry => entry.isFile())) {
@@ -891,9 +895,9 @@ test('LED-02 LED-06 既有账本截为零字节仍能独占并保持故障态', 
   await writeFile(path,'');
   await r.start();
   const customer = await r.session();
-  await bind(customer);
-  await failure(customer,'prepare_order',basket,/账本不可用/);
-  assert.equal((await success(customer,'my_orders')).count,1);
+  await failure(customer,'bind_member',{code:phone,codeType:'phone'},/安全账本不可用/);
+  await failure(customer,'my_orders',{},/尚未绑定/);
+  assert.equal((await success(customer,'preview_order',basket)).ok,true);
   assert.equal(count(r,PATHS.create),1);
 });
 
@@ -912,7 +916,7 @@ test('LED-06 账本目录不可写时启动失败，恢复写权限后可接管'
   }
   await r.start();
   const resumed = await r.session();
-  await bind(resumed);
+  await bindAgain(resumed);
   assert.equal((await prepare(resumed)).recentOrder.orderNo,receipt.orderNo);
 });
 

@@ -21,9 +21,9 @@ test('R25 BND-02/03 WRT-18 QRY-03 金额分、状态与会员编号按原文的�
   const s = await r.session();
   for (const encode of [JSON.rawJSON, String]) {
     r.mock.override.set(PATHS.member, () => ok({ customerId: encode('0.0') }));
-    await failure(s, 'bind_member', { code: 'CARD', codeType: 'card' }, /去微信搜/);
+    await failure(s, 'bind_member', { code: '13900000001', codeType: 'phone' }, /去微信搜/);
     r.mock.override.set(PATHS.member, () => ok(encode(memberA + '0e-1')));
-    await bind(s);
+    await bind(s, encode === String ? '13800000001' : '13800000000');
     r.mock.couponRows = [
       { title: '测试券甲', unUseStatus: encode('0.999999999999999999'), userCouponCanDisAmount: 3 },
       { id: '802', title: '测试券乙', unUseStatus: encode('1.0'), couponCenterType: encode('1.999999999999999999'), userCouponCanDisAmount: 1 }

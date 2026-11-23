@@ -1,16 +1,14 @@
-import { randomBytes } from 'node:crypto';
+import { createBindingFlow, memberView } from './binding.js';
 import { isDeepStrictEqual } from 'node:util';
 import { currentQuotaDay, issueConfirmation } from './logs.js';
-import { beijingTime, couponInstanceId, couponTextMask, decimalId, digest, integerDigits, responseId, tail, yuan } from './common.js';
+import { beijingTime, couponInstanceId, couponTextMask, decimalId, digest, responseId, yuan } from './common.js';
 import { PATHS, readHint } from './qmai.js';
 import { Ledger } from './ledger.js';
-import { couponView, listedProducts, sameProducts, nonnegativeInteger, orderNumber, orderView, placedView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
+import { couponView, listedProducts, sameProducts, nonnegativeInteger, pendingCount, orderNumber, orderView, placedView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
 
 const bookProblem = '安全账本不可用，已拒绝下单。未决核对、当日额度、防重复都靠这本账本，读不出它就等于没有护栏。请稍后再试或直接在小程序下单；看菜单和查订单不受影响。';
 const missingToken = '确认令牌无效（不存在或已被使用过）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。';
 const replaced = '这张待确认单已被更新的一版替代（顾客之后又重新组过单），不能再提交。请按最后念给顾客的那张确认；要用这一版就重新组单。';
-const bindFailed = '绑定暂时没成功（查询会员信息时出了点问题，不是你的号有问题）。稍等一下再试一次。';
-const notMember = '这个号还不是李茶的茶会员，所以没法帮你下单。去微信搜「李茶的茶」小程序注册一下（用同一个手机号，很快），注册好回来跟我说一声，我再帮你绑。';
 const forbidden = new Set(['isPre', 'preTime', 'preTimeStart', 'preTimeEnd', 'isWaiterCheck', 'orderSubType', 'payModel']);
 const couponKeys = new Set(['lastSelect', 'attendCouponIds', 'attendCouponType', 'useCouponId', 'couponId']);
 const dayMs = 86400000;
@@ -58,27 +56,7 @@ function queryError(error, fallback) {
   return error.kind === 'business' ? (error.message === '未知错误' ? fallback : error.message) : readHint(error);
 }
 
-const memberView = b => ({ last4: b.identifierTail, via: b.via });
-const bindingView = b => ({ bound: true, customerIdLast4: b.customerIdTail, member: memberView(b),
-  boundVia: b.via, boundAt: beijingTime(b.created) });
-const pendingCount = rows => `${rows.length} 笔状态未知${rows[0]?.time ? '，最早一笔发生在 ' + beijingTime(rows[0].time) : ''}`;
 const owner = row => responseId(row?.userId);
-
-// 映射随这一次会员绑定释放。同设备的新会话和同会员的幂等绑定共用它。
-function createCouponRefs() {
-  const refById = new Map();
-  const couponByRef = new Map();
-  return {
-    issue(id, title) {
-      if (refById.has(id)) return refById.get(id);
-      const ref = randomBytes(24).toString('base64url');
-      refById.set(id, ref);
-      couponByRef.set(ref, { id, title });
-      return ref;
-    },
-    get(ref) { return couponByRef.get(ref); }
-  };
-}
 
 export async function createCommerce(config, qmai, browse, logs) {
   const book = new Ledger(config.LICHA_DATA_DIR);
@@ -86,8 +64,8 @@ export async function createCommerce(config, qmai, browse, logs) {
   const bindings = new Map();
   const drafts = new Map();
   const flights = new Map();
-  const bindTimes = new Map();
-  let globalBindTimes = [];
+  const bindingFlow = createBindingFlow({ config, qmai, book, logs, bindings, unresolved,
+    discardDrafts: (device, hash) => supersede(draft => draft.device === device && draft.hash === hash, 'rebound') });
   const tokenTtl = config.LICHA_CONFIRM_TOKEN_TTL_MS;
   const minutes = tokenTtl / 60000;
   const windowMs = config.LICHA_ORDER_MATCH_WINDOW_MS;
@@ -100,7 +78,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       }
     }
     for (const [token, draft] of drafts) if (now >= draft.expires + tokenTtl) drafts.delete(token);
-    for (const [device, times] of bindTimes) if (times.at(-1) <= now - 3600000) bindTimes.delete(device);
+    bindingFlow.sweep(now);
   }
 
   function supersede(match, state = 'replaced') {
@@ -118,66 +96,6 @@ export async function createCommerce(config, qmai, browse, logs) {
 
   function unresolved(hash) {
     return book.unresolved(hash).filter(row => !flights.has(row.key));
-  }
-
-  async function bind({ code, codeType }, device) {
-    const clean = code.replace(/\s+/gu, '');
-    const allDigits = /^\d+$/.test(clean);
-    const length = [...clean].length;
-    function reject(reason, message) {
-      logs.access({event:'bind_rejected', reason}, {device});
-      throw Error(message);
-    }
-    if (codeType === 'phone' && (length !== 11 || !allDigits)) {
-      reject('format', `code 格式不正确：codeType=phone 要求去除空白后为 11 位纯数字（收到长度：${length}，是否全为数字：${allDigits ? '是' : '否'}）`);
-    }
-    if (length < 4 || length > 64) reject('format', `code 格式不正确：codeType=${codeType} 要求去除空白后长度在 4-64 之间（收到长度：${length}）`);
-    if (!config.QMAI_OPEN_ID || !config.QMAI_OPEN_KEY || !config.QMAI_GRANT_CODE) {
-      reject('credentials', '凭证不完整：服务端缺少企迈凭证，暂时无法查询。');
-    }
-    const now = Date.now();
-    const local = (bindTimes.get(device) || []).filter(time => time > now - 3600000);
-    globalBindTimes = globalBindTimes.filter(time => time > now - 60000);
-    if (local.length >= config.LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR || globalBindTimes.length >= config.LICHA_RATE_BINDS_GLOBAL_PER_MIN) {
-      reject('rate_limit', '绑定尝试太频繁，请稍后再试。');
-    }
-    local.push(now);
-    bindTimes.set(device, local);
-    globalBindTimes.push(now);
-    let data;
-    try {
-      data = await qmai.read(PATHS.member, { customerCode: { code: clean, type: { phone: 1, card: 2, dynamic_code: 0 }[codeType] } });
-    } catch (error) {
-      reject(error.kind, error.kind === 'credentials' ? error.message : bindFailed);
-    }
-    const wrapped = data !== null && typeof data === 'object' && Object.hasOwn(data, 'customerId');
-    const value = wrapped ? data.customerId : data;
-    const digits = integerDigits(value);
-    if ((wrapped && value === null) || digits === '0' || (typeof value === 'string' && /^0*$/.test(value.trim()))) {
-      reject('not_member', notMember);
-    }
-    const id = decimalId(digits);
-    if (!id) reject('invalid_response', bindFailed);
-    const previous = bindings.get(device);
-    if (previous?.id === id) {
-      logs.access({event:'bind', reason:'same_member'}, {device, memberId:previous.id});
-      return { ...bindingView(previous), note: '本设备原本绑的就是这一位会员，无需重新绑定。' };
-    }
-    const pending = previous ? unresolved(previous.hash) : [];
-    if (pending.length) reject('unresolved', `暂时不能换人：上一次下单请求的结果还没核对清楚（${pendingCount(pending)}）。\n先用「看看我最近的订单」把那一单核对掉，再换人——否则那笔单到底成没成就没人能确认了。`);
-    const created = Date.now();
-    const displayId = typeof value === 'string' && /^\d+$/.test(value) ? value : id;
-    const binding = { id, hash: digest(id), customerIdTail: tail(displayId), identifierTail: tail(clean),
-      via: codeType, created, touched: created, couponRefs: createCouponRefs(),
-      ...(codeType === 'phone' && { phone: clean }) };
-    const discarded = previous ? supersede(draft => draft.device === device && draft.hash === previous.hash, 'rebound') : 0;
-    bindings.set(device, binding);
-    logs.access({event: previous ? 'rebind' : 'bind', discarded}, {device, memberId:id, previousMemberId:previous?.id});
-    if (!previous) return bindingView(binding);
-    return { ...bindingView(binding), rebound: true, previousCustomerIdLast4: previous.customerIdTail,
-      previousMember: memberView(previous), discardedPendingOrders: discarded,
-      note: `已从${previous.identifierTail}换成${binding.identifierTail}。` +
-        (discarded ? `原来那位顾客还没确认的 ${discarded} 张单已作废，需要重新组单。` : '') };
   }
 
   function requireBinding(name, device) {
@@ -480,13 +398,13 @@ export async function createCommerce(config, qmai, browse, logs) {
     try {
       let result;
       if (name === 'place_order') result = await place(args, device);
-      else if (name === 'bind_member') result = await bind(args, device);
+      else if (name === 'bind_member') result = await bindingFlow.bind(args, device);
       else {
         const binding = requireBinding(name, device);
         const handler = { prepare_order: prepare, get_order_status: status, my_orders: orders }[name];
         result = await handler(args, binding, device);
       }
-      bindings.get(device).touched = Date.now();
+      if (name !== 'bind_member' || result.bound) bindings.get(device).touched = Date.now();
       return result;
     } finally {
       if (current) current.busy = false;

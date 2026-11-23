@@ -1,5 +1,7 @@
 import { beijingTime, couponInstanceId, digest, integerDigits, projectText, responseId, yuan } from './common.js';
 
+export const pendingCount = rows => `${rows.length} 笔状态未知${rows[0]?.time ? '，最早一笔发生在 ' + beijingTime(rows[0].time) : ''}`;
+
 export function toFen(value) {
   if (typeof value !== 'number' && typeof value !== 'string') return null;
   const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(String(value).trim());

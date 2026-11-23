@@ -1,8 +1,18 @@
-# 李茶的茶点单 MCP v1.10.1 交付清单
+# 李茶的茶点单 MCP v1.11 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.10.1 券归属、实例冲突与实付核对
+## v1.11 手机号绑定与短信验证
+
+- **会员绑定。** 同设备首次绑定手机号需通过企迈验证码校验。换绑前及校验通过后均核对原会员未决订单。发码到校验期间保留原绑定和待确认单，卡号和动态码在本地拒绝。短信校验从严接受 R27 的四种肯定回执，校验请求失败保留剩余次数。[绑定与审计回归](test/sms-binding.test.js)
+- **短信出口。** 开通下单须设置有效的 `LICHA_SMS_EVENT_NO`。独立出口只放行发码和校验，发码消耗与本次请求、手机号匹配的一次性落盘凭据，两项均只尝试一次。[配置与出口测试](test/sms-gateway.test.js)
+- **恢复与隐私。** 发码按手机号摘要落盘，冷却、滚动小时和北京时间自然日上限跨设备、跨重启生效。短信服务明确拒绝或回执不明也占用次数。格式 2 账本自动升至格式 3，保留订单。重启清除内存中的待验证，账本故障停止发码。绑定闲置期默认 30 天。[账本升级与限频](test/sms-ledger.test.js) · [跨设备及重启验收](test/sms-binding-recovery.test.js)
+
+**全量回归。** 基线 `fa7f891`。新增 25 项测试，其中绑定流程、过期与隐私 8 项，配置、出口与回执 6 项，账本 6 项，跨设备与重启 5 项。Node 22.23.1 完整运行 `npm test`，230 项全部通过，失败、跳过、取消均为 0。
+
+**实测边界。** 本轮使用假凭证和本机模拟企迈。商家后台的事件编号、短信单价，以及正确码、错误码、过期码的真实回执仍待品牌方核实。
+
+## v1.10.1 券归属、实例冲突与实付核对（历史记录）
 
 - **组单。** 逐行核对 `customerId` 和 `user_id`。明示他人、归属无效或矛盾时排除整张券。同一实例的可用性、可抵金额或原始券名有冲突时也排除整张，一致重复只计一次。缺实例 ID 或两个归属都缺时继续列出并参与默认预测，省略该张的 `ref`。指定时现查，旧编号不能绕过本次判定。正反行序、甲指定乙的可用券被拒且创建请求为零、三张券中只删除一行 ID，均有回归。[组单与 R26 完整请求体](test/coupon-preparation.test.js)
 - **文字与日志。** 从整次筛券响应取实例 ID，组单、创建错误、读回错误及优惠明细共用本单的遮盖规则。7 位 ID 显示为 `***`，19 位只露尾四位。WRT-01 的多余字段路径按段核对设备券编号，命中的段显示为 `（券编号）`。回环测试同时检查访问、写入、上游三本日志。[遮盖与日志回归](test/coupon-redaction.test.js)
@@ -201,7 +211,7 @@
 | LED-03、LED-06 | 已用进程强杀、同步错误注入与磁盘文件损坏验证恢复。物理断电、损坏的存储硬件以及网络文件系统锁语义未验证。部署目标为本机持久化文件系统。 |
 | PRE-12、WRT-20、P1 | 本服务在真实企迈下单后的用券和实付仍待联调。契约 §3.10.4 记录的 11-23 两笔探针测试覆盖一张普通券，自动生效类券和非券活动的表现仍待验证。指定用哪张券排在第二版。 |
 | BND-10、PRE-06、WRT-19 | 真实身份持有证明、非零加价的价格单位及全额抵扣后的订单状态仍待真实环境核实。 |
-| SES-04、WRT-09、§8 | 实际开放时的绑定时长和额度仍待确认（P3、P4）。生产部署、旧版停单及人工清算未执行。 |
+| SES-04、WRT-09、§8 | 绑定闲置期已按 P3 定为默认 30 天，实际开放时的订单额度待确认（P4）。生产部署、旧版停单及人工清算未执行。 |
 | 独立验收 | 第五轮黑盒结果由负责人提供。v1.4 尚未经新一轮独立黑盒复验。本地只使用假钥匙与回环 HTTP。 |
 | 品牌 Skill 话术 | 根目录 `SKILL.md` 已使用 `member.last4`。本轮验证到 MCP 工具出参，未验证实际 AI 客户端的口播。 |
 
@@ -243,8 +253,8 @@
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
 | ORD-01 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L27) |
-| ORD-02 | [server/qmai.js](server/qmai.js) · readPaths、Qmai.write · [账本发送凭据](server/ledger.js) | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12)<br>[ORD-02 增加路径常量不会自动获得读权限](test/write-gate.test.js#L37) |
-| ORD-03 | [server/qmai.js](server/qmai.js) · Qmai.read、Qmai.write | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292) |
+| ORD-02 | [server/qmai.js](server/qmai.js) · readPaths、Qmai.write、Qmai.sms · [账本发送凭据](server/ledger.js) | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12)<br>[ORD-02 增加路径常量不会自动获得读权限](test/write-gate.test.js#L37) |
+| ORD-03 | [server/qmai.js](server/qmai.js) · Qmai.read、Qmai.write、Qmai.sms | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292) |
 
 ### 浏览与算价
 
@@ -265,16 +275,20 @@
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
-| BND-01 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-02 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19)<br>[BND-02 R24 会员查询支持标量编号，未知形态报告查询失败并保留原绑定](test/commerce.test.js#L749) |
-| BND-03 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-04 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-05 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-06 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-07 | [server/commerce.js](server/commerce.js) · bind | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
-| BND-08 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
-| BND-09 | [server/commerce.js](server/commerce.js) · bind | [绑定查询限流不计预检与限流拒绝 BND-09](test/commerce.test.js#L66)<br>[BND-09 格式预检、设备一小时与全局一分钟滑窗分别计数，在边界释放](test/window.test.js#L70) |
-| BND-10 | [server/commerce.js](server/commerce.js) · bind | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-01 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-02 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19)<br>[BND-02 R24 会员查询支持标量编号，未知形态报告查询失败并保留原绑定](test/commerce.test.js#L749) |
+| BND-03 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-04 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-05 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-06 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-07 | [server/binding.js](server/binding.js) | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
+| BND-08 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-09 | [server/binding.js](server/binding.js) | [绑定查询限流不计预检与限流拒绝 BND-09](test/commerce.test.js#L66)<br>[BND-09 格式预检、设备一小时与全局一分钟滑窗分别计数，在边界释放](test/window.test.js#L70) |
+| BND-10 | [server/binding.js](server/binding.js) | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
+| BND-11 | [两步绑定](server/binding.js) | [待验证、换绑、失败与作废](test/sms-binding.test.js) |
+| BND-12 | [发码计数与落盘凭据](server/ledger.js) | [三层限频](test/sms-ledger.test.js) · [并发、重启与故障](test/sms-binding-recovery.test.js) |
+| BND-13 | [设备待验证](server/binding.js) | [重启失效](test/sms-binding-recovery.test.js) · [出参与日志隐私](test/sms-binding.test.js) |
+| BND-14 | [访问审计](server/logs.js) | [发码和校验分类、手机号与设备摘要](test/sms-binding.test.js) |
 
 ### 组单
 

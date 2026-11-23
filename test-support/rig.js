@@ -8,6 +8,24 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 
+export const mockCaptcha = '048257';
+
+export function mockSmsUpstream() {
+  const challenges = new Map();
+  return (path, params) => {
+    if (path === 'v3/message/commonSendSmsCaptcha') {
+      challenges.set(params.bizId, params.customerPhone);
+      return {status:true};
+    }
+    if (path === 'v3/message/commonCheckSmsCaptcha') {
+      const passed = challenges.has(params.bizId) && challenges.get(params.bizId) === params.phone &&
+        params.captcha === mockCaptcha;
+      if (passed) challenges.delete(params.bizId);
+      return {status:passed};
+    }
+  };
+}
+
 export const serverPath = fileURLToPath(new URL('../server/main.js',import.meta.url));
 const loopback = '127.0.0.1';
 async function listen(server) {
@@ -25,6 +43,7 @@ export async function freePort() {
 export async function rig(t,options = {}) {
   const cwd = await mkdtemp(join(tmpdir(),'licha-test-'));
   const requests = [];
+  const sms = options.mockSms ? mockSmsUpstream() : undefined;
   const upstream = http.createServer(async(req,res) => {
     try {
       const chunks = [];
@@ -34,9 +53,9 @@ export async function rig(t,options = {}) {
         typeof value === 'number' && /^-?\d{15,}$/.test(ctx.source) ? ctx.source : value);
       const path = req.url.replace(/^\//,'');
       requests.push({path,params:body.params,body,raw,at:Date.now()});
-      const reply = options.upstream
+      const reply = sms?.(path,body.params) ?? (options.upstream
         ? await options.upstream(path,body.params,{req,res,body,raw})
-        : {status:true,code:0,data:[]};
+        : {status:true,code:0,data:[]});
       if (reply !== undefined && !res.writableEnded) {
         res.setHeader('content-type','application/json');
         res.end(JSON.stringify(reply));
@@ -54,7 +73,7 @@ export async function rig(t,options = {}) {
     HOST:loopback, PORT:String(await freePort()), QMAI_BASE_URL:'http://' + loopback + ':' + upstreamPort + '/',
     QMAI_OPEN_KEY:'FAKE_SIGNING_KEY',QMAI_OPEN_ID:'FAKE_OPEN_ID',QMAI_GRANT_CODE:'FAKE_GRANT_CODE',
     LICHA_ACCESS_KEYS:'FAKE_ACCESS_KEY',LICHA_DATA_DIR:join(cwd,'data'),LICHA_LOG_DIR:join(cwd,'logs'),
-    LICHA_ENABLE_ORDERING:'1',LICHA_UPSTREAM_MIN_INTERVAL_MS:'2',LICHA_READ_BACKOFF_MS:'3,5',
+    LICHA_ENABLE_ORDERING:'1',LICHA_SMS_EVENT_NO:'42',LICHA_UPSTREAM_MIN_INTERVAL_MS:'2',LICHA_READ_BACKOFF_MS:'3,5',
     LICHA_READ_TIMEOUT_MS:'1000',LICHA_WRITE_TIMEOUT_MS:'1000',...options.env
   });
   for (const [key,value] of Object.entries(env)) if (value === undefined) delete env[key];

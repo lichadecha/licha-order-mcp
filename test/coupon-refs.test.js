@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { basket, bind, failure, memberA, prepare, success, withBound } from '../test-support/commerce.js';
+import { basket, bind, bindAgain, phone, phoneB, failure, memberA, prepare, success, withBound } from '../test-support/commerce.js';
 
 const couponId = '7200000000000000001';
 const coupon = { id: couponId, customerId: memberA, title: '茶券', unUseStatus: 1, userCouponCanDisAmount: 3 };
@@ -29,7 +29,7 @@ test('PRE-13 同设备跨会话、会员幂等重绑、券 ID 等值写法与列
   const first = (await prepare(s)).coupons.usable.map(row => row.ref);
   assert.equal(new Set(first).size, 2);
   const next = await r.session(s.device);
-  await bind(next, 'FAKE_CARD_A', 'card');
+  assert.equal((await success(next, 'bind_member', { code: phone, codeType: 'phone' })).bound, true);
   m.couponRows = [sameTitle, { ...coupon, id: '07200000000000000001.0' }];
   const chosen = (await success(next, 'prepare_order', specific(first[0]))).coupons;
   assert.equal(chosen.choice, 'specific');
@@ -43,13 +43,13 @@ test('PRE-13 别的设备即使同会员也不能用编号，换绑再绑回也�
   m.couponRows = [coupon];
   const ref = await firstRef(s);
   const other = await r.session();
-  await bind(other);
+  await bindAgain(other);
   await checkExpired(r, other, ref);
   const otherRef = await firstRef(other);
   assert.notEqual(otherRef, ref);
-  await bind(s, 'FAKE_CARD_B', 'card');
+  await bind(s, phoneB);
   await checkExpired(r, s, ref);
-  await bind(s);
+  await bindAgain(s);
   await checkExpired(r, s, ref);
   assert.notEqual(await firstRef(s), ref);
   assert.equal(await firstRef(other), otherRef);
@@ -72,7 +72,7 @@ test('PRE-13 服务重启后同设备、会员和券实例重新取得的编号�
   const ref = await firstRef(s);
   await r.restart();
   const restored = await r.session(s.device);
-  await bind(restored);
+  await bindAgain(restored);
   await checkExpired(r, restored, ref);
   assert.notEqual(await firstRef(restored), ref);
 });

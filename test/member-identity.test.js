@@ -2,47 +2,47 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PATHS } from '../server/qmai.js';
 import { digest } from '../server/common.js';
-import { argsFor, bind, bookRecords, count, failure, number, ok, place, prepare, setup, success } from '../test-support/commerce.js';
+import { argsFor, bind, bindAgain, phone, phoneB, bookRecords, count, failure, number, ok, place, prepare, setup, success } from '../test-support/commerce.js';
 
 test('BND-04/05/06 PRE-10 按原编号取尾号，绑定、念单、查单说同一个标识尾号', async t => {
   const r = await setup(t);
   const s = await r.session();
-  const ids = { '13800000000': '01234567', SAME: 1234567, '00005555': '07654321' };
+  const ids = { [phone]: '01234567', [phoneB]: '07654321' };
   r.mock.override.set(PATHS.member, ({ customerCode }) => ok({ customerId: ids[customerCode.code] }));
 
   const first = await bind(s);
   const phoneMember = { last4: '***0000', via: 'phone' };
   assert.equal(first.customerIdLast4, '***4567');
   assert.deepEqual(first.member, phoneMember);
-  const same = await bind(s, 'SAME', 'dynamic_code');
+  const same = await success(s, 'bind_member', { codeType: 'phone', code: phone });
   assert.equal(same.rebound, undefined);
   assert.equal(same.customerIdLast4, first.customerIdLast4);
   assert.deepEqual(same.member, phoneMember);
   assert.deepEqual((await prepare(s)).member, phoneMember);
   assert.deepEqual((await success(s, 'my_orders')).member, phoneMember);
 
-  const next = await bind(s, '00005555', 'card');
-  const cardMember = { last4: '***5555', via: 'card' };
+  const next = await bind(s, phoneB);
+  const nextMember = { last4: '***8888', via: 'phone' };
   assert.equal(next.customerIdLast4, '***4321');
   assert.equal(next.previousCustomerIdLast4, '***4567');
-  assert.deepEqual(next.member, cardMember);
+  assert.deepEqual(next.member, nextMember);
   assert.deepEqual(next.previousMember, phoneMember);
-  assert.equal(next.note, '已从***0000换成***5555。原来那位顾客还没确认的 1 张单已作废，需要重新组单。');
-  assert.deepEqual((await success(s, 'my_orders')).member, cardMember);
-  const back = await bind(s);
-  assert.deepEqual(back.previousMember, cardMember);
-  assert.equal(back.note, '已从***5555换成***0000。');
+  assert.equal(next.note, '已从***0000换成***8888。原来那位顾客还没确认的 1 张单已作废，需要重新组单。');
+  assert.deepEqual((await success(s, 'my_orders')).member, nextMember);
+  const back = await bindAgain(s);
+  assert.deepEqual(back.previousMember, nextMember);
+  assert.equal(back.note, '已从***8888换成***0000。');
 });
 
 for (const unknown of [false, true]) {
   const outcome = unknown ? '结果未知' : '成功';
   test(`BND-05 LED-05 WRT-07/09/18 R3 两种会员编号共享${outcome}记录，重启后继续生效`, async t => {
     const r = await setup(t, { LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY: '1' });
-    r.mock.override.set(PATHS.member, params => ok(params.customerCode.code === 'PADD' ? { customerId: '00123' } : 123));
+    r.mock.override.set(PATHS.member, params => ok(params.customerCode.code === phone ? { customerId: '00123' } : 123));
     r.mock.override.set(PATHS.orderStatus, () => ok({ userId: '000123', status: 10 }));
     const padded = await r.session(), plain = await r.session();
-    const first = await bind(padded, 'PADD', 'card');
-    await bind(plain, 'BASE', 'card');
+    const first = await bind(padded, phone);
+    await bind(plain, phoneB);
     const draft = await prepare(padded);
     let receipt;
     if (unknown) {
@@ -60,13 +60,13 @@ for (const unknown of [false, true]) {
       assert.equal(receipt.qmaiActualAmountYuan, '20.00');
       assert.equal((await success(plain, 'get_order_status', { orderNo: receipt.orderNo })).status, 10);
     }
-    const again = await bind(padded, 'BASE', 'dynamic_code');
+    const again = await success(padded, 'bind_member', { code: phone, codeType: 'phone' });
     assert.equal(again.rebound, undefined);
     assert.equal(again.boundAt, first.boundAt);
-    assert.equal(again.boundVia, 'card');
+    assert.equal(again.boundVia, 'phone');
     await r.restart();
     const restarted = await r.session();
-    await bind(restarted, 'PADD', 'card');
+    await bindAgain(restarted, phone);
     await failure(restarted, 'place_order', argsFor(await prepare(restarted)), guard);
     assert.equal(count(r, PATHS.create), 1);
     if (unknown) {
@@ -100,6 +100,7 @@ test('QRY-02/04 WRT-18 UNR-03 R25 原始会员编号有非零小数或指数溢�
   r.mock.override.set(PATHS.create, () => ok({}));
   await failure(s, 'place_order', argsFor(await prepare(s)), /结果未知/);
   const time = r.requests.filter(req => req.path === PATHS.create).at(-1).at;
+  const unbound = await r.session();
   for (const token of ['76543210.0000000001', '1e400']) {
     const data = `{"data":[{"orderNo":"${number(10)}","orderAt":${time},"userId":${token}}],"total":1}`;
     r.mock.override.set(PATHS.orderList, (_, { res }) => rawReply(data, res));
@@ -109,7 +110,7 @@ test('QRY-02/04 WRT-18 UNR-03 R25 原始会员编号有非零小数或指数溢�
     assert.equal(list.unresolvedPendingWrites, 1);
     for (const member of [token, `{"customerId":${token}}`]) {
       r.mock.override.set(PATHS.member, (_, { res }) => rawReply(member, res));
-      await failure(s, 'bind_member', { code: 'BASE', codeType: 'card' }, /查询会员信息/);
+      await failure(unbound, 'bind_member', { code: phone, codeType: 'phone' }, /查询会员信息/);
     }
   }
 });
@@ -120,7 +121,7 @@ test('R25 会员编号超出 long 上限视为查询失败，上限值按原文�
   for (const token of ['9223372036854775808', '10000000000000000000', '9'.repeat(512)]) {
     for (const encode of [JSON.rawJSON, String]) {
       r.mock.override.set(PATHS.member, () => ok({ customerId: encode(token) }));
-      await failure(s, 'bind_member', { codeType: 'card', code: 'CARD' }, /查询会员信息/);
+      await failure(s, 'bind_member', { codeType: 'phone', code: phone }, /查询会员信息/);
     }
   }
   await failure(s, 'prepare_order', { storeId: '123', items: [{ goodsId: '123', quantity: 1 }] }, /尚未绑定/);
@@ -134,10 +135,11 @@ test('R25 会员编号超出 long 上限视为查询失败，上限值按原文�
 test('§4 会员 ID 的小数与指数按十进制整数取尾号，短编号仍隐藏', async t => {
   const r = await setup(t);
   const s = await r.session();
+  let index = 0;
   for (const [value, last4] of [[JSON.rawJSON('12341873.0'), '***1873'],
     [JSON.rawJSON('7.6541873e7'), '***1873'], ['76551873.0', '***1873'],
     [JSON.rawJSON('1234567.0'), '***'], ['00001234', '***1234']]) {
     r.mock.override.set(PATHS.member, () => ok(value));
-    assert.equal((await bind(s)).customerIdLast4, last4);
+    assert.equal((await bind(s, '1380000000' + index++)).customerIdLast4, last4);
   }
 });

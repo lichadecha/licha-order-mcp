@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { rig } from './rig.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { rig, mockCaptcha, mockSmsUpstream } from './rig.js';
 import { PATHS } from '../server/qmai.js';
 
 export const memberA = '9000000000000001234';
 export const memberB = '9000000000000005678';
 export const phone = '13800000000';
+export const phoneB = '13800008888';
 export const goodsId = '8100000000000000001';
 export const skuId = '8100000000000000002';
 export const shop = '111111';
@@ -18,14 +20,17 @@ export async function setup(t, env = {}) {
   const mock = {
     price: 2000, couponRows: [], orders: [], last: null, writes: 0, override: new Map(), code: '01'
   };
+  const sms = mockSmsUpstream();
   const r = await rig(t, {
-    env: { LICHA_RATE_CALLS_PER_DEVICE_PER_MIN: '200', ...env },
+    env: { LICHA_RATE_CALLS_PER_DEVICE_PER_MIN: '200', LICHA_SMS_COOLDOWN_SEC: '1', ...env },
     upstream: async (path, params, context) => {
       if (mock.override.has(path)) return mock.override.get(path)(params, context);
       switch (path) {
+      case PATHS.smsSend:
+      case PATHS.smsCheck: return sms(path, params);
       case PATHS.member: {
-        const id = { [phone]: memberA, FAKE_CARD_A: memberA, FAKE_CARD_B: memberB, ABCD: memberB,
-          '0000': 0, '0001': '0', '0002': null }[params.customerCode.code];
+        const id = { [phone]: memberA, [phoneB]: memberB,
+          '13900000000': 0, '13900000001': '0', '13900000002': null }[params.customerCode.code];
         return ok({ customerId: id ?? null });
       }
       case PATHS.item: return ok([{ goodsId, name: '测试茶', type: 1, status: 10,
@@ -58,7 +63,21 @@ export async function failure(s, tool, args, regex) {
   assert.match(result.content[0].text, regex);
   return result.content[0].text;
 }
-export const bind = (s, code = phone, codeType = 'phone') => success(s, 'bind_member', { code, codeType });
+export async function bind(s, code = phone) {
+  const args = { code, codeType: 'phone' };
+  const first = await success(s, 'bind_member', args);
+  assert.equal(first.bound, false);
+  assert.equal(first.verificationSent, true);
+  const verified = await success(s, 'bind_member', { ...args, captcha: mockCaptcha });
+  assert.equal(verified.bound, true);
+  return verified;
+}
+
+// setup 的发码冷却为一秒，跨设备和重启仍需等待。
+export async function bindAgain(s, code = phone) {
+  await delay(1010);
+  return bind(s, code);
+}
 export const prepare = s => success(s, 'prepare_order', basket);
 export const argsFor = d => ({ confirmToken: d.confirmToken, confirmAmountYuan: Number(d.estimatedTotalYuan) });
 export const place = (s, draft) => success(s, 'place_order', argsFor(draft));

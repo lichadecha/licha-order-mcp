@@ -6,7 +6,7 @@ import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { digest } from '../server/common.js';
-import { basket, bind, bookFile, bookRecords, count, failure, place, prepare, success, withBound } from '../test-support/commerce.js';
+import { basket, bind, phone, bookFile, bookRecords, count, failure, place, prepare, success, withBound } from '../test-support/commerce.js';
 import { PATHS } from '../server/qmai.js';
 
 const cli = fileURLToPath(new URL('../server/ledger-cli.js', import.meta.url));
@@ -15,10 +15,9 @@ const list = r => spawnSync(process.execPath, [cli, 'list'], {cwd:r.cwd, env:r.e
 async function verifyFault(r, previousCreates) {
   await r.start();
   const resumed = await r.session();
-  await bind(resumed);
-  await failure(resumed, 'prepare_order', basket, /账本不可用/);
+  await failure(resumed, 'bind_member', { code: phone, codeType: 'phone' }, /安全账本不可用/);
   assert.equal((await success(resumed, 'preview_order', basket)).ok, true);
-  assert.equal((await success(resumed, 'my_orders')).count, previousCreates);
+  await failure(resumed, 'my_orders', {}, /尚未绑定/);
   assert.equal(count(r, PATHS.create), previousCreates);
   await r.stop();
 }
@@ -64,7 +63,7 @@ test('LED-02/08 SQLite 未知版本拒绝打开业务，不自动重写版本或
   assert.deepEqual(await readdir(r.dataDir), [basename(file)]);
   const db = new DatabaseSync(file);
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
     db.exec('PRAGMA user_version=99');
   } finally { db.close(); }
   const bytes = await readFile(file);
@@ -115,13 +114,14 @@ DatabaseSync.prototype.exec = function(sql) {
   assert.equal(count(r, PATHS.create), 1);
 });
 
-test('LED-03 建库、发送记录与成功终态均由 synchronous=FULL 或更强的连接提交', async t => {
+test('LED-03 建库、发码、发单记录与成功终态均由 synchronous=FULL 或更强的连接提交', async t => {
   const preload = `import {DatabaseSync} from 'node:sqlite';
 const exec = DatabaseSync.prototype.exec;
 DatabaseSync.prototype.exec = function(sql) {
   if (sql === 'COMMIT') {
     const row = this.prepare('SELECT record FROM records LIMIT 1').get();
-    const state = row ? JSON.parse(row.record).state : 'initial';
+    const hasSms = this.prepare('SELECT 1 FROM sms_sends LIMIT 1').get();
+    const state = row ? JSON.parse(row.record).state : hasSms ? 'sms' : 'initial';
     const {synchronous} = this.prepare('PRAGMA synchronous').get();
     process.stderr.write('test-ledger-commit ' + state + ' ' + synchronous + '\\n');
   }
@@ -131,6 +131,6 @@ DatabaseSync.prototype.exec = function(sql) {
   await place(s, await prepare(s));
   await r.stop();
   const commits = [...r.stderr.matchAll(/^test-ledger-commit (\w+) (\d+)$/gm)];
-  assert.deepEqual(commits.map(([,state]) => state), ['initial','sent','success']);
+  assert.deepEqual(commits.map(([,state]) => state), ['initial','sms','sent','success']);
   assert.ok(commits.every(([, , level]) => Number(level) >= 2), r.stderr);
 });

@@ -6,7 +6,12 @@ const defaults = {
   MAX_ORDERS_PER_CUSTOMER_PER_DAY: 5,
   MAX_ORDERS_PER_DAY: 10,
   CONFIRM_TOKEN_TTL_MS: 300000,
-  BINDING_IDLE_TTL_MS: 7200000,
+  BINDING_IDLE_TTL_MS: 2592000000,
+  SMS_CODE_TTL_SEC: 300,
+  SMS_COOLDOWN_SEC: 60,
+  SMS_PER_PHONE_PER_HOUR: 5,
+  SMS_PER_PHONE_PER_DAY: 10,
+  SMS_MAX_WRONG: 5,
   SESSION_IDLE_TTL_MS: 1800000,
   ORDER_MATCH_WINDOW_MS: 600000,
   RECENT_ORDER_HINT_MS: 600000,
@@ -40,6 +45,7 @@ export function readConfig(env = process.env) {
     const name = 'LICHA_' + key;
     config[name] = positive(env[name] ?? initial, name);
   }
+  if (config.LICHA_SMS_CODE_TTL_SEC < 30 || config.LICHA_SMS_CODE_TTL_SEC > 300) invalid('LICHA_SMS_CODE_TTL_SEC');
   config.PORT = positive(env.PORT ?? 3000, 'PORT');
   if (config.PORT > 65535) invalid('PORT');
   config.HOST = nonempty('HOST', '127.0.0.1');
@@ -57,6 +63,9 @@ export function readConfig(env = process.env) {
   if (config.LICHA_BLOCKED_DEVICES.some(id => !uuidPattern.test(id))) invalid('LICHA_BLOCKED_DEVICES');
   config.LICHA_DATA_DIR = (env.LICHA_DATA_DIR !== undefined || config.LICHA_ENABLE_ORDERING)
     ? resolve(nonempty('LICHA_DATA_DIR')) : null;
+  if (env.LICHA_SMS_EVENT_NO !== undefined || config.LICHA_ENABLE_ORDERING) {
+    config.LICHA_SMS_EVENT_NO = positive(env.LICHA_SMS_EVENT_NO, 'LICHA_SMS_EVENT_NO');
+  }
   config.LICHA_LOG_DIR = resolve(nonempty('LICHA_LOG_DIR', './logs'));
   const delays = (env.LICHA_READ_BACKOFF_MS ?? '1000,2000').split(',');
   if (delays.length !== 2) invalid('LICHA_READ_BACKOFF_MS');

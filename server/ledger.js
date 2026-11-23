@@ -10,7 +10,15 @@ import { orderNumber } from './commerce-view.js';
 
 const bookName = 'orders.sqlite';
 const initialName = '.orders-init.sqlite';
-const formatVersion = 2;
+const formatVersion = 3;
+const hourMs = 3600_000;
+const dayMs = 24 * hourMs;
+const smsSchema = `CREATE TABLE sms_sends (
+  phone_hash TEXT NOT NULL, sent_at INTEGER NOT NULL, checksum TEXT NOT NULL,
+  PRIMARY KEY (phone_hash, sent_at)
+) STRICT;
+CREATE INDEX sms_sends_time ON sms_sends(sent_at)`;
+const smsUnavailable = '安全账本不可用，暂时不能发验证码。看菜单不受影响，也可以直接在小程序里下单。';
 const cutover = '安全账本不可用，格式不兼容或组成不完整。请按规格 §8 第 8 项停掉旧版写入，核清未决请求与当日额度后用空账本切换。';
 // 凭据只在记录持久化之后由账本签发，并绑定到这一次实际发送。
 const sendReceipts = new WeakMap();
@@ -19,6 +27,34 @@ export function consumeSendReceipt(receipt, attempt) {
     throw Error('写出口缺少本次发送的落盘凭据');
   }
   sendReceipts.delete(receipt);
+}
+
+const smsReceipts = new WeakMap();
+export function consumeSmsReceipt(receipt, attempt, phone) {
+  const evidence = smsReceipts.get(receipt);
+  if (!evidence || evidence.attempt !== attempt || evidence.phoneHash !== digest(phone)) {
+    throw Error('短信出口缺少本次发码的落盘凭据');
+  }
+  smsReceipts.delete(receipt);
+}
+
+function smsChecksum(phoneHash, time) {
+  return digest(phoneHash + ':' + time);
+}
+
+function smsLimit(times, config, now) {
+  if (!times.length) return;
+  const remainingMs = times.at(-1) + config.LICHA_SMS_COOLDOWN_SEC * 1000 - now;
+  if (remainingMs > 0) return `验证码发得太频繁了，请 ${Math.ceil(remainingMs / 1000)} 秒后再试。`;
+  const hourly = times.filter(time => time > now - hourMs);
+  if (hourly.length >= config.LICHA_SMS_PER_PHONE_PER_HOUR) {
+    const availableAt = hourly[hourly.length - config.LICHA_SMS_PER_PHONE_PER_HOUR] + hourMs;
+    return `这个手机号收验证码的次数已到上限，请约 ${Math.ceil((availableAt - now) / 60_000)} 分钟后再试，或直接在小程序里下单。`;
+  }
+  const midnight = Math.floor((now + 8 * hourMs) / dayMs) * dayMs - 8 * hourMs;
+  if (times.filter(time => time >= midnight).length >= config.LICHA_SMS_PER_PHONE_PER_DAY) {
+    return '这个手机号收验证码的次数已到上限，请明天再试，或直接在小程序里下单。';
+  }
 }
 
 const states = new Set(['sent', 'unknown', 'success', 'failed', 'found', 'absent']);
@@ -90,7 +126,8 @@ export class Ledger {
       if (!this.identity.isFile() || !this.identity.size) throw Error('账本损坏');
       this.db = new DatabaseSync(this.file);
       this.db.exec('PRAGMA synchronous=FULL');
-      if (this.db.prepare('PRAGMA user_version').get().user_version !== formatVersion) {
+      const version = this.db.prepare('PRAGMA user_version').get().user_version;
+      if (version !== 2 && version !== formatVersion) {
         this.faultReason = cutover;
         throw Error(cutover);
       }
@@ -103,6 +140,17 @@ export class Ledger {
           throw Error('账本记录损坏');
         }
         recovered.set(record.key, record);
+      }
+      if (version === 2) {
+        // v2 还没有短信表。在确认旧订单完整后一次性升级，避免把损坏的新版误作空表。
+        this.db.exec('BEGIN IMMEDIATE');
+        this.db.exec(smsSchema);
+        this.db.exec(`PRAGMA user_version=${formatVersion}`);
+        this.db.exec('COMMIT');
+      }
+      for (const row of this.db.prepare('SELECT phone_hash, sent_at, checksum FROM sms_sends').iterate()) {
+        if (!isDigest(row.phone_hash) || !Number.isSafeInteger(row.sent_at) || row.sent_at <= 0
+          || row.checksum !== smsChecksum(row.phone_hash, row.sent_at)) throw Error('发码记录损坏');
       }
       this.records = recovered;
       for (const record of recovered.values()) rememberAuditFields(record);
@@ -119,6 +167,7 @@ export class Ledger {
       db.exec('PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE');
       db.exec('BEGIN IMMEDIATE');
       db.exec('CREATE TABLE records (key TEXT PRIMARY KEY, record TEXT NOT NULL, checksum TEXT NOT NULL) STRICT');
+      db.exec(smsSchema);
       db.exec(`PRAGMA user_version=${formatVersion}`);
       db.exec('COMMIT');
     } finally {
@@ -128,19 +177,12 @@ export class Ledger {
     fsyncSync(this.directoryFd);
   }
 
-  #persistRecord(record, insertOnly) {
+  #withWritableBook(operation) {
     if (this.fault) throw Error('安全账本不可用，需要人工检查');
     try {
-      if (!validateRecord(record)) throw Error('账本记录无效');
       const current = statSync(this.file);
       if (current.ino !== this.identity.ino || current.dev !== this.identity.dev) throw Error('账本已替换');
-      const json = JSON.stringify(record);
-      // 发送前只许插入新请求。终态、防重和认领信息都在同一行随事务提交。
-      const sql = 'INSERT INTO records (key, record, checksum) VALUES (?, ?, ?)'
-        + (insertOnly ? '' : ' ON CONFLICT(key) DO UPDATE SET record=excluded.record, checksum=excluded.checksum');
-      this.db.exec('BEGIN IMMEDIATE');
-      this.db.prepare(sql).run(record.key, json, digest(json));
-      this.db.exec('COMMIT');
+      return operation();
     } catch {
       this.fault = true;
       // 关闭连接会回滚尚未提交的事务。若 COMMIT 已生效，保留该提交供重启读取。
@@ -150,6 +192,19 @@ export class Ledger {
       } catch { /* 服务仍持有目录锁并拒绝后续写入。 */ }
       throw Error('安全账本写入失败');
     }
+  }
+
+  #persistRecord(record, insertOnly) {
+    this.#withWritableBook(() => {
+      if (!validateRecord(record)) throw Error('账本记录无效');
+      const json = JSON.stringify(record);
+      // 发送前只许插入新请求。终态、防重和认领信息都在同一行随事务提交。
+      const sql = 'INSERT INTO records (key, record, checksum) VALUES (?, ?, ?)'
+        + (insertOnly ? '' : ' ON CONFLICT(key) DO UPDATE SET record=excluded.record, checksum=excluded.checksum');
+      this.db.exec('BEGIN IMMEDIATE');
+      this.db.prepare(sql).run(record.key, json, digest(json));
+      this.db.exec('COMMIT');
+    });
     this.records.set(record.key, record);
     rememberAuditFields(record);
   }
@@ -163,6 +218,32 @@ export class Ledger {
     this.#persistRecord(record, true);
     const receipt = Object.freeze({});
     sendReceipts.set(receipt, attempt);
+    return receipt;
+  }
+
+  recordSmsSending(phone, attempt, config, now = Date.now()) {
+    const phoneHash = digest(phone);
+    let limit;
+    try {
+      limit = this.#withWritableBook(() => {
+        // 服务独占目录，检查到提交之间全程同步。自定义冷却超过一天时仍保留其记录。
+        const cutoff = now - Math.max(dayMs, config.LICHA_SMS_COOLDOWN_SEC * 1000);
+        const history = this.db.prepare('SELECT sent_at FROM sms_sends WHERE phone_hash=? AND sent_at>? ORDER BY sent_at')
+          .all(phoneHash, cutoff);
+        const reason = smsLimit(history.map(row => row.sent_at), config, now);
+        if (reason) return reason;
+        this.db.exec('BEGIN IMMEDIATE');
+        this.db.prepare('DELETE FROM sms_sends WHERE sent_at<=?').run(cutoff);
+        this.db.prepare('INSERT INTO sms_sends (phone_hash, sent_at, checksum) VALUES (?, ?, ?)')
+          .run(phoneHash, now, smsChecksum(phoneHash, now));
+        this.db.exec('COMMIT');
+      });
+    } catch {
+      throw Object.assign(Error(smsUnavailable), {kind:'sms_ledger'});
+    }
+    if (limit) throw Object.assign(Error(limit), {kind:'sms_limit'});
+    const receipt = Object.freeze({});
+    smsReceipts.set(receipt, {attempt, phoneHash});
     return receipt;
   }
 

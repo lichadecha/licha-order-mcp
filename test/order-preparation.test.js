@@ -2,14 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PATHS } from '../server/qmai.js';
 import {
-  argsFor, basket, bind, bookRecords, count, failure, memberA, number, ok, place, prepare,
+  argsFor, basket, bindAgain, bookRecords, count, failure, memberA, number, ok, place, prepare,
   shop, skuId, success, withBound
 } from '../test-support/commerce.js';
 
 test('PRE-09/12 WRT-01/10 同一会员跨设备切换用券选择后只有新版能提交', async t => {
   const { r, s, m } = await withBound(t);
   const other = await r.session();
-  await bind(other);
+  await bindAgain(other);
   const original = await prepare(s);
   const revised = await success(other, 'prepare_order', { ...basket, couponChoice: 'none' });
   assert.equal(revised.supersededPendingOrders, 1);

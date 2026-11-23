@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PATHS } from '../server/qmai.js';
-import { argsFor, basket, bind, bookRecords, count, failure, memberA, number, ok, place, prepare,
+import { argsFor, basket, bind, bindAgain, phoneB, bookRecords, count, failure, memberA, number, ok, place, prepare,
   shop, success, withBound } from '../test-support/commerce.js';
 
 // 只在测试子进程的 SQLite API 上注入。在该连接内能观察到未提交的记录。
@@ -35,7 +35,7 @@ async function restartAndBind(r, s) {
   delete r.env.NODE_OPTIONS;
   await r.restart();
   const resumed = await r.session(s.device);
-  await bind(resumed);
+  await bindAgain(resumed);
   return resumed;
 }
 
@@ -45,7 +45,7 @@ for (const phase of ['before', 'after']) {
   test('LED-03① 发送前记录' + point + '，零次创建，重启按已提交记录核对', async t => {
     const {r, s} = await withBound(t, {NODE_OPTIONS:interruptCommit('sent', phase), LICHA_ORDER_MATCH_WINDOW_MS:'50'});
     const other = await r.session();
-    await bind(other, 'FAKE_CARD_B', 'card');
+    await bind(other, phoneB);
     const spare = await prepare(other);
     const draft = await prepare(s);
     await failure(s, 'place_order', argsFor(draft), /本次下单请求没有发出/);
@@ -150,7 +150,7 @@ for (const [state, phase, point] of [
     await failure(resumed, 'place_order', argsFor(draft), /令牌无效/);
     await failure(resumed, 'place_order', argsFor(await prepare(resumed)), /状态未知/);
     const other = await r.session();
-    await bind(other, 'FAKE_CARD_B', 'card');
+    await bind(other, phoneB);
     assert.equal((await place(other, await prepare(other))).placed, true);
     assert.equal(count(r, PATHS.create), created + 1);
   });

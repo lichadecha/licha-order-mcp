@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { rig } from '../test-support/rig.js';
+import { bind, bindAgain } from '../test-support/commerce.js';
+import { rig, mockCaptcha } from '../test-support/rig.js';
 import { createLogs } from '../server/logs.js';
 import { readConfig } from '../server/config.js';
 import { digest, projectText } from '../server/common.js';
@@ -15,7 +16,7 @@ const initialize = {jsonrpc:'2.0',id:1,method:'initialize',params:{
 const ping = {jsonrpc:'2.0',id:2,method:'ping'};
 const ok = data => ({code:0,status:true,data});
 const phone = {code:'13800000000',codeType:'phone'};
-const card = {code:'FAKE_CARD_1234',codeType:'card'};
+const otherPhone = {code:'13800001234',codeType:'phone'};
 const customer = '9000000000000001234';
 const data = result => { assert.ok(!result.isError,result.content[0].text); return JSON.parse(result.content[0].text); };
 function upstream(path) {
@@ -62,9 +63,9 @@ test('SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关�
 });
 
 test('SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期',async t => {
-  const r = await rig(t,{upstream,env:{LICHA_BINDING_IDLE_TTL_MS:'900',LICHA_SESSION_IDLE_TTL_MS:'200'}});
+  const r = await rig(t,{mockSms:true,upstream,env:{LICHA_BINDING_IDLE_TTL_MS:'900',LICHA_SESSION_IDLE_TTL_MS:'200'}});
   const first = await r.session();
-  data(await first.call('bind_member',phone));
+  await bind(first);
   const other = await r.session();
   assert.match((await other.call('my_orders')).content[0].text,/尚未绑定/);
   await delay(270);
@@ -84,10 +85,10 @@ test('SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏�
 });
 
 test('SES-05 SES-09 跨会话共用滑动窗口；重启清除限流与绑定',async t => {
-  const r = await rig(t,{upstream,env:{LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:'2'}});
+  const r = await rig(t,{mockSms:true,upstream,env:{LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:'3'}});
   const a = await r.session();
   const b = await r.session(a.device);
-  data(await a.call('bind_member',card));
+  await bind(a);
   data(await b.call('my_orders'));
   const before = r.requests.length;
   assert.match((await a.call('my_orders')).content[0].text,/操作太频繁/);
@@ -98,7 +99,7 @@ test('SES-05 SES-09 跨会话共用滑动窗口；重启清除限流与绑定',a
   await r.restart();
   const fresh = await r.session(a.device);
   assert.match((await fresh.call('my_orders')).content[0].text,/尚未绑定/);
-  data(await fresh.call('bind_member',card));
+  await bind(fresh, otherPhone.code);
 });
 
 test('SES-08 同设备跨会话按到达次序执行，其他设备可以继续查询',async t => {
@@ -106,13 +107,15 @@ test('SES-08 同设备跨会话按到达次序执行，其他设备可以继续�
   const entered = new Promise(resolve => {markEntered=resolve});
   const gate = new Promise(resolve => {release=resolve});
   const r = await rig(t,{upstream:async(path,params) => {
-    if (params.customerCode?.code === phone.code) {markEntered(); await gate;}
+    if (path.endsWith('commonSendSmsCaptcha')) return ok(null);
+    if (path.endsWith('commonCheckSmsCaptcha')) {markEntered(); await gate; return ok(null);}
     return upstream(path);
   }});
   const a = await r.session();
   const b = await r.session(a.device);
   const other = await r.session();
-  const first = a.call('bind_member',phone);
+  assert.equal(data(await a.call('bind_member',phone)).verificationSent,true);
+  const first = a.call('bind_member',{...phone,captcha:mockCaptcha});
   await entered;
   const second = b.call('my_orders');
   data(await other.call('find_store',{query:'演示'}));
@@ -125,7 +128,7 @@ test('SES-08 SES-09 上一个绑定仍在等待时，同设备超额请求立即
   let markEntered, release;
   const entered = new Promise(resolve => { markEntered = resolve; });
   const gate = new Promise(resolve => { release = resolve; });
-  const r = await rig(t,{env:{LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:'1',LICHA_READ_TIMEOUT_MS:'5000'},
+  const r = await rig(t,{mockSms:true,env:{LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:'1',LICHA_READ_TIMEOUT_MS:'5000'},
     upstream:async (path) => { markEntered(); await gate; return upstream(path); }});
   const a = await r.session();
   const b = await r.session(a.device);
@@ -141,12 +144,12 @@ test('SES-08 SES-09 上一个绑定仍在等待时，同设备超额请求立即
 
 test('LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单、整条日志脱敏',async t => {
   const secretText = '请联系+8613800000000并带上FAKE_SECRET_MESSAGE';
-  const r = await rig(t,{upstream:path => path.endsWith('getShopList')
+  const r = await rig(t,{mockSms:true,upstream:path => path.endsWith('getShopList')
     ? {status:false,code:110004,message:secretText} : upstream(path)});
   const a = await r.session();
-  data(await a.call('bind_member',phone));
+  await bind(a);
   const b = await r.session();
-  data(await b.call('bind_member',card));
+  await bind(b, otherPhone.code);
   assert.equal((await a.call('find_store',{query:'茶'})).isError,true);
   const fakeToken = randomUUID();
   assert.equal((await a.call('place_order',{confirmToken:fakeToken,confirmAmountYuan:1})).isError,true);
@@ -158,7 +161,7 @@ test('LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单�
   const attempts = await readFile(join(r.logDir,'upstream.jsonl'),'utf8');
   const writes = await readFile(join(r.logDir,'write.jsonl'),'utf8');
   const all = access+attempts+writes;
-  for (const value of [a.device,b.device,customer,phone.code,card.code,secretText,'FAKE_NEVER_WRITE',fakeToken,...['QMAI_OPEN_KEY','QMAI_OPEN_ID','QMAI_GRANT_CODE','LICHA_ACCESS_KEYS'].map(key=>r.env[key])]) {
+  for (const value of [a.device,b.device,customer,phone.code,otherPhone.code,mockCaptcha,secretText,'FAKE_NEVER_WRITE',fakeToken,...['QMAI_OPEN_KEY','QMAI_OPEN_ID','QMAI_GRANT_CODE','LICHA_ACCESS_KEYS'].map(key=>r.env[key])]) {
     assert.ok(!all.includes(value),'识别值进入日志');
   }
   assert.ok(!attempts.includes('FAKE_SECRET_MESSAGE'));
@@ -178,11 +181,11 @@ test('LOG-01 LOG-02 LOG-03 LOG-04 LOG-06 LOG-07 出口审计、来源白名单�
 });
 
 test('LOG-05 三本日志介质故障不改变业务结果',async t => {
-  const r = await rig(t,{upstream});
+  const r = await rig(t,{mockSms:true,upstream});
   await rm(r.logDir,{recursive:true});
   await writeFile(r.logDir,'模拟日志目录无法写入');
   const a = await r.session();
-  data(await a.call('bind_member',phone));
+  await bind(a);
   assert.match((await a.call('place_order',{confirmToken:'FAKE_TOKEN',confirmAmountYuan:2})).content[0].text,/无效/);
   data(await a.call('find_store',{query:'演示'}));
 });
@@ -252,7 +255,7 @@ test('§3.2 凭证缺项仍可握手，非法环境变量阻止启动且不回�
   const r = await rig(t,{env:{QMAI_OPEN_ID:undefined}});
   const a = await r.session();
   assert.equal((await a.rpc('tools/list')).tools.length,9);
-  for (const [name,args] of [['find_store',{query:'茶'}],['bind_member',card]]) {
+  for (const [name,args] of [['find_store',{query:'茶'}],['bind_member',phone]]) {
     const result = await a.call(name,args);
     assert.equal(result.isError,true);
     assert.match(result.content[0].text,/凭证不完整/);
@@ -268,7 +271,7 @@ test('§3.2 凭证缺项仍可握手，非法环境变量阻止启动且不回�
 
 test('SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单',async t => {
   const seen = [];
-  const r = await rig(t,{env:{LICHA_BINDING_IDLE_TTL_MS:'700',LICHA_CONFIRM_TOKEN_TTL_MS:'60000'},
+  const r = await rig(t,{mockSms:true,env:{LICHA_BINDING_IDLE_TTL_MS:'700',LICHA_SMS_COOLDOWN_SEC:'1',LICHA_CONFIRM_TOKEN_TTL_MS:'60000'},
     upstream(path,params) {
       if (path.endsWith('getShopGoodsDetail')) return ok([{goodsId:'101',name:'测试茶',
         goodsSkuList:[{skuId:'202',salePrice:1000}]}]);
@@ -278,7 +281,7 @@ test('SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会�
       return upstream(path);
     }});
   const a = await r.session();
-  data(await a.call('bind_member',phone));
+  await bind(a);
   const args = {storeId:'00011',items:[{goodsId:'101',quantity:1}]};
   const first = data(await a.call('prepare_order',args));
   assert.deepEqual(first.store,{storeId:'11',name:'编号测试门店'});
@@ -289,7 +292,7 @@ test('SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会�
   const later = data(await b.call('prepare_order',args));
   await delay(820);
   assert.match((await b.call('my_orders')).content[0].text,/尚未绑定/);
-  data(await b.call('bind_member',phone));
+  await bindAgain(b);
   assert.match((await b.call('place_order',{confirmToken:later.confirmToken,confirmAmountYuan:10})).content[0].text,/无效/);
   assert.equal(seen.length,1);
 });

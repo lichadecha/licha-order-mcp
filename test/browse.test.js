@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {rig} from '../test-support/rig.js';
+import {bind} from '../test-support/commerce.js';
 import {PATHS, Qmai, parseResponse, sign} from '../server/qmai.js';
 
 const good = data => ({status:true, code:0, data});
@@ -164,7 +165,7 @@ test('BRW-08 逐行算价、同名做法及缺价规格', async t => {
 test('BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照', async t => {
   let reads = 0, row = product();
   const member = '8999999999999909001', orderNo = 'D00000000000000000901';
-  const r = await rig(t,{upstream(path,params,{res}) {
+  const r = await rig(t,{mockSms:true,upstream(path,params,{res}) {
     switch (kind(path)) {
       case PATHS.member: return good({customerId:member});
       case PATHS.item: reads++; return good([row]);
@@ -180,7 +181,7 @@ test('BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发�
   const args = {storeId:301,items:[item,item]};
   const detail = () => invoke(s,'get_item_detail',{storeId:301,goodsId:digits});
   const prepare = () => s.call('prepare_order',args);
-  await invoke(s,'bind_member',{code:'FAKE-CARD-9001',codeType:'card'});
+  await bind(s);
   assert.equal((await detail()).skus[0].priceFen,2400);
   row.goodsSkuList[0].salePrice = 4740;
   const draft = await invoke(s,'prepare_order',args);
@@ -321,7 +322,7 @@ test('BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读
   let reads = 0;
   const preload = "const fixed=Date.now(); Date.now=()=>fixed;";
   const hook = 'data:text/javascript;base64,'+Buffer.from(preload).toString('base64');
-  const r = await rig(t,{env:{NODE_OPTIONS:'--import='+hook,LICHA_READ_TIMEOUT_MS:'5000'},async upstream(path) {
+  const r = await rig(t,{mockSms:true,env:{NODE_OPTIONS:'--import='+hook,LICHA_READ_TIMEOUT_MS:'5000'},async upstream(path) {
     if (path === PATHS.member) return good({customerId:'8900000000000000001'});
     if (path === PATHS.stores) return good({list:[]});
     assert.equal(path,PATHS.item);
@@ -330,7 +331,7 @@ test('BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读
     return good([product({goodsSkuList:[{skuId,salePrice:price}],sortedPracticeList:[]})]);
   }});
   const [reader,buyer] = await Promise.all([r.session(),r.session()]);
-  await invoke(buyer,'bind_member',{codeType:'card',code:'FAKE-CACHE-CARD'});
+  await bind(buyer);
   const details = () => invoke(reader,'get_item_detail',{storeId:301,goodsId:digits});
   const old = details();
   await began.promise;
@@ -401,7 +402,7 @@ test('BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至
       {attachGoodsName:'芒果  粒',attachGoodsId:'303',attachGoodsPrice:40}
     ]
   });
-  const r = await rig(t,{upstream(path) {
+  const r = await rig(t,{mockSms:true,upstream(path) {
     switch (path) {
       case PATHS.item: return good([row]);
       case PATHS.member: return good({customerId:member});
@@ -412,7 +413,7 @@ test('BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至
     }
   }});
   const s = await r.session();
-  await invoke(s,'bind_member',{code:'FAKE-OPTIONS',codeType:'card'});
+  await bind(s);
   const basket = (practices,attaches) => ({storeId:301,items:[{goodsId:digits,quantity:1,practices,attaches}]});
   for (const [label,name] of variants) {
     await t.test(label,async () => {

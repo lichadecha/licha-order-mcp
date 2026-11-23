@@ -6,7 +6,7 @@ import { digest } from '../server/common.js';
 import { Ledger } from '../server/ledger.js';
 import { PATHS } from '../server/qmai.js';
 import {
-  argsFor, basket, bind, bookRecords, count, failure, memberA, number, ok, place, prepare, success, withBound
+  argsFor, basket, bindAgain, bookRecords, count, failure, memberA, number, ok, place, prepare, success, withBound
 } from '../test-support/commerce.js';
 
 async function writeAudit(r) {
@@ -20,7 +20,7 @@ test('§5.9 写审计只从本设备签发的待确认单取用券选择，覆�
   const draft = await success(s, 'prepare_order', {...basket, couponChoice:'none'});
   const args = argsFor(draft);
   const stranger = await r.session();
-  await bind(stranger);
+  await bindAgain(stranger);
   await failure(stranger, 'place_order', args, /令牌无效/);
   await failure(s, 'place_order', {...args, confirmToken:'unknown-token'}, /令牌无效/);
   await failure(s, 'place_order', argsFor(original), /已被更新/);
@@ -39,7 +39,7 @@ test('§5.9 写审计只从本设备签发的待确认单取用券选择，覆�
 });
 
 test('§5.9 设备限流的写审计只关联本设备已登记的用券选择', async t => {
-  const {r, s} = await withBound(t, {LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:'2'});
+  const {r, s} = await withBound(t, {LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:'3'});
   const draft = await success(s, 'prepare_order', {...basket, couponChoice:'none'});
   await failure(s, 'place_order', argsFor(draft), /太频繁/);
   await failure(s, 'place_order', {...argsFor(draft), confirmToken:'unknown-token'}, /太频繁/);
@@ -51,13 +51,13 @@ test('§5.9 设备限流的写审计只关联本设备已登记的用券选择',
 for (const [reason, args, message, limit] of [
   ['WRT-01', {confirmAmountYuan:20, extra:true}, /多余/, '200'],
   ['invalid_arguments', {confirmAmountYuan:false}, /类型/, '200'],
-  ['device_rate', {confirmAmountYuan:20}, /太频繁/, '2']
+  ['device_rate', {confirmAmountYuan:20}, /太频繁/, '3']
 ]) {
   test(`LOG-03 ${reason} 拒绝只记录本设备登记令牌的全值和防重键`, async t => {
     const {r, s} = await withBound(t, {LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:limit});
     const own = await prepare(s);
     const other = await r.session();
-    await bind(other);
+    await bindAgain(other);
     const foreign = await success(other, 'prepare_order', {...basket, couponChoice:'none'});
     const unknown = '00000000-0000-4000-8000-000000000001';
     for (const confirmToken of [own.confirmToken, foreign.confirmToken, unknown, 12345678]) {
@@ -93,7 +93,7 @@ test('R26 不用券明确失败只发送一次，未决请求的用券选择在�
   m.orders = [{orderNo:number(42), userId:memberA, orderAt:record.time}];
   await r.restart();
   const again = await r.session();
-  await bind(again);
+  await bindAgain(again);
   assert.equal((await success(again, 'my_orders')).resolvedPendingWrites, 1);
   const rows = await writeAudit(r);
   assert.deepEqual(rows.map(row => [row.outcome, row.couponChoice]), [
@@ -119,7 +119,7 @@ test('§5.9 v1.8 账本中没有用券选择的未决记录按默认用券核对
   }
   await r.start();
   const again = await r.session();
-  await bind(again);
+  await bindAgain(again);
   assert.equal((await success(again, 'my_orders')).resolvedPendingWrites, 1);
   const last = (await writeAudit(r)).at(-1);
   assert.deepEqual([last.outcome, last.couponChoice], ['resolved', 'default']);
@@ -159,7 +159,7 @@ test('§4 / §5.9 指定用券的审计和账本只记选择，重启后仍能�
   const chosen = () => success(s, 'prepare_order', {...basket, couponChoice:'specific', couponRef:ref});
   const draft = await chosen();
   const other = await r.session();
-  await bind(other);
+  await bindAgain(other);
   await failure(other, 'place_order', argsFor(draft), /令牌无效/);
   await failure(s, 'place_order', {...argsFor(draft), couponRef:ref}, /多余的：couponRef/);
   assert.equal((await place(s, draft)).placed, true);
@@ -176,7 +176,7 @@ test('§4 / §5.9 指定用券的审计和账本只记选择，重启后仍能�
   m.orders = [{orderNo:number(42), userId:memberA, orderAt:records[2].time}];
   await r.restart();
   const resumed = await r.session(s.device);
-  await bind(resumed);
+  await bindAgain(resumed);
   assert.equal((await success(resumed, 'my_orders')).resolvedPendingWrites, 1);
   const audit = await writeAudit(r);
   assert.deepEqual(audit.map(row => [row.outcome, row.couponChoice]), [

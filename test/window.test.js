@@ -8,7 +8,7 @@ import { rig } from '../test-support/rig.js';
 
 const baseTime = Date.UTC(2026, 0, 1, 12, 0, 57);
 const memberPath = 'v3/crm/customer/getCustomerIdByCode';
-const valid = { codeType: 'card', code: 'FAKE_CARD' };
+const valid = { codeType: 'phone', code: '13800000000' };
 const callsLimited = '操作太频繁，请稍等一下再试。';
 const bindsLimited = '绑定尝试太频繁，请稍后再试。';
 
@@ -30,7 +30,7 @@ Date.now = () => Number(readFileSync(${JSON.stringify(clockFile)}, 'utf8'));
     nodeArgs: ['--import', pathToFileURL(preload).href],
     env: { LICHA_SESSION_IDLE_TTL_MS: '7200000', ...limits },
     upstream: (path) => path === memberPath
-      ? { code: 0, status: true, data: { customerId: '9000000000000001234' } }
+      ? { code: 0, status: true, data: { customerId: 0 } }
       : { code: 400, status: false },
   });
   async function attempt(offset, session, expectedError, args = valid) {
@@ -45,7 +45,8 @@ Date.now = () => Number(readFileSync(${JSON.stringify(clockFile)}, 'utf8'));
       if (typeof expectedError === 'string') assert.equal(result.content[0].text, expectedError);
       else assert.match(result.content[0].text, expectedError);
     } else {
-      assert.equal(JSON.parse(result.content[0].text).bound, true);
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /还不是李茶的茶会员/);
       assert.equal(after, before + 1);
     }
   }

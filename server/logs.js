@@ -24,7 +24,7 @@ export function currentQuotaDay() {
 const knownPaths = new Set(Object.values(PATHS));
 const generatedFields = new Set(['time', 'date', 'quotaDate', 'path']);
 const protectedFields = new Set([
-  'orderNo', 'tokenId', 'requestKey', 'dedupKey', 'memberHash', 'previousMemberHash', 'deviceHash'
+  'orderNo', 'tokenId', 'requestKey', 'dedupKey', 'memberHash', 'previousMemberHash', 'deviceHash', 'phoneHash'
 ]);
 
 export function createLogs(config) {
@@ -33,7 +33,7 @@ export function createLogs(config) {
   function clean(key, value) {
     if (generatedFields.has(key)) return undefined;
     if (protectedFields.has(key)) return typeof value === 'string' ? tail(value) : '***';
-    if (/key|token|secret|password|passphrase|authorization|grantcode|openid|signature|credential|licha.?access|^nonce$/i.test(key)) return undefined;
+    if (/key|token|secret|password|passphrase|authorization|captcha|grantcode|openid|signature|credential|licha.?access|^nonce$/i.test(key)) return undefined;
     if (Array.isArray(value)) return value.map(item => clean('', item));
     if (value && typeof value === 'object') {
       return Object.fromEntries(Object.entries(value).map(([k,v]) => [k,clean(k,v)]));
@@ -46,7 +46,7 @@ export function createLogs(config) {
     return str === String(value) ? value : str;
   }
   function writer(file, dated) {
-    return (record, {device, memberId, previousMemberId, confirmation, order, ledgerRecord, reservation} = {}) => {
+    return (record, {device, phone, memberId, previousMemberId, confirmation, order, ledgerRecord, reservation} = {}) => {
       try {
         const row = clean('',record);
         row.time = beijingTime();
@@ -54,6 +54,7 @@ export function createLogs(config) {
         if (file === 'upstream.jsonl' && knownPaths.has(record.path)) row.path = record.path;
         if (dated && quotaDays.has(reservation)) row.quotaDate = reservation.day;
         if (device) row.deviceHash = digest(device);
+        if (phone) row.phoneHash = digest(phone);
         if (memberId) row.memberHash = digest(memberId);
         if (previousMemberId) row.previousMemberHash = digest(previousMemberId);
         if (confirmations.has(confirmation)) {

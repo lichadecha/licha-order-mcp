@@ -2,8 +2,8 @@ import {createHmac, randomInt} from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import {setTimeout as delay} from 'node:timers/promises';
-import {decimalId, integerDigits, projectText} from './common.js';
-import {consumeSendReceipt} from './ledger.js';
+import {decimalId, integerDigits, maskNumbers, projectText} from './common.js';
+import {consumeSendReceipt, consumeSmsReceipt} from './ledger.js';
 
 export const PATHS = Object.freeze({
   stores: 'v3/org/shop/getShopList',
@@ -17,8 +17,11 @@ export const PATHS = Object.freeze({
   orderDetail: 'v3/order/standard/cyOrderDetail',
   orderStatus: 'v3/order/status',
   orderList: 'v3/order/userAppointTimeOrderList',
-  create: 'v3/newPattern/cateringApiserver/post/order/v1/create'
+  create: 'v3/newPattern/cateringApiserver/post/order/v1/create',
+  smsSend: 'v3/message/commonSendSmsCaptcha',
+  smsCheck: 'v3/message/commonCheckSmsCaptcha'
 });
+const smsPaths = new Set([PATHS.smsSend, PATHS.smsCheck]);
 const readPaths = new Set([
   PATHS.stores, PATHS.storeStatus, PATHS.categories, PATHS.categoryItems, PATHS.search,
   PATHS.item, PATHS.member, PATHS.coupons, PATHS.orderDetail, PATHS.orderStatus, PATHS.orderList
@@ -111,7 +114,7 @@ export function readHint(error, fallback) {
     ?? (error.code == null ? fallback : undefined) ?? '接口暂时异常，换个问法试试';
 }
 
-function post(url, path, payload, timeout, onFlush, maskCouponIds) {
+function post(url, path, payload, timeout, onFlush, maskText, phone) {
   const transport = url.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
     let timedOut = false;
@@ -134,8 +137,11 @@ function post(url, path, payload, timeout, onFlush, maskCouponIds) {
           const envelope = parseResponse(Buffer.concat(chunks).toString('utf8'), path);
           if (envelope?.status === false) {
             const {message, code} = envelope;
-            reject(new QmaiError('business', projectText(message, maskCouponIds) || '未知错误', {
-              code: Number.isSafeInteger(code) || (typeof code === 'string' && /^\d{1,9}$/.test(code)) ? code : undefined,
+            const fallback = path === PATHS.smsSend ? '短信服务暂时不可用' : '未知错误';
+            // 11 位电话可用 JSON 数字精确表示，回显时可能丢了前导零。
+            const businessCode = Number.isSafeInteger(code) || (typeof code === 'string' && /^\d{1,9}$/.test(code)) ? code : undefined;
+            reject(new QmaiError('business', projectText(message, maskText) || fallback, {
+              code: phone !== undefined && Number(businessCode) === Number(phone) ? undefined : businessCode,
               messageLength: typeof message === 'string' ? [...message].length : 0
             }));
           } else if (envelope?.status === true) resolve(envelope.data);
@@ -185,7 +191,7 @@ export class Qmai {
     const backoff = this.config.LICHA_READ_BACKOFF_MS;
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.#attempt(path, params, false, options);
+        return await this.#attempt(path, params, options);
       } catch (error) {
         const transient = ['timeout','network','invalid'].includes(error.kind)
           || (error.kind === 'http' && error.statusCode >= 500);
@@ -197,12 +203,43 @@ export class Qmai {
   write(path, params, options = {}) {
     if (path !== PATHS.create || ![true, '1'].includes(this.config.LICHA_ENABLE_ORDERING)) throw new Error('写出口拒绝此请求');
     if (typeof options.beforeSend !== 'function') throw new Error('写出口要求发送前落盘凭据');
-    return this.#attempt(path, params, true, options);
+    return this.#attempt(path, params, options);
   }
 
-  #attempt(path, params, write, {beforeSend, maskCouponIds}) {
+  async sms(path, {phone, bizId, captcha}, {beforeSend} = {}) {
+    if (!smsPaths.has(path) || ![true, '1'].includes(this.config.LICHA_ENABLE_ORDERING)) throw Error('短信出口拒绝此请求');
+    const c = this.config;
+    if (path === PATHS.smsSend) {
+      if (typeof beforeSend !== 'function') throw Error('短信出口要求发码前记账凭据');
+      const params = {bizId, customerPhone:phone, eventNo:c.LICHA_SMS_EVENT_NO, expireTime:c.LICHA_SMS_CODE_TTL_SEC, source:3};
+      // 企迈可能将号码或自行生成的验证码写进拒绝文案。只投影去除数字和凭证后的说明。
+      const maskText = value => {
+        for (const secret of [bizId, c.QMAI_OPEN_KEY, c.QMAI_OPEN_ID, c.QMAI_GRANT_CODE, ...c.LICHA_ACCESS_KEYS]) {
+          if (secret) value = value.replaceAll(secret, '***');
+        }
+        return value.replace(/\d+/g, '***');
+      };
+      await this.#attempt(path, params, {beforeSend, maskText});
+      return true;
+    }
+    try {
+      const data = await this.#attempt(path, {bizId, captcha, phone}, {});
+      return data == null || data === true || (typeof data === 'object' && !Array.isArray(data) && Object.keys(data).length === 0);
+    } catch (error) {
+      if (error.kind === 'business') return false;
+      throw error;
+    }
+  }
+
+  #attempt(path, params, {beforeSend, maskCouponIds, maskText = maskCouponIds ?? maskNumbers}) {
     const c = this.config;
     if (!this.key?.length || !c.QMAI_OPEN_ID || !c.QMAI_GRANT_CODE) throw new QmaiError('credentials', MISSING_CREDENTIALS);
+    const write = path === PATHS.create || smsPaths.has(path);
+    const phone = path === PATHS.create ? params.mobile : path === PATHS.member ? params.customerCode?.code : undefined;
+    const project = phone === undefined ? maskText : text => {
+      const normalized = String(Number(phone));
+      return maskText(text).replaceAll(phone, '***').replace(/\d+/g, digits => digits === normalized ? '***' : digits);
+    };
     const timeout = write ? c.LICHA_WRITE_TIMEOUT_MS : c.LICHA_READ_TIMEOUT_MS;
     const deadline = write ? performance.now() + timeout : Infinity;
     const url = new URL(path, c.QMAI_BASE_URL.replace(/\/?$/, '/'));
@@ -224,17 +261,21 @@ export class Qmai {
         const fields = {openId: c.QMAI_OPEN_ID, grantCode: c.QMAI_GRANT_CODE, nonce: randomInt(1000000, 1000000000),
           timestamp: Math.floor(Date.now() / 1000)};
         const payload = encode({...fields, token: sign(this.key, fields), params});
-        if (write) {
+        if (path === PATHS.create || path === PATHS.smsSend) {
           const attempt = Object.freeze({});
-          consumeSendReceipt(beforeSend(attempt), attempt);
+          const receipt = beforeSend(attempt);
+          if (path === PATHS.smsSend) consumeSmsReceipt(receipt, attempt, params.customerPhone);
+          else consumeSendReceipt(receipt, attempt);
         }
         const started = performance.now();
         const flushed = Promise.withResolvers();
-        const report = (outcome, error) => this.logAttempt({
-          path, outcome, elapsedMs: Math.round(performance.now() - started),
-          ...(error?.code !== undefined && {code:error.code}), ...(error?.messageLength !== undefined && {messageLength:error.messageLength})
-        });
-        const response = post(url, path, payload, timeout, flushed.resolve, maskCouponIds);
+        const report = (outcome, error) => {
+          const code = error?.code;
+          this.logAttempt({path, outcome, elapsedMs:Math.round(performance.now() - started),
+            ...(code !== undefined && !(smsPaths.has(path) && /\d{4}/.test(code)) && {code}),
+            ...(error?.messageLength !== undefined && {messageLength:error.messageLength})});
+        };
+        const response = post(url, path, payload, timeout, flushed.resolve, project, phone);
         response.then(data => {
           const rows = path === PATHS.orderList && Array.isArray(data?.data) ? data.data
             : path === PATHS.create ? [data] : [];

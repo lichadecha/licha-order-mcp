@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {rig} from '../test-support/rig.js';
-import {bookRecords} from '../test-support/commerce.js';
+import {bind as bindPhone, bookRecords} from '../test-support/commerce.js';
 import {PATHS} from '../server/qmai.js';
 
 const good = data => ({status:true,code:0,data});
@@ -17,7 +17,7 @@ async function value(result) {
 }
 async function bind(r,code) {
   const session = await r.session();
-  await value(session.call('bind_member',{codeType:'card',code:'FAKE-CARD-' + code}));
+  await bindPhone(session, '13800000' + code);
   return session;
 }
 const prepare = s => value(s.call('prepare_order',order));
@@ -54,7 +54,7 @@ test('WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写�
   const firstReceived = Promise.withResolvers();
   const release = Promise.withResolvers();
   t.after(()=>release.resolve());
-  const r = await rig(t,{env:{NODE_OPTIONS:'--import='+hook,LICHA_MAX_ORDERS_PER_DAY:'1',
+  const r = await rig(t,{mockSms:true,env:{NODE_OPTIONS:'--import='+hook,LICHA_MAX_ORDERS_PER_DAY:'1',
     LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1', LICHA_UPSTREAM_MIN_INTERVAL_MS:'720', LICHA_WRITE_TIMEOUT_MS:'6000'},
     upstream:mockUpstream(async params => {
       const n = created.push(params);
@@ -96,14 +96,24 @@ test('WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写�
   assert.equal(audit.find(row => row.reason === 'WRT-09_global').quotaDate,undefined);
 });
 
-test('WRT-11 等待实际发送名额超时，账本空且个人、全局占位都释放', async t => {
+test('WRT-11 等待实际发送名额超时，无发单记录且个人、全局占位都释放', async t => {
   const interval = 430;
-  const r = await rig(t,{env:{LICHA_UPSTREAM_MIN_INTERVAL_MS:String(interval),LICHA_WRITE_TIMEOUT_MS:'100',
+  const readStarted = Promise.withResolvers();
+  const upstream = mockUpstream(()=>good({orderNo:'D00000000000000000911'}));
+  const r = await rig(t,{mockSms:true,env:{LICHA_UPSTREAM_MIN_INTERVAL_MS:String(interval),LICHA_WRITE_TIMEOUT_MS:'650',
     LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1',LICHA_MAX_ORDERS_PER_DAY:'1'},
-    upstream:mockUpstream(()=>good({orderNo:'D00000000000000000911'}))});
+    upstream(path, params, wire) {
+      if (path === PATHS.categories) readStarted.resolve();
+      return upstream(path, params, wire);
+    }});
   const s = await bind(r,'611');
   const first = await prepare(s);
+  // 单个间隔能发短信。两个不同门店的读取先占据发送时隙，使下单等待超过写超时。
+  const readers = await Promise.all([r.session(), r.session()]);
+  const menuReads = readers.map((reader, i) => value(reader.call('get_menu', {storeId: 610 + i})));
+  await readStarted.promise;
   const response = await place(s,first);
+  await Promise.all(menuReads);
   assert.equal(response.isError,true);
   assert.match(response.content[0].text,/排队的人多，这次下单请求没有发出/);
   assert.equal(r.requests.filter(x=>x.path===PATHS.create).length,0);
