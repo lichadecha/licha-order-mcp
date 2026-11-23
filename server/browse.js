@@ -1,4 +1,4 @@
-import {PATHS, readHint} from './qmai.js';
+import {PATHS, isRetryableReadError, readHint} from './qmai.js';
 import {beijingTime, decimalId, digest, projectText, responseId, yuan} from './common.js';
 import {itemCard, menuItem, id, list, numeric} from './catalog.js';
 import {priceLine, SelectionError} from './price.js';
@@ -13,7 +13,7 @@ const statusText = n => statusNames[n] ?? '状态未知';
 function readError(label, error = {}, fallback) {
   const hint = readHint(error, fallback);
   const reason = error.kind === 'business' ? error.message : '未知错误';
-  if (label === '按分类查商品失败' && !['timeout','network','http'].includes(error.kind)) {
+  if (label === '按分类查商品失败' && !isRetryableReadError(error)) {
     return new Error(`${label}：${reason}`);
   }
   return Object.assign(new Error(`${label}：${reason}（${hint}）`), {reason:error.kind === 'business' ? reason : hint});

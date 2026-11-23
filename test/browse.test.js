@@ -267,6 +267,30 @@ test('BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应
   }
 });
 
+test('BRW-10 五种浏览查询收到 HTTP 200 坏 JSON 都共试三次并给出网络提示', async t => {
+  const storeId = 301;
+  const r = await rig(t,{upstream(path,params,{res}) {
+    if (path === PATHS.categories && params.storeId === storeId) {
+      return good([{frontCategoryId:1,categoryName:'奶茶'}]);
+    }
+    res.end('{"data":');
+  }});
+  const s = await r.session();
+  for (const [path,tool,args,label] of [
+    [PATHS.stores,'find_store',{query:'测试'},'门店列表拉取失败'],
+    [PATHS.categories,'get_menu',{storeId:302},'分类菜单拉取失败'],
+    [PATHS.categoryItems,'get_menu',{storeId,keyword:'奶茶'},'按分类查商品失败'],
+    [PATHS.search,'get_menu',{storeId,keyword:'椰果'},'搜索失败'],
+    [PATHS.item,'get_item_detail',{storeId,goodsId:digits},'商品详情查询失败']
+  ]) {
+    const start = r.requests.length;
+    const result = await s.call(tool,args);
+    assert.equal(result.isError,true);
+    assert.equal(r.requests.slice(start).filter(req => req.path === path).length,3,label);
+    assert.equal(result.content[0].text,`${label}：未知错误（网络异常，稍后再试）`);
+  }
+});
+
 test('UPS-02 全局队列按实际发送时刻限速、慢响应可并行', async t => {
   let release, notified;
   const held = new Promise(resolve => { release = resolve; });
@@ -401,16 +425,17 @@ test('UPS-01 R21 损坏的密钥封装不作为普通字符串签名', () => {
 });
 
 test('BRW-04 分类商品失败保留前缀，业务拒绝给原因，超时、断连和 HTTP 错误给对应提示', async () => {
-  for (const [kind,message,expected] of [
+  for (const [kind,message,expected,statusCode] of [
     ['business','分类不可用','按分类查商品失败：分类不可用'],
     ['timeout','','按分类查商品失败：未知错误（门店系统这会儿反应慢，刚才那一步没查到结果，稍等几秒我再帮你问一次。）'],
     ['network','','按分类查商品失败：未知错误（网络异常，稍后再试）'],
-    ['http','HTTP 503','按分类查商品失败：未知错误（网络异常，稍后再试）']
+    ['http','HTTP 503','按分类查商品失败：未知错误（网络异常，稍后再试）',503],
+    ['http','HTTP 400','按分类查商品失败：未知错误',400]
   ]) {
     const browse = new Browse({LICHA_CACHE_CATEGORIES_MS:1000}, {async read(path) {
       if (path === PATHS.categories) return [{frontCategoryId:1,categoryName:'奶茶'}];
       assert.equal(path,PATHS.categoryItems);
-      throw Object.assign(new Error(message), {kind});
+      throw Object.assign(new Error(message), {kind,statusCode});
     }});
     await assert.rejects(browse.call('get_menu',{storeId:301,keyword:'奶茶'}), {message:expected});
   }

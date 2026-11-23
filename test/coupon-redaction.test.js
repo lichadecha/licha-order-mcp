@@ -124,6 +124,10 @@ test('WRT-01 多余字段逐段投影，区分本设备券编号、普通字段�
   const args = argsFor(draft);
   for (const [input, expected] of [
     [{ ...args, [ref]: true }, '（券编号）'],
+    [{ ...args, extra: { userId: 1 }, other: true }, 'extra'],
+    [{ ...args, confirmToken: [{ extra: { userId: 1 }, other: true }] }, 'confirmToken[0].extra'],
+    [{ ...args, confirmToken: [[0], { userId: 1 }] }, 'confirmToken[1].userId'],
+    [{ ...args, confirmToken: [0], extra: true }, 'extra'],
     [{ ...args, confirmAmountYuan: { [ref]: 20 } }, 'confirmAmountYuan.（券编号）'],
     [{ ...args, confirmAmountYuan: { userId: 1 } }, 'confirmAmountYuan.userId'],
     [{ ...args, ['__proto__']: '原始字段' }, '__proto__'],

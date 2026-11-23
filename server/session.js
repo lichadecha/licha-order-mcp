@@ -27,23 +27,37 @@ function extraPlaceField(args, isCouponRef) {
     if (isCouponRef(key)) return '（券编号）';
     return /^[A-Za-z_-]{1,32}$/.test(key) ? key : '（略）';
   };
+  let arrayFallback;
   for (const [key,value] of Object.entries(args)) {
     if (!['confirmToken','confirmAmountYuan'].includes(key)) return field(key);
-    let path = key;
-    let child = value;
-    while (Array.isArray(child) && child.length) {
-      // 如果数组中带有对象字段，指出它实际所在的位置。
-      const found = child.findIndex(item => item && typeof item === 'object' && Object.keys(item).length);
-      const index = Math.max(0, found);
-      path += '[' + (index <= 999 ? index : '（略）') + ']';
-      child = child[index];
+    if (!value || typeof value !== 'object') continue;
+    if (!Array.isArray(value)) {
+      const first = Object.keys(value)[0];
+      if (first !== undefined) return key + '.' + field(first);
+      continue;
     }
-    if (child && typeof child === 'object') {
+    const stack = [{array:value, index:0, path:key}];
+    while (stack.length) {
+      const frame = stack.at(-1);
+      if (frame.index === frame.array.length) {
+        // 整份入参没有多余对象键时，沿用首个非空数组的下标回执。
+        if (frame.array.length) arrayFallback ??= frame.path + '[0]';
+        stack.pop();
+        continue;
+      }
+      const index = frame.index++;
+      const child = frame.array[index];
+      if (!child || typeof child !== 'object') continue;
+      const path = frame.path + '[' + (index <= 999 ? index : '（略）') + ']';
+      if (Array.isArray(child)) {
+        stack.push({array:child, index:0, path});
+        continue;
+      }
       const first = Object.keys(child)[0];
       if (first !== undefined) return path + '.' + field(first);
     }
-    if (path !== key) return path;
   }
+  return arrayFallback;
 }
 
 export function makeEndpoint({version,config,logs,browse,commerce}) {

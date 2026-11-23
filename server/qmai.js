@@ -107,6 +107,11 @@ export class QmaiError extends Error {
   }
 }
 
+export function isRetryableReadError(error) {
+  return ['timeout','network','invalid'].includes(error.kind)
+    || (error.kind === 'http' && error.statusCode >= 500 && error.statusCode < 600);
+}
+
 export function readHint(error, fallback) {
   if (error.kind === 'timeout') return READ_TIMEOUT;
   if (error.kind !== 'business') return '网络异常，稍后再试';
@@ -193,9 +198,7 @@ export class Qmai {
       try {
         return await this.#attempt(path, params, options);
       } catch (error) {
-        const transient = ['timeout','network','invalid'].includes(error.kind)
-          || (error.kind === 'http' && error.statusCode >= 500);
-        if (options.retry === false || !transient || attempt >= 2) throw error;
+        if (options.retry === false || !isRetryableReadError(error) || attempt >= 2) throw error;
         await delay(backoff[attempt]);
       }
     }
