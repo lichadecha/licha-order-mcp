@@ -75,12 +75,15 @@ const otherDiscountTypes = new Set([3, 5, 6, 8, 10, 12, 21, 70, 71]);
 function discountView(detail, { prediction, couponChoice }, actualFen) {
   const noCoupon = couponChoice === 'none';
   const items = [];
+  const totalFen = nonnegativeInteger(detail.discountAmount);
+  let itemSumFen = 0;
   let matchedCoupon = false;
   let matchedUnknownType = false;
   if (Array.isArray(detail.discountList)) {
-    for (const row of detail.discountList) {
-      if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    for (const raw of detail.discountList) {
+      const row = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
       const fen = nonnegativeInteger(row.discountAmount);
+      itemSumFen = itemSumFen === null || fen === null ? null : itemSumFen + fen;
       const type = nonnegativeInteger(row.discountType);
       const name = projectText(row.discountName) || '优惠';
       const summary = projectText(row.discountSummary);
@@ -96,6 +99,7 @@ function discountView(detail, { prediction, couponChoice }, actualFen) {
   }
   if (!noCoupon && !prediction && !items.length) return;
   const result = { items };
+  const totalMismatch = items.length > 0 && totalFen !== null && itemSumFen !== null && itemSumFen !== totalFen;
   const description = items.map(item => (item.summary || item.name)
     + (item.amountYuan === null ? '（金额未知）' : `（抵 ¥${item.amountYuan}）`)).join('；');
   if (items.some(item => item.isCoupon)) {
@@ -110,7 +114,7 @@ function discountView(detail, { prediction, couponChoice }, actualFen) {
       result.note = result.matchesPrediction ? `与组单时告知的一致：${description}。`
         : `与组单时告知的不一致——念单时说的是「${prediction.title}」，实际用的是：${description}。${actualFen > 0 ? '请如实更正后再引导付款。' : '请如实更正。'}`;
     }
-  } else if (items.some(item => item.isCoupon === undefined)) {
+  } else if (totalMismatch || items.some(item => item.isCoupon === undefined)) {
     result.note = noCoupon
       ? `顾客选了这单不用券；门店系统给了优惠：${description}，读回里看不出这是不是优惠券。请如实告知顾客这笔优惠，并请他在小程序「我的订单」里看一下这一单有没有用券。`
       : `门店系统自动给了优惠：${description}。读回里看不出这是不是优惠券，请如实告知顾客有这笔优惠。`;
@@ -125,7 +129,7 @@ function discountView(detail, { prediction, couponChoice }, actualFen) {
         result.note += `念单时说的「${prediction.title}」没有被使用。`;
       }
     }
-  } else if (nonnegativeInteger(detail.discountAmount) === 0) {
+  } else if (totalFen === 0) {
     if (noCoupon) {
       result.matchesChoice = true;
       result.note = '按顾客的选择，这单没有用券（读回显示没有任何优惠）。';

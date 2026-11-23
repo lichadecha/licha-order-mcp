@@ -225,7 +225,8 @@ export async function createCommerce(config, qmai, browse, logs) {
 
   function logPlaceRejection(reason, confirmToken, device) {
     const draft = deviceDraft(confirmToken, device);
-    logs.write({outcome:'rejected', reason, couponChoice:draft?.couponChoice}, {device});
+    logs.write({outcome:'rejected', reason, couponChoice:draft?.couponChoice},
+      {device, confirmation:draft?.confirmation});
   }
 
   async function place({ confirmToken, confirmAmountYuan }, device) {

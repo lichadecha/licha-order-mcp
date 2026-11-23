@@ -254,7 +254,8 @@ test('安全读回和优惠证据 WRT-15/16/17/18/19', async t => {
   assert.ok(missing.warning);
   assert.match(missing.couponApplied.note,/没取到优惠明细/);
   assert.equal(missing.couponApplied.matchesPrediction,undefined);
-  const noncoupon = await orderWith(row => ({...row,discountList:[{discountType:3,discountAmount:100,discountName:'满减'}]}));
+  const noncoupon = await orderWith(row => ({...row,actualAmount:1900,discountAmount:100,
+    discountList:[{discountType:3,discountAmount:100,discountName:'满减'}]}));
   assert.equal(noncoupon.couponApplied.matchesPrediction,false);
   assert.match(noncoupon.couponApplied.note,/门店系统自动给了优惠/);
   const otherCoupon = await orderWith(row => ({...row,discountList:[{discountType:2,discountAmount:100,discountName:'别的券'}]}));

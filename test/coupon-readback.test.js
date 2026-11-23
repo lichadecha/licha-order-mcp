@@ -97,3 +97,54 @@ test('WRT-17 默认用券仅在有优惠条目或预测时给出读回核对，�
     items, matchesPrediction: true, note: '与组单时告知的一致：茶券（金额未知）。'
   });
 });
+
+const activity = { discountType: 3, discountName: '满减', discountAmount: 100 };
+
+function readDiscounts(couponChoice, discountList, discountAmount) {
+  const orderNo = number(1);
+  const detail = { orderNo, userId: memberA, actualAmount: 1800, discountAmount, discountList };
+  const draft = { totalFen: 2000, couponChoice };
+  if (couponChoice === 'default') draft.prediction = { title: '茶券', rawTitle: '茶券' };
+  return placedView({ orderNo }, detail, '', draft, { id: memberA }).couponApplied;
+}
+
+test('WRT-17/20 默认和不用券都逐条展示认不出的优惠，保留用券结论的不确定性', () => {
+  for (const unknown of [null, 7, '内部文字', [{ discountType: 2 }]]) {
+    for (const choice of ['default', 'none']) {
+      const applied = readDiscounts(choice, [activity, unknown], 200);
+      const description = '满减（抵 ¥1.00）；优惠（金额未知）';
+      assert.deepEqual(applied, {
+        items: [{ name: '满减', amountYuan: '1.00', isCoupon: false }, { name: '优惠', amountYuan: null }],
+        note: choice === 'none'
+          ? `顾客选了这单不用券；门店系统给了优惠：${description}，读回里看不出这是不是优惠券。请如实告知顾客这笔优惠，并请他在小程序「我的订单」里看一下这一单有没有用券。`
+          : `门店系统自动给了优惠：${description}。读回里看不出这是不是优惠券，请如实告知顾客有这笔优惠。`
+      });
+    }
+  }
+});
+
+test('WRT-17/20 明细金额之和与合计不符时不能断言没用券，相符时沿用原结论', () => {
+  const rows = [activity, { discountType: 5, discountAmount: 50 }];
+  for (const choice of ['default', 'none']) {
+    for (const total of [0, 149, 151]) {
+      const applied = readDiscounts(choice, rows, total);
+      assert.equal(Object.hasOwn(applied, 'matchesPrediction'), false);
+      assert.equal(Object.hasOwn(applied, 'matchesChoice'), false);
+      assert.match(applied.note, /读回里看不出这是不是优惠券/);
+    }
+    for (const [list, total] of [[rows, 150], [rows, undefined], [[activity, { discountType: 5 }], 150]]) {
+      const applied = readDiscounts(choice, list, total);
+      if (choice === 'none') assert.equal(applied.matchesChoice, true);
+      else assert.equal(applied.matchesPrediction, false);
+      assert.match(applied.note, /这不是用券/);
+    }
+  }
+});
+
+test('WRT-17/20 有明确券时，未知条目或合计不符均保留已用券的结论', () => {
+  const coupon = { discountType: 2, discountName: '茶券', discountAmount: 100 };
+  for (const rows of [[activity, null, coupon], [activity, coupon]]) {
+    assert.equal(readDiscounts('none', rows, 300).matchesChoice, false);
+    assert.equal(readDiscounts('default', rows, 300).matchesPrediction, true);
+  }
+});

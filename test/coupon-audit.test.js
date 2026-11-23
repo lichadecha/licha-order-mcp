@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
+import { digest } from '../server/common.js';
 import { Ledger } from '../server/ledger.js';
 import { PATHS } from '../server/qmai.js';
 import {
@@ -46,6 +47,38 @@ test('§5.9 设备限流的写审计只关联本设备已登记的用券选择',
     ['device_rate', 'none'], ['device_rate', undefined]
   ]);
 });
+
+for (const [reason, args, message, limit] of [
+  ['WRT-01', {confirmAmountYuan:20, extra:true}, /多余/, '200'],
+  ['invalid_arguments', {confirmAmountYuan:false}, /类型/, '200'],
+  ['device_rate', {confirmAmountYuan:20}, /太频繁/, '2']
+]) {
+  test(`LOG-03 ${reason} 拒绝只记录本设备登记令牌的全值和防重键`, async t => {
+    const {r, s} = await withBound(t, {LICHA_RATE_CALLS_PER_DEVICE_PER_MIN:limit});
+    const own = await prepare(s);
+    const other = await r.session();
+    await bind(other);
+    const foreign = await success(other, 'prepare_order', {...basket, couponChoice:'none'});
+    const unknown = '00000000-0000-4000-8000-000000000001';
+    for (const confirmToken of [own.confirmToken, foreign.confirmToken, unknown, 12345678]) {
+      await failure(s, 'place_order', {...args, confirmToken}, message);
+    }
+    const rows = await writeAudit(r);
+    assert.deepEqual(rows.map(row => row.reason), Array(4).fill(reason));
+    const [registered, ...unverified] = rows;
+    const key = digest(own.confirmToken);
+    assert.equal(registered.tokenId, own.confirmToken);
+    assert.equal(registered.requestKey, key);
+    assert.equal(registered.dedupKey, key);
+    assert.equal(registered.couponChoice, 'default');
+    for (const row of unverified) {
+      for (const field of ['tokenId', 'requestKey', 'dedupKey', 'couponChoice']) {
+        assert.ok(!Object.hasOwn(row, field), field);
+      }
+    }
+    assert.equal(count(r, PATHS.create), 0);
+  });
+}
 
 test('R26 不用券明确失败只发送一次，未决请求的用券选择在重启核对时仍可审计', async t => {
   const {r, s, m} = await withBound(t);
