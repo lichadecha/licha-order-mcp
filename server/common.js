@@ -53,17 +53,38 @@ export function yuan(fen) {
   return (fen < 0 ? '-' : '') + digits.slice(0, -2) + '.' + digits.slice(-2);
 }
 
+const privateNumbers = /\d{15,}|(?:0086|\+?86)?1[3-9]\d{9}/g;
 export function maskNumbers(value) {
-  return value.replace(/\d{15,}|(?:0086|\+?86)?1[3-9]\d{9}/g, tail);
+  return value.replace(privateNumbers, tail);
 }
 
-export function projectText(value) {
+// 在排除归属异常或互相冲突的行之前取 ID。掩码只随本次组单及其提交使用。
+export function couponTextMask(rows) {
+  if (!Array.isArray(rows)) return maskNumbers;
+  const ids = new Map();
+  for (const row of rows) {
+    const id = couponInstanceId(row?.id);
+    if (id === null) continue;
+    ids.set(id, tail(id));
+    ids.set(String(row.id), tail(id));
+  }
+  if (!ids.size) return maskNumbers;
+  // R25 的合法数字原文中，只有小数点和指数的加号需要正则转义。
+  const patterns = [...ids.keys()].sort((a, b) => b.length - a.length)
+    .map(id => id.replace(/[.+]/g, '\\$&'));
+  const known = new RegExp(patterns.join('|'), 'g');
+  return value => value.replace(/\+?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g, number => {
+    // 完整实例优先，例如以手机号开头的 12 位券码。其他数字片段沿用通用遮盖。
+    return ids.get(number) ?? maskNumbers(number).replace(known, match => ids.get(match));
+  });
+}
+
+export function projectText(value, mask = maskNumbers) {
   if (typeof value !== 'string') return '';
-  const cleaned = value
+  const publicText = value
     .replace(/(?:https?:\/\/|www\.)[^\s，。；、）)]+/gi, ' ')
-    .replace(/[a-z\d_.-]*(?:key|secret|token)[a-z\d_.-]*\s*[=：:]\s*[^\s，。；、]+/gi, ' ')
-    .replace(/\d{15,}|(?:0086|\+?86)?1[3-9]\d{9}/g, tail)
-    .replace(/\s+/g, ' ').trim();
+    .replace(/[a-z\d_.-]*(?:key|secret|token)[a-z\d_.-]*\s*[=：:]\s*[^\s，。；、]+/gi, ' ');
+  const cleaned = mask(publicText).replace(/\s+/g, ' ').trim();
   const chars = Array.from(cleaned);
   return chars.length > 80 ? chars.slice(0, 80).join('') + '…' : cleaned;
 }

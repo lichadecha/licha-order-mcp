@@ -76,7 +76,7 @@ export function parseResponse(raw, path) {
     }
     // 大整数直接取原文。交易证据中的分数和指数也保留词法，让整数校验能识别舍入前的值。
     const integerField = (orderRead && orderIntegerFields.has(key))
-      || (path === PATHS.coupons && (key === 'id' || key === 'unUseStatus' || key === 'couponCenterType'))
+      || (path === PATHS.coupons && (['id', 'customerId', 'user_id', 'unUseStatus', 'couponCenterType'].includes(key)))
       || (path === PATHS.member && (key === 'customerId' || key === 'data'));
     return /^-?\d{15,}$/.test(token) || (integerField && /[.eE]/.test(token)) ? token : value;
   });
@@ -111,7 +111,7 @@ export function readHint(error, fallback) {
     ?? (error.code == null ? fallback : undefined) ?? '接口暂时异常，换个问法试试';
 }
 
-function post(url, path, payload, timeout, onFlush) {
+function post(url, path, payload, timeout, onFlush, maskCouponIds) {
   const transport = url.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
     let timedOut = false;
@@ -134,7 +134,7 @@ function post(url, path, payload, timeout, onFlush) {
           const envelope = parseResponse(Buffer.concat(chunks).toString('utf8'), path);
           if (envelope?.status === false) {
             const {message, code} = envelope;
-            reject(new QmaiError('business', projectText(message) || '未知错误', {
+            reject(new QmaiError('business', projectText(message, maskCouponIds) || '未知错误', {
               code: Number.isSafeInteger(code) || (typeof code === 'string' && /^\d{1,9}$/.test(code)) ? code : undefined,
               messageLength: typeof message === 'string' ? [...message].length : 0
             }));
@@ -179,28 +179,28 @@ export class Qmai {
 
   read(path, params = {}, options = {}) {
     if (!readPaths.has(path)) throw new Error('读出口拒绝此路径');
-    return this.#read(path, params, options.retry !== false);
+    return this.#read(path, params, options);
   }
-  async #read(path, params, retry) {
+  async #read(path, params, options) {
     const backoff = this.config.LICHA_READ_BACKOFF_MS;
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.#attempt(path, params, false);
+        return await this.#attempt(path, params, false, options);
       } catch (error) {
         const transient = ['timeout','network','invalid'].includes(error.kind)
           || (error.kind === 'http' && error.statusCode >= 500);
-        if (!retry || !transient || attempt >= 2) throw error;
+        if (options.retry === false || !transient || attempt >= 2) throw error;
         await delay(backoff[attempt]);
       }
     }
   }
-  write(path, params, {beforeSend} = {}) {
+  write(path, params, options = {}) {
     if (path !== PATHS.create || ![true, '1'].includes(this.config.LICHA_ENABLE_ORDERING)) throw new Error('写出口拒绝此请求');
-    if (typeof beforeSend !== 'function') throw new Error('写出口要求发送前落盘凭据');
-    return this.#attempt(path, params, true, beforeSend);
+    if (typeof options.beforeSend !== 'function') throw new Error('写出口要求发送前落盘凭据');
+    return this.#attempt(path, params, true, options);
   }
 
-  #attempt(path, params, write, beforeSend) {
+  #attempt(path, params, write, {beforeSend, maskCouponIds}) {
     const c = this.config;
     if (!this.key?.length || !c.QMAI_OPEN_ID || !c.QMAI_GRANT_CODE) throw new QmaiError('credentials', MISSING_CREDENTIALS);
     const timeout = write ? c.LICHA_WRITE_TIMEOUT_MS : c.LICHA_READ_TIMEOUT_MS;
@@ -234,7 +234,7 @@ export class Qmai {
           path, outcome, elapsedMs: Math.round(performance.now() - started),
           ...(error?.code !== undefined && {code:error.code}), ...(error?.messageLength !== undefined && {messageLength:error.messageLength})
         });
-        const response = post(url, path, payload, timeout, flushed.resolve);
+        const response = post(url, path, payload, timeout, flushed.resolve, maskCouponIds);
         response.then(data => {
           const rows = path === PATHS.orderList && Array.isArray(data?.data) ? data.data
             : path === PATHS.create ? [data] : [];

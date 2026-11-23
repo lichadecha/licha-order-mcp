@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { checkOrderFields } from '../server/commerce.js';
 import { PATHS } from '../server/qmai.js';
 import {
-  basket, count, failure, goodsId, memberA, ok, phone, place, prepare, shop, skuId, success, withBound
+  basket, count, failure, goodsId, memberA, memberB, ok, phone, place, prepare, shop, skuId, success, withBound
 } from '../test-support/commerce.js';
 
 const noneFields = { lastSelect: { type: -1, value: '' }, attendCouponIds: [], attendCouponType: 1 };
@@ -40,7 +40,7 @@ test('PRE-12/13 仅 prepare_order 公开三种用券选择和可选的券编号�
 
 test('PRE-07/12 缺省与显式 default 同样预测，none 省掉筛券并只给选择与念单说明', async t => {
   const { r, s, m } = await withBound(t);
-  m.couponRows = [{ id: '809', title: '会员券', userCouponCanDisAmount: 5, unUseStatus: 1, couponCenterType: 1 }];
+  m.couponRows = [{ id: '809', customerId: memberA, title: '会员券', userCouponCanDisAmount: 5, unUseStatus: 1, couponCenterType: 1 }];
   const omitted = await prepare(s);
   const ref = omitted.coupons.usable[0].ref;
   assert.ok(ref);
@@ -130,7 +130,7 @@ test('PRE-06/09 用券自检失败不会签发令牌，也不会替代此前的�
   assert.equal((await place(s, prior)).placed, true);
 });
 
-const threeYuan = { id: '9300000000000000789', title: '三元券', unUseStatus: 1, userCouponCanDisAmount: 3 };
+const threeYuan = { customerId: memberA, id: '9300000000000000789', title: '三元券', unUseStatus: 1, userCouponCanDisAmount: 3 };
 const choose = ref => ({ ...basket, couponChoice: 'specific', couponRef: ref });
 
 test('PRE-13 用券选择与编号不配套时给业务文案，不问上游', async t => {
@@ -238,14 +238,106 @@ test('PRE-13 R13 无门店编码直接拒绝，筛券失败仅问一次，均不
   assert.equal((await place(s, original)).placed, true);
 });
 
-test('PRE-07/13 可用行缺券实例 ID 时无法列出完整券列表，默认仍可组单，指定拒绝', async t => {
-  const { s, m } = await withBound(t);
+test('PRE-07/13 只删一行的 id，三张券照常列出，缺 ID 的券仍可预测', async t => {
+  const { r, s, m } = await withBound(t);
+  m.couponRows = [
+    { ...threeYuan }, { ...threeYuan, id: '204', title: '五元券', userCouponCanDisAmount: 5 },
+    { ...threeYuan, id: '205', title: '一元券', userCouponCanDisAmount: 1 }
+  ];
+  const before = (await prepare(s)).coupons;
+  const [threeRef, fiveRef] = before.usable.map(row => row.ref);
+  delete m.couponRows[1].id;
+  const after = (await prepare(s)).coupons;
+  const expected = structuredClone(before);
+  delete expected.usable[1].ref;
+  assert.deepEqual(after, expected);
+  assert.equal(after.predicted.title, '五元券');
+  await failure(s, 'prepare_order', choose(fiveRef), /这单用不了/);
+  const selected = await success(s, 'prepare_order', choose(threeRef));
+  assert.deepEqual(selected.coupons.usable, after.usable);
+  assert.equal(count(r, PATHS.create), 0);
+});
+
+test('PRE-13 两个归属字段指向乙、出现无效归属或互相矛盾时，甲看不到券且不能指定', async t => {
+  const { r, s, m } = await withBound(t);
   m.couponRows = [threeYuan];
-  const original = await prepare(s);
-  m.couponRows.push({ title: '缺编号的券', unUseStatus: 1, userCouponCanDisAmount: 5 });
-  await failure(s, 'prepare_order', choose(original.coupons.usable[0].ref), /券信息暂时没查到/);
+  const ref = (await prepare(s)).coupons.usable[0].ref;
+  for (const ownership of [
+    { customerId: memberB, user_id: memberB },
+    { customerId: memberA, user_id: memberB },
+    { customerId: memberB, user_id: memberA },
+    { customerId: null, user_id: memberA },
+    { customerId: 0 }, { customerId: memberA, user_id: '' },
+    { customerId: JSON.rawJSON(memberA + '.00000001') },
+    { customerId: memberA, user_id: JSON.rawJSON('9223372036854775808') }
+  ]) {
+    m.couponRows = [{ ...threeYuan, ...ownership }];
+    const { coupons } = await prepare(s);
+    assert.equal(coupons.available, true);
+    assert.deepEqual(coupons.usable, []);
+    assert.deepEqual(coupons.unusable, []);
+    assert.ok(!coupons.predicted);
+    assert.equal(await failure(s, 'prepare_order', choose(ref), /这单用不了/),
+      '「三元券」这单用不了。可以换一张，或按默认、不用券组单。');
+  }
+  assert.equal(count(r, PATHS.create), 0);
+});
+
+test('PRE-13 任一归属字段数值匹配可指定，两个字段都缺仍可预测但不发编号', async t => {
+  const { r, s, m } = await withBound(t);
+  const { customerId, ...noOwner } = threeYuan;
+  m.couponRows = [{ ...noOwner, user_id: JSON.rawJSON(memberA + '0e-1') }];
   const { coupons } = await prepare(s);
-  assert.deepEqual(coupons, {
-    choice: 'default', available: false, usable: [], unusable: [], note: '券信息暂时没查到；下单后以门店系统读回的实付为准，如有优惠会在读回里体现。'
-  });
+  const ref = coupons.usable[0].ref;
+  assert.equal(typeof ref, 'string');
+  m.couponRows = [{ ...noOwner, customerId: '0' + memberA + '.0', user_id: memberA }];
+  assert.equal((await success(s, 'prepare_order', choose(ref))).coupons.chosen.title, '三元券');
+  m.couponRows = [noOwner];
+  const expected = structuredClone(coupons);
+  delete expected.usable[0].ref;
+  assert.deepEqual((await prepare(s)).coupons, expected);
+  await failure(s, 'prepare_order', choose(ref), /这单用不了/);
+  assert.equal(count(r, PATHS.create), 0);
+});
+
+test('PRE-13 同实例可用性、金额、原券名或归属冲突，正序倒序均排除整张券', async t => {
+  const { r, s, m } = await withBound(t);
+  const commonTitle = '券'.repeat(81);
+  const row = { ...threeYuan, title: commonTitle + '甲' };
+  const other = { ...threeYuan, id: '206', title: '剩余券', userCouponCanDisAmount: 1 };
+  m.couponRows = [row, other];
+  const initial = (await prepare(s)).coupons;
+  const [selected, retained] = initial.usable;
+  for (const conflict of [
+    { unUseStatus: 0 }, { userCouponCanDisAmount: 3.01 }, { title: commonTitle + '乙' },
+    { customerId: memberB }, { customerId: memberA, user_id: null }
+  ]) {
+    const duplicate = { ...row, ...conflict, id: '0' + row.id + '.0' };
+    for (const pair of [[row, duplicate], [duplicate, row]]) {
+      m.couponRows = [...pair, other];
+      const { coupons } = await prepare(s);
+      assert.deepEqual(coupons.usable, [retained]);
+      assert.deepEqual(coupons.unusable, []);
+      assert.equal(coupons.predicted.title, other.title);
+      await failure(s, 'prepare_order', choose(selected.ref), /这单用不了/);
+    }
+  }
+  assert.equal(count(r, PATHS.create), 0);
+});
+
+test('PRE-13 同实例一致的重复行只计一次，调换顺序保持编号与预测', async t => {
+  const { s, m } = await withBound(t);
+  const unavailable = { ...threeYuan, id: '207', title: '周末券', unUseStatus: 0, unUseDesc: '限周末' };
+  m.couponRows = [threeYuan, unavailable];
+  const expected = (await prepare(s)).coupons;
+  const ref = expected.usable[0].ref;
+  const equivalent = { ...threeYuan, id: JSON.rawJSON(threeYuan.id + '.0'), userCouponCanDisAmount: '3.00' };
+  for (const pair of [[threeYuan, equivalent], [equivalent, threeYuan]]) {
+    m.couponRows = [...pair, unavailable, { ...unavailable }];
+    assert.deepEqual((await prepare(s)).coupons, expected);
+    const chosen = (await success(s, 'prepare_order', choose(ref))).coupons;
+    assert.deepEqual(chosen.usable, expected.usable);
+    assert.deepEqual(chosen.unusable, expected.unusable);
+    assert.equal(chosen.chosen.title, threeYuan.title);
+  }
 });

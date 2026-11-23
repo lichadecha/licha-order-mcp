@@ -24,16 +24,38 @@ export function nonnegativeInteger(value) {
   return Number.isSafeInteger(n) ? n : null;
 }
 
-export function couponView(rows, totalFen, hasCode, choice, refs, selected) {
+function eligibleCouponRows(rows, memberId) {
+  const instances = new Map();
+  for (const row of rows) {
+    const id = couponInstanceId(row?.id);
+    const owners = ['customerId', 'user_id'].filter(key => row != null && Object.hasOwn(row, key));
+    const wrongOwner = owners.some(key => responseId(row[key]) !== memberId);
+    const rawTitle = typeof row?.title === 'string' ? row.title : '';
+    const usable = nonnegativeInteger(row?.unUseStatus) === 1;
+    const fen = toFen(row?.userCouponCanDisAmount) ?? 0;
+    const type = nonnegativeInteger(row?.couponCenterType);
+    const reason = typeof row?.unUseDesc === 'string' ? row.unUseDesc : '';
+    const existing = instances.get(id);
+    if (existing) {
+      existing.excluded ||= wrongOwner || existing.usable !== usable || existing.fen !== fen || existing.rawTitle !== rawTitle;
+      existing.hasOwner ||= owners.length > 0;
+      if (existing.type !== type) existing.type = null;
+      if (existing.reason !== reason) existing.reason = '';
+    } else {
+      // 没有 ID 的行彼此无法认定为同一张券，仍各自参与默认预测。
+      instances.set(id ?? Symbol(), { id, usable, fen, rawTitle, type, reason, hasOwner: owners.length > 0, excluded: wrongOwner });
+    }
+  }
+  return [...instances.values()].filter(row => !row.excluded);
+}
+
+export function couponView(rows, totalFen, hasCode, choice, binding, selected, maskCouponIds) {
   if (choice === 'none') {
     return { coupons: { choice, note: '顾客选了这单不用券。念完合计要加一句：「这单按你说的不用券。」下单后会核对门店系统有没有照办。' } };
   }
   const usable = [];
   const unusable = [];
-  // 可用行缺有效实例 ID 时给不出编号，也不能用残缺列表推测默认用券。
-  const available = Array.isArray(rows) && rows.every(row =>
-    nonnegativeInteger(row?.unUseStatus) !== 1 || couponInstanceId(row.id) !== null);
-  const coupons = { choice, available, usable, unusable };
+  const coupons = { choice, available: Array.isArray(rows), usable, unusable };
   if (!coupons.available) {
     if (choice === 'specific') throw Error(hasCode
       ? '券信息暂时没查到，没法确认这张券能不能用，所以这次不能指定用券。可以按默认或不用券组单，或稍后再试。'
@@ -43,36 +65,35 @@ export function couponView(rows, totalFen, hasCode, choice, refs, selected) {
       : '这家门店暂时查不了券；下单后以门店系统读回的实付为准。';
     return { coupons };
   }
+  const eligible = eligibleCouponRows(rows, binding.id);
   if (choice === 'specific') {
-    const row = rows.find(row => couponInstanceId(row?.id) === selected.id);
-    const fen = toFen(row?.userCouponCanDisAmount) ?? 0;
-    if (nonnegativeInteger(row?.unUseStatus) !== 1 || fen <= 0) {
-      const reason = projectText(row?.unUseDesc);
-      throw Error(`「${selected.title}」这单用不了${reason ? '：' + reason : ''}。可以换一张，或按默认、不用券组单。`);
+    const row = eligible.find(row => row.id === selected.id);
+    if (!row?.hasOwner || !row.usable || row.fen <= 0) {
+      const reason = projectText(row?.reason, maskCouponIds);
+      throw Error(`「${maskCouponIds(selected.title)}」这单用不了${reason ? '：' + reason : ''}。可以换一张，或按默认、不用券组单。`);
     }
-    const title = projectText(row.title) || '（未命名的券）';
-    const canDisYuan = yuan(fen);
-    const payAfterYuan = yuan(Math.max(0, totalFen - fen));
+    const title = projectText(row.rawTitle, maskCouponIds) || '（未命名的券）';
+    const canDisYuan = yuan(row.fen);
+    const payAfterYuan = yuan(Math.max(0, totalFen - row.fen));
     coupons.chosen = { title, canDisYuan, payAfterYuan };
     coupons.note = `顾客指定用『${title}』。念完合计要加一句：「这单用你的『${title}』，省 ${canDisYuan} 元，实付大约 ¥${payAfterYuan}。」下单后会核对门店系统用的是不是这张。`;
   }
   let winner;
   let best = 0;
-  for (const row of rows) {
-    const title = projectText(row?.title) || '（未命名的券）';
-    if (nonnegativeInteger(row?.unUseStatus) !== 1) {
-      unusable.push({ title, reason: projectText(row?.unUseDesc) || '本单不可用' });
+  for (const row of eligible) {
+    const title = projectText(row.rawTitle, maskCouponIds) || '（未命名的券）';
+    if (!row.usable) {
+      unusable.push({ title, reason: projectText(row.reason, maskCouponIds) || '本单不可用' });
       continue;
     }
-    const fen = toFen(row.userCouponCanDisAmount) ?? 0;
-    const type = nonnegativeInteger(row.couponCenterType);
-    const ref = refs.issue(couponInstanceId(row.id), title);
-    const entry = { ref, title, canDisYuan: yuan(fen), ...(type !== null && { couponCenterType: type }) };
+    const { id, fen, type } = row;
+    const entry = { ...(id && row.hasOwner && { ref: binding.couponRefs.issue(id, title) }),
+      title, canDisYuan: yuan(fen), ...(type !== null && { couponCenterType: type }) };
     usable.push(entry);
     if (choice === 'specific') continue;
     if (fen > 0 && (!winner || (type === 2 && winner.couponCenterType !== 2)
       || ((type === 2) === (winner.couponCenterType === 2) && fen > best))) {
-      winner = { ...entry, rawTitle: typeof row.title === 'string' && row.title.trim() ? row.title : '' };
+      winner = { ...entry, rawTitle: row.rawTitle.trim() ? row.rawTitle : '' };
       best = fen;
     }
   }
@@ -94,23 +115,25 @@ export function couponView(rows, totalFen, hasCode, choice, refs, selected) {
 // 企迈契约 §4 提供了这些非券类型；新类型需有依据才能分类。
 const otherDiscountTypes = new Set([3, 5, 6, 8, 10, 12, 21, 70, 71]);
 
-function discountView(detail, { prediction, couponChoice, chosenCoupon }, actualFen) {
+function discountView(detail, { prediction, couponChoice, chosenCoupon, maskCouponIds }, actualFen) {
   const noCoupon = couponChoice === 'none';
   const specific = couponChoice === 'specific';
   const couponIds = [];
   const items = [];
   const totalFen = nonnegativeInteger(detail.discountAmount);
+  const listIsArray = Array.isArray(detail.discountList);
+  const zeroDiscount = totalFen === 0 && (listIsArray || !Object.hasOwn(detail, 'discountList'));
   let itemSumFen = 0;
   let matchedCoupon = false;
   let matchedUnknownType = false;
-  if (Array.isArray(detail.discountList)) {
+  if (listIsArray) {
     for (const raw of detail.discountList) {
       const row = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
       const fen = nonnegativeInteger(row.discountAmount);
       itemSumFen = itemSumFen === null || fen === null ? null : itemSumFen + fen;
       const type = nonnegativeInteger(row.discountType);
-      const name = projectText(row.discountName) || '优惠';
-      const summary = projectText(row.discountSummary);
+      const name = projectText(row.discountName, maskCouponIds) || '优惠';
+      const summary = projectText(row.discountSummary, maskCouponIds);
       const entry = { name, ...(summary && { summary }), amountYuan: fen === null ? null : yuan(fen) };
       if (type === 2 || otherDiscountTypes.has(type)) entry.isCoupon = type === 2;
       if (specific && entry.isCoupon) couponIds.push(couponInstanceId(row.discountId));
@@ -137,8 +160,16 @@ function discountView(detail, { prediction, couponChoice, chosenCoupon }, actual
       result.note = `顾客指定了『${title}』，但门店系统读回用的是：${description}。${rejection}`;
     } else if (knownTypes && !totalMismatch && couponIds.length === 1 && couponIds[0] === chosenCoupon.id) {
       result.matchesChoice = true;
-      result.note = `按顾客的选择用了『${title}』：${description}。`;
-    } else if (knownTypes && !totalMismatch && !couponIds.length && (items.length || totalFen === 0)) {
+      const extraFen = actualFen - toFen(chosenCoupon.payAfterYuan);
+      result.amountAsPromised = extraFen <= 0;
+      if (result.amountAsPromised) {
+        result.note = `按顾客的选择用了『${title}』：${description}。`;
+      } else {
+        const { amountYuan } = items.find(item => item.isCoupon);
+        const discount = amountYuan === null ? '实际抵了多少没读到' : `只抵了 ¥${amountYuan}`;
+        result.note = `用了顾客指定的『${title}』，但这张${discount}（念单时说省 ¥${chosenCoupon.canDisYuan}），实付 ¥${yuan(actualFen)}，比念单时说的 ¥${chosenCoupon.payAfterYuan} 多 ¥${yuan(extraFen)}。请先如实告诉顾客这个差额，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。`;
+      }
+    } else if (knownTypes && !totalMismatch && !couponIds.length && (items.length || zeroDiscount)) {
       result.matchesChoice = false;
       const details = items.length ? `；门店系统另给的优惠：${description}` : '';
       result.note = `顾客指定了『${title}』，但读回显示这单没有用上任何券${details}。${rejection}`;
@@ -175,7 +206,7 @@ function discountView(detail, { prediction, couponChoice, chosenCoupon }, actual
         result.note += `念单时说的「${prediction.title}」没有被使用。`;
       }
     }
-  } else if (totalFen === 0) {
+  } else if (zeroDiscount) {
     if (noCoupon) {
       result.matchesChoice = true;
       result.note = '按顾客的选择，这单没有用券（读回显示没有任何优惠）。';
@@ -221,7 +252,7 @@ export function placedView(created, detail, readError, draft, binding) {
   if (createFen !== null) result.qmaiPayAmountYuanFromCreate = yuan(createFen);
   if (actual === 0) {
     result.nextStep = `这单读回的实付是 ¥0.00。${applied ? '请按 couponApplied.note 如实说明优惠，' : ''}请让顾客到小程序「我的订单」确认这一单的状态；不要说「去付款」。`;
-  } else if (applied?.matchesChoice === false) {
+  } else if (applied?.matchesChoice === false || applied?.amountAsPromised === false) {
     const choice = draft.couponChoice === 'specific' ? '按顾客指定的券办' : '按顾客的选择不用券';
     result.nextStep = `订单已创建但尚未支付。门店系统没有${choice}（见 couponApplied.note），请先如实说明${result.warning ? '并说清金额差额' : ''}：顾客接受这个金额，再引导他去小程序「我的订单」完成付款；不接受，就请他在小程序「我的订单」里取消这一单（没付款的单门店不会做，也不会扣钱）。我们不代付、不碰任何支付凭据。`;
   } else {

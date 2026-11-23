@@ -1,8 +1,16 @@
-# 李茶的茶点单 MCP v1.10 交付清单
+# 李茶的茶点单 MCP v1.10.1 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.10 顾客指定用哪张券
+## v1.10.1 券归属、实例冲突与实付核对
+
+- **组单。** 逐行核对 `customerId` 和 `user_id`。明示他人、归属无效或矛盾时排除整张券。同一实例的可用性、可抵金额或原始券名有冲突时也排除整张，一致重复只计一次。缺实例 ID 或两个归属都缺时继续列出并参与默认预测，省略该张的 `ref`。指定时现查，旧编号不能绕过本次判定。正反行序、甲指定乙的可用券被拒且创建请求为零、三张券中只删除一行 ID，均有回归。[组单与 R26 完整请求体](test/coupon-preparation.test.js)
+- **文字与日志。** 从整次筛券响应取实例 ID，组单、创建错误、读回错误及优惠明细共用本单的遮盖规则。7 位 ID 显示为 `***`，19 位只露尾四位。WRT-01 的多余字段路径按段核对设备券编号，命中的段显示为 `（券编号）`。回环测试同时检查访问、写入、上游三本日志。[遮盖与日志回归](test/coupon-redaction.test.js)
+- **读回。** 确认只用了指定券后，按分比较实付与待确认单登记的券后实付。念单预计付 17.00 元，读回实付 19.50 元或 20.00 元，两例均为 `matchesChoice:true`、`amountAsPromised:false`，说明差额并请顾客决定付款或取消。有明确异券时优先判用券不符。默认、不用券、指定三种选择遇到非数组明细都按未取得优惠信息处理。[读回、金额与付款指引](test/coupon-readback.test.js)
+
+**全量回归。** 基线 `bc767b1`。新增 14 项测试，其中归属与冲突 4 项、文字及字段路径遮盖 6 项、读回与金额核对 4 项。原有缺 ID 用例按新版逐行判定更新。Node 22.23.1 使用假凭证与本机回环模拟企迈，完整运行 `npm test`，205 项全部通过，失败、跳过、取消均为 0。默认与不用券的整份创建请求均通过既有 R26 样本比对。
+
+## v1.10 顾客指定用哪张券（历史记录）
 
 - **券编号与组单。** 可用券带有绑定范围内稳定的随机 `ref`。顾客点名后，用 `couponChoice: "specific"` 和 `couponRef` 重新组单。服务端先核验编号，再查询一次本单可用券。查券失败、门店没有编码、券已不可用或抵扣为零时均不签令牌。通过时给出券名、当前可抵金额和券后预计实付。上游把缺少有效实例 ID 的行列为可用时，按查券失败处理，默认选择仍可组单。[编号生命周期](test/coupon-refs.test.js) · [组单回归](test/coupon-preparation.test.js)
 - **提交与恢复。** 下单请求按 R26 在顶层写入三项，两处券实例 ID 均为同一个十进制字符串。签发与提交各自核对请求。写审计和账本只记 `specific`。模拟重启后可继续核对未决单。既有整份创建请求断言继续覆盖默认和不用券。[提交与审计回归](test/coupon-audit.test.js)
@@ -284,6 +292,7 @@
 | PRE-10 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | PRE-11 | [server/commerce.js](server/commerce.js) · prepare | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[PRE-11 自动认领与停服人工裁决均按发出时刻提醒再下单](test/commerce.test.js#L651) |
 | PRE-12 | [server/tools.js](server/tools.js) · [prepare](server/commerce.js) | [可选入参、两种创建请求和查券次数](test/coupon-preparation.test.js) · [跨设备换选择](test/order-preparation.test.js) |
+| PRE-13 | [筛券归属与实例合并](server/commerce-view.js) · [券编号与待确认单](server/commerce.js) | [逐行筛券与指定](test/coupon-preparation.test.js) · [编号生命周期](test/coupon-refs.test.js) |
 
 ### 下单
 
@@ -309,6 +318,7 @@
 | WRT-18 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229) |
 | WRT-19 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11](test/commerce.test.js#L135)<br>[安全读回和优惠证据 WRT-15/16/17/18/19](test/commerce.test.js#L229)<br>[WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额](test/commerce.test.js#L718) |
 | WRT-20 | [server/commerce-view.js](server/commerce-view.js) · placedView、discountView | [五种证据、实付分支和读回失败](test/coupon-readback.test.js) |
+| WRT-21 | [指定券核对、差额及付款指引](server/commerce-view.js) | [不同券优先、金额兑现与非数组明细](test/coupon-readback.test.js) |
 
 ### 账本
 

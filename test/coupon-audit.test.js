@@ -137,7 +137,7 @@ JSON.parse = function (...args) {
   return body;
 };`;
   const {r, s, m} = await withBound(t, {NODE_OPTIONS:'--import=data:text/javascript;base64,' + Buffer.from(preload).toString('base64')});
-  m.couponRows = [{id:'7200000000000000001', title:'三元券', unUseStatus:1, userCouponCanDisAmount:3}];
+  m.couponRows = [{customerId:memberA, id:'7200000000000000001', title:'三元券', unUseStatus:1, userCouponCanDisAmount:3}];
   const {ref} = (await prepare(s)).coupons.usable[0];
   const draft = await success(s, 'prepare_order', {...basket, couponChoice:'specific', couponRef:ref});
   await failure(s, 'place_order', argsFor(draft), /用券字段与本单的用券选择不符/);
@@ -154,7 +154,7 @@ test('§4 / §5.9 指定用券的审计和账本只记选择，重启后仍能�
   const {r, s, m} = await withBound(t);
   const id = '7300000000000000042';
   const title = '仅顾客可见的测试券';
-  m.couponRows = [{id, title, unUseStatus:1, userCouponCanDisAmount:3}];
+  m.couponRows = [{customerId:memberA, id, title, unUseStatus:1, userCouponCanDisAmount:3}];
   const {ref} = (await prepare(s)).coupons.usable[0];
   const chosen = () => success(s, 'prepare_order', {...basket, couponChoice:'specific', couponRef:ref});
   const draft = await chosen();

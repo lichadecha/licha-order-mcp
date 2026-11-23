@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { basket, bind, failure, prepare, success, withBound } from '../test-support/commerce.js';
+import { basket, bind, failure, memberA, prepare, success, withBound } from '../test-support/commerce.js';
 
 const couponId = '7200000000000000001';
-const coupon = { id: couponId, title: '茶券', unUseStatus: 1, userCouponCanDisAmount: 3 };
+const coupon = { id: couponId, customerId: memberA, title: '茶券', unUseStatus: 1, userCouponCanDisAmount: 3 };
 const specific = couponRef => ({ ...basket, couponChoice: 'specific', couponRef });
 
 async function firstRef(s) {

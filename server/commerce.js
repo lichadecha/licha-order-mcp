@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { currentQuotaDay, issueConfirmation } from './logs.js';
-import { beijingTime, couponInstanceId, decimalId, digest, integerDigits, responseId, tail, yuan } from './common.js';
+import { beijingTime, couponInstanceId, couponTextMask, decimalId, digest, integerDigits, responseId, tail, yuan } from './common.js';
 import { PATHS, readHint } from './qmai.js';
 import { Ledger } from './ledger.js';
 import { couponView, listedProducts, sameProducts, nonnegativeInteger, orderNumber, orderView, placedView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
@@ -220,19 +220,22 @@ export async function createCommerce(config, qmai, browse, logs) {
         rows = Array.isArray(data) ? data : data?.list;
       } catch { /* couponView 按选择处理未查到的券信息 */ }
     }
-    const { coupons, prediction } = couponView(rows, totalFen, !store || hasCode, couponChoice, b.couponRefs, selected);
+    const maskCouponIds = couponTextMask(rows);
+    const { coupons, prediction } = couponView(rows, totalFen, !store || hasCode, couponChoice, b, selected, maskCouponIds);
     if (book.fault) throw Error(bookProblem);
     const now = Date.now();
     const confirmation = issueConfirmation();
     const confirmToken = confirmation.token;
     const discarded = supersede(draft => draft.hash === b.hash);
-    drafts.set(confirmToken, { confirmation, paramsJson, couponChoice,
-      ...(selected && { chosenCoupon: { id: selected.id, title: coupons.chosen.title } }),
+    drafts.set(confirmToken, { confirmation, paramsJson, couponChoice, maskCouponIds,
+      ...(selected && { chosenCoupon: { id: selected.id, ...coupons.chosen } }),
       totalFen, products: productEvidence, prediction, storeId, hash: b.hash,
       device, expires: now + tokenTtl, state: 'ready' });
     logs.access({event:'prepare_order',totalFen}, {device,memberId:b.id,confirmation});
-    const result = { confirmToken, member: memberView(b), store: { storeId, ...(store?.name && { name: store.name }) },
-      lines, estimatedTotalYuan: yuan(totalFen), coupons };
+    const result = { confirmToken, member: memberView(b), store: { storeId, ...(store?.name && { name: maskCouponIds(store.name) }) },
+      lines: lines.map(line => ({ ...line, name: maskCouponIds(line.name), specName: maskCouponIds(line.specName),
+        practices: line.practices.map(maskCouponIds), attaches: line.attaches.map(maskCouponIds) })),
+      estimatedTotalYuan: yuan(totalFen), coupons };
     const recent = [...book.records.values()].filter(row => row.memberHash === b.hash && orderNumber(row)
       && (row.state === 'success' || row.state === 'found'))
       .map(row => ({ row, at: row.state === 'found' ? row.time : row.completedAt }))
@@ -321,7 +324,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       catch (error) { reject('WRT-10', error.message); }
       let recorded = false;
       try {
-        created = await qmai.write(PATHS.create, params, { beforeSend(attempt) {
+        created = await qmai.write(PATHS.create, params, { maskCouponIds: draft.maskCouponIds, beforeSend(attempt) {
           record.time = Date.now();
           const receipt = book.recordSending(record, attempt);
           recorded = true;
@@ -356,7 +359,8 @@ export async function createCommerce(config, qmai, browse, logs) {
       flights.delete(key);
     }
     let detail, readError;
-    try { detail = await qmai.read(PATHS.orderDetail, { orderNo: created.orderNo, bizType: 5, userId: b.id }); }
+    try { detail = await qmai.read(PATHS.orderDetail, { orderNo: created.orderNo, bizType: 5, userId: b.id },
+      { maskCouponIds: draft.maskCouponIds }); }
     catch (error) { readError = queryError(error, '响应为空'); }
     const result = placedView(created, detail, readError, draft, b);
     if (result.readbackFailed) {
@@ -489,5 +493,8 @@ export async function createCommerce(config, qmai, browse, logs) {
     }
   }
   const cleanup = setInterval(() => sweep(Date.now()), Math.min(60000, tokenTtl, config.LICHA_BINDING_IDLE_TTL_MS)).unref();
-  return { call, logPlaceRejection, close() { clearInterval(cleanup); book.close(); } };
+  function isDeviceCouponRef(device, key) {
+    return !!bindings.get(device)?.couponRefs.get(key);
+  }
+  return { call, logPlaceRejection, isDeviceCouponRef, close() { clearInterval(cleanup); book.close(); } };
 }
