@@ -91,7 +91,9 @@ npm test
 
 `/mcp` 使用有状态 Streamable HTTP，支持 POST、GET、DELETE。薄壳为每次请求附加准入串与设备 ID，握手后附加会话 ID。仅当带指定原因头的 404 证明工具尚未处理请求时，薄壳才重建会话并重发一次。网络中断、等待超时或下单结果未知时，应先查 `my_orders`。顾客在小程序「我的订单」自行核对并付款。
 
-`prepare_order` 可省略 `couponChoice` 或传 `"default"`，由门店系统按默认规则用券。只有顾客明确说这单不用券时才传 `"none"`。顾客改口时重新组单，念出新单的券前合计和用券选择，确认后用新令牌调用 `place_order`。
+`prepare_order` 可省略 `couponChoice` 或传 `"default"`，由门店系统按默认规则用券。顾客明确说不用券时传 `"none"`。顾客点名某张券时，传 `"specific"`，并把上次待确认单中那张券的 `coupons.usable[].ref` 填入 `couponRef`。`couponRef` 是最长 128 个字符的非空字符串，只有指定用券时才带。换绑、绑定过期或服务重启后，先按默认方式重新组单，取得新的券编号。
+
+指定用券时服务端会重查这张券在当前购物车能抵多少。念单时说明券前合计、券名和预计实付，顾客确认后用新令牌和券前合计调用 `place_order`。下单后按 `couponApplied.note` 与 `nextStep` 告知顾客实际用券和付款安排。
 
 ## 账本故障与人工核对
 

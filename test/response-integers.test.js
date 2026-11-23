@@ -1,8 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { PATHS } from '../server/qmai.js';
+import { couponInstanceId } from '../server/common.js';
+import { parseResponse, PATHS } from '../server/qmai.js';
 import { argsFor, basket, bind, failure, memberA, number, ok, place, prepare, setup, success, withBound } from '../test-support/commerce.js';
+
+test('R25 以十进制原文读取筛券的实例 ID，剔除舍入后看似有效的编号', () => {
+  const expected = '9876543210987654321';
+  for (const [token, id] of [
+    [expected + '.0', expected], [expected + '0e-1', expected], ['"00' + expected + '"', expected],
+    [expected + '.00000001', null], ['1e-400', null], ['2e400', null], ['0', null]
+  ]) {
+    const [row] = parseResponse('[{"id":' + token + '}]', PATHS.coupons);
+    assert.equal(couponInstanceId(row.id), id);
+  }
+});
 
 test('R25 BND-02/03 WRT-18 QRY-03 金额分、状态与会员编号按原文的整数值读取', async t => {
   const r = await setup(t);
@@ -14,7 +26,7 @@ test('R25 BND-02/03 WRT-18 QRY-03 金额分、状态与会员编号按原文的�
     await bind(s);
     r.mock.couponRows = [
       { title: '测试券甲', unUseStatus: encode('0.999999999999999999'), userCouponCanDisAmount: 3 },
-      { title: '测试券乙', unUseStatus: encode('1.0'), couponCenterType: encode('1.999999999999999999'), userCouponCanDisAmount: 1 }
+      { id: '802', title: '测试券乙', unUseStatus: encode('1.0'), couponCenterType: encode('1.999999999999999999'), userCouponCanDisAmount: 1 }
     ];
     const draft = await prepare(s);
     assert.deepEqual(draft.coupons.usable.map(coupon => coupon.title), ['测试券乙']);
@@ -112,7 +124,7 @@ test('§4 创建回执的元、详情的分与券的抵扣金额逐分一致', a
   const orderNo = number(42);
   m.override.set(PATHS.create, () => ok({ orderNo, payAmount: JSON.rawJSON(amount) }));
   m.override.set(PATHS.orderDetail, () => ok({ orderNo, userId: memberA, actualAmount: 9007199254740985 }));
-  m.couponRows = [{ title: '金额核对券', unUseStatus: 1, userCouponCanDisAmount: JSON.rawJSON(amount) }];
+  m.couponRows = [{ id: '803', title: '金额核对券', unUseStatus: 1, userCouponCanDisAmount: JSON.rawJSON(amount) }];
   const draft = await prepare(s);
   assert.equal(draft.coupons.predicted.canDisYuan, amount);
   const receipt = await place(s, draft);
@@ -129,7 +141,7 @@ test('§4 券抵扣按原文四舍五入，支持指数、字符串和整分进�
   ];
   for (const encode of [JSON.rawJSON, String]) {
     m.couponRows = cases.map(([amount], i) => ({
-      title: '测试券' + i, unUseStatus: 1, userCouponCanDisAmount: encode(amount)
+      id: String(810 + i), title: '测试券' + i, unUseStatus: 1, userCouponCanDisAmount: encode(amount)
     }));
     const { coupons } = await prepare(s);
     assert.deepEqual(coupons.usable.map(coupon => coupon.canDisYuan), cases.map(([, expected]) => expected));

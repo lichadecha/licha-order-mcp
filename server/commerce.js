@@ -1,6 +1,7 @@
+import { randomBytes } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { currentQuotaDay, issueConfirmation } from './logs.js';
-import { beijingTime, decimalId, digest, integerDigits, responseId, tail, yuan } from './common.js';
+import { beijingTime, couponInstanceId, decimalId, digest, integerDigits, responseId, tail, yuan } from './common.js';
 import { PATHS, readHint } from './qmai.js';
 import { Ledger } from './ledger.js';
 import { couponView, listedProducts, sameProducts, nonnegativeInteger, orderNumber, orderView, placedView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
@@ -11,31 +12,36 @@ const replaced = '这张待确认单已被更新的一版替代（顾客之后�
 const bindFailed = '绑定暂时没成功（查询会员信息时出了点问题，不是你的号有问题）。稍等一下再试一次。';
 const notMember = '这个号还不是李茶的茶会员，所以没法帮你下单。去微信搜「李茶的茶」小程序注册一下（用同一个手机号，很快），注册好回来跟我说一声，我再帮你绑。';
 const forbidden = new Set(['isPre', 'preTime', 'preTimeStart', 'preTimeEnd', 'isWaiterCheck', 'orderSubType', 'payModel']);
-const noCouponFields = {
-  lastSelect: Object.freeze({ type: -1, value: '' }), attendCouponIds: Object.freeze([]), attendCouponType: 1
-};
-const couponKeys = new Set([...Object.keys(noCouponFields), 'useCouponId', 'couponId']);
+const couponKeys = new Set(['lastSelect', 'attendCouponIds', 'attendCouponType', 'useCouponId', 'couponId']);
 const dayMs = 86400000;
 
-export function checkOrderFields(params, couponChoice = 'default') {
+function couponFields(choice, id) {
+  if (choice === 'default') return {};
+  return { lastSelect: { type: -1, value: choice === 'specific' ? id : '' },
+    attendCouponIds: choice === 'specific' ? [id] : [], attendCouponType: 1 };
+}
+
+export function checkOrderFields(params, couponChoice = 'default', chosenId) {
   function rejectCoupon(path) {
     throw Error(`组单自检失败：下单参数里的用券字段与本单的用券选择不符（命中路径：${path}）`);
   }
+  if (couponChoice === 'specific' && (typeof chosenId !== 'string' || couponInstanceId(chosenId) !== chosenId)) {
+    rejectCoupon('params.lastSelect');
+  }
+  const expected = couponFields(couponChoice, chosenId);
   function visit(value, path) {
     for (const [key, child] of Object.entries(value)) {
       const childPath = Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`;
       if (forbidden.has(key)) throw Error(`组单自检失败：下单参数不得包含预约单字段 ${key}（命中路径：${childPath}）`);
-      if (couponKeys.has(key) && !(couponChoice === 'none' && value === params && Object.hasOwn(noCouponFields, key))) {
+      if (couponKeys.has(key) && !(value === params && Object.hasOwn(expected, key))) {
         rejectCoupon(childPath);
       }
       if (child && typeof child === 'object') visit(child, childPath);
     }
   }
   visit(params, 'params');
-  if (couponChoice === 'none') {
-    for (const [key, expected] of Object.entries(noCouponFields)) {
-      if (!Object.hasOwn(params, key) || !isDeepStrictEqual(params[key], expected)) rejectCoupon('params.' + key);
-    }
+  for (const [key, value] of Object.entries(expected)) {
+    if (!Object.hasOwn(params, key) || !isDeepStrictEqual(params[key], value)) rejectCoupon('params.' + key);
   }
 }
 
@@ -57,6 +63,22 @@ const bindingView = b => ({ bound: true, customerIdLast4: b.customerIdTail, memb
   boundVia: b.via, boundAt: beijingTime(b.created) });
 const pendingCount = rows => `${rows.length} 笔状态未知${rows[0]?.time ? '，最早一笔发生在 ' + beijingTime(rows[0].time) : ''}`;
 const owner = row => responseId(row?.userId);
+
+// 映射随这一次会员绑定释放。同设备的新会话和同会员的幂等绑定共用它。
+function createCouponRefs() {
+  const refById = new Map();
+  const couponByRef = new Map();
+  return {
+    issue(id, title) {
+      if (refById.has(id)) return refById.get(id);
+      const ref = randomBytes(24).toString('base64url');
+      refById.set(id, ref);
+      couponByRef.set(ref, { id, title });
+      return ref;
+    },
+    get(ref) { return couponByRef.get(ref); }
+  };
+}
 
 export async function createCommerce(config, qmai, browse, logs) {
   const book = new Ledger(config.LICHA_DATA_DIR);
@@ -146,7 +168,8 @@ export async function createCommerce(config, qmai, browse, logs) {
     const created = Date.now();
     const displayId = typeof value === 'string' && /^\d+$/.test(value) ? value : id;
     const binding = { id, hash: digest(id), customerIdTail: tail(displayId), identifierTail: tail(clean),
-      via: codeType, created, touched: created, ...(codeType === 'phone' && { phone: clean }) };
+      via: codeType, created, touched: created, couponRefs: createCouponRefs(),
+      ...(codeType === 'phone' && { phone: clean }) };
     const discarded = previous ? supersede(draft => draft.device === device && draft.hash === previous.hash, 'rebound') : 0;
     bindings.set(device, binding);
     logs.access({event: previous ? 'rebind' : 'bind', discarded}, {device, memberId:id, previousMemberId:previous?.id});
@@ -167,36 +190,44 @@ export async function createCommerce(config, qmai, browse, logs) {
   }
 
   async function prepare(args, b, device) {
+    const { couponChoice = 'default', couponRef } = args;
+    if ((couponChoice === 'specific') !== (couponRef !== undefined)) {
+      throw Error('用券选择与券编号不配套：指定用某张券时要带上那张券的 couponRef；不指定时不要带 couponRef。');
+    }
+    const selected = b.couponRefs.get(couponRef);
+    if (couponChoice === 'specific' && !selected) {
+      throw Error('这张券的编号已失效（换过会员、绑定过期或服务重启都会失效）。请先不带 couponChoice 重新组单，从新列出的可用券里取 ref。');
+    }
     if (book.fault) throw Error(bookProblem);
     const { totalFen, lines, orderItems, tradeMarks, productEvidence } = await browse.quote(args, true);
     if (totalFen > config.LICHA_MAX_ORDER_AMOUNT_FEN) throw Error(`单笔金额超上限：本单预估 ¥${yuan(totalFen)}，上限 ¥${yuan(config.LICHA_MAX_ORDER_AMOUNT_FEN)}。请减少商品后重新组单。`);
     const storeId = String(args.storeId);
-    const { couponChoice = 'default' } = args;
     const params = { storeId, items: orderItems, orderType: 1, source: 18, userId: b.id,
       channelCode: 'AI_AGENT', scene: 'AI_AGENT', member: true,
       ...(b.phone && { mobile: b.phone, reservePhone: b.phone }),
-      ...(couponChoice === 'none' && noCouponFields) };
-    checkOrderFields(params, couponChoice);
+      ...couponFields(couponChoice, selected?.id) };
+    checkOrderFields(params, couponChoice, selected?.id);
     const paramsJson = JSON.stringify(params);
     let store;
     try { store = await browse.storeForOrder(storeId); } catch { /* 门店名录失败时仍可按门店 ID 组单 */ }
     let rows;
     const hasCode = !!store?.shopCode.trim();
-    if (couponChoice === 'default' && hasCode) {
+    if (couponChoice !== 'none' && hasCode) {
       try {
         const data = await qmai.read(PATHS.coupons, {
           customerId: b.id, discountPrice: 0, multiMark: store.shopCode, typeCate: 1, tradeMarks
         }, { retry: false });
         rows = Array.isArray(data) ? data : data?.list;
-      } catch { /* 券预测失败不阻断组单 */ }
+      } catch { /* couponView 按选择处理未查到的券信息 */ }
     }
-    const { coupons, prediction } = couponView(rows, totalFen, !store || hasCode, couponChoice);
+    const { coupons, prediction } = couponView(rows, totalFen, !store || hasCode, couponChoice, b.couponRefs, selected);
     if (book.fault) throw Error(bookProblem);
     const now = Date.now();
     const confirmation = issueConfirmation();
     const confirmToken = confirmation.token;
     const discarded = supersede(draft => draft.hash === b.hash);
     drafts.set(confirmToken, { confirmation, paramsJson, couponChoice,
+      ...(selected && { chosenCoupon: { id: selected.id, title: coupons.chosen.title } }),
       totalFen, products: productEvidence, prediction, storeId, hash: b.hash,
       device, expires: now + tokenTtl, state: 'ready' });
     logs.access({event:'prepare_order',totalFen}, {device,memberId:b.id,confirmation});
@@ -215,7 +246,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     if (discarded) Object.assign(result, { supersededPendingOrders: discarded,
       supersedeNote: '顾客之前还没确认的那张待确认单已作废，只有这张能提交；别拿旧的 confirmToken。' });
     return { ...result, pickup: '堂食（本店当前只开堂食）：付款后按小程序订单页的提示取餐', expiresInMinutes: minutes,
-      note: `请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；coupons.choice 为 none 时，念完合计按 coupons.note 说一句这单不用券；其余情况不提券。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 ${minutes} 分钟内有效、只能用一次，过期请重新组单。` };
+      note: `请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；coupons.choice 为 none 或 specific 时，念完合计按 coupons.note 说一句这单不用券 / 用哪张券；其余情况不提券。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 ${minutes} 分钟内有效、只能用一次，过期请重新组单。` };
   }
 
   function deviceDraft(confirmToken, device) {
@@ -286,7 +317,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     let created;
     try {
       if (book.records.get(key)?.state === 'success') reject('WRT-10', '这张待确认单已经下过单了，不能重复提交。要再买一单请重新组单。');
-      try { checkOrderFields(params, draft.couponChoice); }
+      try { checkOrderFields(params, draft.couponChoice, draft.chosenCoupon?.id); }
       catch (error) { reject('WRT-10', error.message); }
       let recorded = false;
       try {

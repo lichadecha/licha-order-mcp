@@ -60,7 +60,7 @@ test('WRT-20 不用券读回其他优惠、类型不明、零优惠及无明细�
   }
 });
 
-test('WRT-18/20 四种读回失败都丢弃金额和优惠，仅不用券补充核对提醒', () => {
+test('WRT-18/20/21 四种读回失败都丢弃金额和优惠，按顾客用券选择补充核对提醒', () => {
   const orderNo = number(1);
   const detail = { orderNo, userId: memberA, actualAmount: 1500, discountList: [{ discountType: 2 }] };
   for (const [data, problem] of [
@@ -69,9 +69,14 @@ test('WRT-18/20 四种读回失败都丢弃金额和优惠，仅不用券补充�
     [{ ...detail, userId: memberB }, '读回的订单归属校验不通过，内容已丢弃'],
     [{ ...detail, actualAmount: null }, '读回里没有可用的实付金额']
   ]) {
-    for (const couponChoice of ['none', 'default']) {
-      const receipt = placedView({ orderNo, payAmount: 15 }, data, '', { totalFen: 2000, couponChoice }, { id: memberA });
-      const suffix = couponChoice === 'none' ? '这单顾客选了不用券，核对金额时请顺便看一下有没有用券。' : '';
+    for (const [couponChoice, suffix] of [
+      ['default', ''],
+      ['none', '这单顾客选了不用券，核对金额时请顺便看一下有没有用券。'],
+      ['specific', '这单顾客指定了用『茶券』，核对金额时请顺便看一下用的是不是这张。']
+    ]) {
+      const draft = { totalFen: 2000, couponChoice };
+      if (couponChoice === 'specific') draft.chosenCoupon = { id: '205', title: '茶券' };
+      const receipt = placedView({ orderNo, payAmount: 15 }, data, '', draft, { id: memberA });
       assert.deepEqual(receipt, {
         placed: true, orderNo, readbackFailed: true,
         readbackNote: `订单已创建成功（订单号 ${orderNo}），但${problem}。请让顾客在小程序「我的订单」核对金额后再付款。${suffix}`,
@@ -147,4 +152,78 @@ test('WRT-17/20 有明确券时，未知条目或合计不符均保留已用券�
     assert.equal(readDiscounts('none', rows, 300).matchesChoice, false);
     assert.equal(readDiscounts('default', rows, 300).matchesPrediction, true);
   }
+});
+
+const chosenCoupon = { id: '9012345678901234567', title: '三元券' };
+const selected = { discountType: 2, discountId: chosenCoupon.id, discountName: '三元券', discountAmount: 300 };
+const other = { ...selected, discountId: '9012345678901234568' };
+function specificReceipt(fields) {
+  const orderNo = number(1);
+  return placedView({ orderNo }, { orderNo, userId: memberA, actualAmount: 2000, ...fields },
+    '', { totalFen: 2000, couponChoice: 'specific', chosenCoupon }, { id: memberA });
+}
+
+test('WRT-21/R25 通过下单入口按读回券实例的精确整数值核对，输出只带投影', async t => {
+  const { s, m, r } = await withBound(t);
+  m.couponRows = [{ ...chosenCoupon, unUseStatus: 1, userCouponCanDisAmount: 3 }];
+  const initial = await success(s, 'prepare_order', basket);
+  const couponRef = initial.coupons.usable[0].ref;
+  for (const discountId of [JSON.rawJSON(chosenCoupon.id + '0e-1'), '000' + chosenCoupon.id + '.00']) {
+    m.override.set(PATHS.orderDetail, () => ok({ ...m.last, actualAmount: 1600, discountAmount: 400,
+      discountList: [{ ...selected, discountId, discountName: '优惠券', extraMap: { received: chosenCoupon.id } }, activity] }));
+    const draft = await success(s, 'prepare_order', { ...basket, couponChoice: 'specific', couponRef });
+    const receipt = await place(s, draft);
+    assert.deepEqual(receipt.couponApplied, {
+      items: [{ name: '优惠券', amountYuan: '3.00', isCoupon: true }, { name: '满减', amountYuan: '1.00', isCoupon: false }],
+      matchesChoice: true, note: '按顾客的选择用了『三元券』：优惠券（抵 ¥3.00）；满减（抵 ¥1.00）。'
+    });
+    assert.ok(!JSON.stringify(receipt).includes(chosenCoupon.id));
+  }
+  assert.equal(count(r, PATHS.create), 2);
+});
+
+test('WRT-21 同名异券和额外用券都不符合选择，付款指引随差额和零实付变化', () => {
+  for (const rows of [[other], [selected, other]]) {
+    for (const [actualAmount, hasWarning] of [[1950, false], [1700, true], [0, true]]) {
+      const receipt = specificReceipt({ actualAmount, discountList: rows });
+      assert.equal(receipt.couponApplied.matchesChoice, false);
+      assert.equal(receipt.couponApplied.note, `顾客指定了『三元券』，但门店系统读回用的是：${rows.map(() => '三元券（抵 ¥3.00）').join('；')}。请先如实告诉顾客，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。`);
+      assert.equal(Object.hasOwn(receipt, 'warning'), hasWarning);
+      assert.equal(receipt.nextStep, actualAmount === 0
+        ? '这单读回的实付是 ¥0.00。请按 couponApplied.note 如实说明优惠，请让顾客到小程序「我的订单」确认这一单的状态；不要说「去付款」。'
+        : `订单已创建但尚未支付。门店系统没有按顾客指定的券办（见 couponApplied.note），请先如实说明${hasWarning ? '并说清金额差额' : ''}：顾客接受这个金额，再引导他去小程序「我的订单」完成付款；不接受，就请他在小程序「我的订单」里取消这一单（没付款的单门店不会做，也不会扣钱）。我们不代付、不碰任何支付凭据。`);
+      assert.ok(!JSON.stringify(receipt).includes(other.discountId));
+    }
+  }
+});
+
+test('WRT-21 仅有非券优惠或明确零优惠时如实说明没有用上任何券', () => {
+  for (const [fields, description] of [
+    [{ discountList: [activity], discountAmount: 100 }, '；门店系统另给的优惠：满减（抵 ¥1.00）'],
+    [{ discountAmount: 0 }, '']
+  ]) {
+    const { couponApplied } = specificReceipt(fields);
+    assert.equal(couponApplied.matchesChoice, false);
+    assert.equal(couponApplied.note, `顾客指定了『三元券』，但读回显示这单没有用上任何券${description}。请先如实告诉顾客，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。`);
+  }
+});
+
+test('WRT-21 证据不全时保留明细并请顾客核对，金额未知本身不阻断身份核对', () => {
+  for (const fields of [
+    {}, { discountAmount: 300 }, { discountList: [{ ...selected, discountId: undefined }] },
+    { discountList: [{ ...selected, discountId: chosenCoupon.id + '.00001' }] },
+    { discountList: [selected, null] }, { discountList: [{ ...selected, discountType: 999 }] },
+    { discountList: [selected], discountAmount: 299 }, { discountList: [activity], discountAmount: 0 },
+    { discountList: [selected, { ...selected, discountId: null }] }
+  ]) {
+    const { couponApplied } = specificReceipt(fields);
+    assert.equal(couponApplied.items.length, fields.discountList?.length ?? 0);
+    assert.equal(Object.hasOwn(couponApplied, 'matchesChoice'), false);
+    assert.equal(Object.hasOwn(couponApplied, 'matchesPrediction'), false);
+    assert.match(couponApplied.note, /^顾客指定了『三元券』，读回里没法确认用的是不是这张/);
+    assert.match(couponApplied.note, /请如实告知顾客，并请他在小程序「我的订单」里看一下这一单用的是哪张券。$/);
+  }
+  const { couponApplied } = specificReceipt({ discountList: [{ ...selected, discountAmount: null }] });
+  assert.equal(couponApplied.matchesChoice, true);
+  assert.equal(couponApplied.note, '按顾客的选择用了『三元券』：三元券（金额未知）。');
 });

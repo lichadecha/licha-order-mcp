@@ -59,7 +59,7 @@ test('R26 WRT-10/12/14 不用券被明确拒绝只发送一次，令牌作废并
 test('WRT-17 OUT-02 按完整券名及摘要比对，类型不明的同名优惠保留不确定', async t => {
   const { s, m } = await withBound(t);
   async function compare(title, discountList) {
-    m.couponRows = [{ title, unUseStatus: 1, userCouponCanDisAmount: 1 }];
+    m.couponRows = [{ id: '809', title, unUseStatus: 1, userCouponCanDisAmount: 1 }];
     const draft = await prepare(s);
     m.override.set(PATHS.orderDetail, () => ok({ ...m.last, discountList }));
     const { couponApplied } = await place(s, draft);
@@ -91,7 +91,7 @@ test('PRE-07 R13 筛券收到名录中的原始门店编码，顾客看到的编
   const { r, s, m } = await withBound(t);
   m.code = '12000000000000007';
   m.override.set(PATHS.coupons, ({ multiMark }) => ok(multiMark === m.code
-    ? [{ title: '门店券', unUseStatus: 1, userCouponCanDisAmount: 1 }] : []));
+    ? [{ id: '801', title: '门店券', unUseStatus: 1, userCouponCanDisAmount: 1 }] : []));
   const found = await success(s, 'find_store', { query: '模拟门店' });
   assert.equal(found.store.shopCode, '***0007');
   const draft = await prepare(s);

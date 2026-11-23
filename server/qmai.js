@@ -50,7 +50,7 @@ const catalogPaths = new Set([PATHS.stores, PATHS.storeStatus, PATHS.categories,
 const catalogIntegers = new Set(['salePrice', 'showPriceLow', 'price', 'attachGoodsPrice', 'type', 'status',
   'categorySort', 'openStatus', 'isPractice', 'isAttach', 'clearStatus', 'inventory', 'isRequired']);
 const orderIntegerFields = new Set(['userId', 'total', 'status', 'actualAmount', 'discountAmount',
-  'discountType', 'goodsId', 'num', 'storeId', 'orderAt', 'createTime']);
+  'discountType', 'discountId', 'goodsId', 'num', 'storeId', 'orderAt', 'createTime']);
 
 export function parseResponse(raw, path) {
   const orderRead = orderReadPaths.has(path);
@@ -76,7 +76,7 @@ export function parseResponse(raw, path) {
     }
     // 大整数直接取原文。交易证据中的分数和指数也保留词法，让整数校验能识别舍入前的值。
     const integerField = (orderRead && orderIntegerFields.has(key))
-      || (path === PATHS.coupons && (key === 'unUseStatus' || key === 'couponCenterType'))
+      || (path === PATHS.coupons && (key === 'id' || key === 'unUseStatus' || key === 'couponCenterType'))
       || (path === PATHS.member && (key === 'customerId' || key === 'data'));
     return /^-?\d{15,}$/.test(token) || (integerField && /[.eE]/.test(token)) ? token : value;
   });

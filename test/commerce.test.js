@@ -100,8 +100,8 @@ test('券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01
   const { r, s, m } = await withBound(t);
   m.couponRows = [
     { title: '大券', userCouponCanDisAmount: 30, unUseStatus: 1, couponCenterType: 1, id: memberA },
-    { title: '测试5折', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
-    { title: '并列', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
+    { id: '804', title: '测试5折', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
+    { id: '805', title: '并列', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
     { title: null, unUseStatus: 0, unUseDesc: '原因 openToken:FAKE_SECRET +8613800000000' }
   ];
   let coupons = (await prepare(s)).coupons;
@@ -134,7 +134,7 @@ test('递归拒绝七个预约字段 PRE-06', () => {
 
 test('并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11', async t => {
   const { r, s, m } = await withBound(t);
-  m.couponRows = [{ title:'半价券', unUseStatus:1, userCouponCanDisAmount:10 }];
+  m.couponRows = [{ id: '806', title:'半价券', unUseStatus:1, userCouponCanDisAmount:10 }];
   const draft = await prepare(s);
   const args = argsFor(draft);
   await failure(s,'place_order',{...args, other:{userId:memberB}},/只接受/);
@@ -228,7 +228,7 @@ test('资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 
 
 test('安全读回和优惠证据 WRT-15/16/17/18/19', async t => {
   const { r, s, m } = await withBound(t,{LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'25',LICHA_MAX_ORDERS_PER_DAY:'25'});
-  m.couponRows = [{ title:'模拟券', userCouponCanDisAmount:1, unUseStatus:1 }];
+  m.couponRows = [{ id: '807', title:'模拟券', userCouponCanDisAmount:1, unUseStatus:1 }];
   const orderWith = async transform => {
     m.override.set(PATHS.orderDetail, () => ok(transform(m.last)));
     return place(s, await prepare(s));
@@ -776,7 +776,7 @@ test('QRY-04 两位会员各有一单，列表夹入缺少会员号的他人订�
 test('WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零元告警只核对差额', async t => {
   const { s, m } = await withBound(t);
   m.price = 100;
-  m.couponRows = [{ title: '测试券', userCouponCanDisAmount: 1, unUseStatus: 1 }];
+  m.couponRows = [{ id: '808', title: '测试券', userCouponCanDisAmount: 1, unUseStatus: 1 }];
   let discounts = [
     { discountName: '测试券', discountType: 2 },
     { discountName: '测试满减', discountType: 3, discountAmount: 100 }

@@ -33,6 +33,12 @@ export function responseId(value) {
   return digits;
 }
 
+// 5.1.7 的券实例编号以字符串传输，按 R25 的整数值匹配。
+export function couponInstanceId(value) {
+  const digits = integerDigits(value);
+  return digits === '0' ? null : digits;
+}
+
 export function beijingTime(ms = Date.now()) {
   return new Date(ms + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ') + ' +08:00';
 }

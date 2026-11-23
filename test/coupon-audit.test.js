@@ -124,3 +124,70 @@ test('§5.9 v1.8 账本中没有用券选择的未决记录按默认用券核对
   const last = (await writeAudit(r)).at(-1);
   assert.deepEqual([last.outcome, last.couponChoice], ['resolved', 'default']);
 });
+
+test('WRT-10 指定券的两处字段即使同值，也须与签发时登记的实例一致', async t => {
+  // 在测试子进程中模拟待发请求被错配为另一张券，保留登记时的选择供提交核对。
+  const preload = `const parse = JSON.parse;
+JSON.parse = function (...args) {
+  const body = parse(...args);
+  if (body?.channelCode === 'AI_AGENT' && body.lastSelect?.value === '7200000000000000001') {
+    body.lastSelect.value = '7200000000000000002';
+    body.attendCouponIds = [body.lastSelect.value];
+  }
+  return body;
+};`;
+  const {r, s, m} = await withBound(t, {NODE_OPTIONS:'--import=data:text/javascript;base64,' + Buffer.from(preload).toString('base64')});
+  m.couponRows = [{id:'7200000000000000001', title:'三元券', unUseStatus:1, userCouponCanDisAmount:3}];
+  const {ref} = (await prepare(s)).coupons.usable[0];
+  const draft = await success(s, 'prepare_order', {...basket, couponChoice:'specific', couponRef:ref});
+  await failure(s, 'place_order', argsFor(draft), /用券字段与本单的用券选择不符/);
+  await failure(s, 'place_order', argsFor(draft), /令牌无效/);
+  assert.equal(count(r, PATHS.create), 0);
+  assert.deepEqual(bookRecords(r), []);
+  assert.deepEqual((await writeAudit(r)).map(row => [row.reason, row.couponChoice]), [
+    ['WRT-10', 'specific'], ['WRT-03', 'specific']
+  ]);
+  assert.equal((await place(s, await prepare(s))).placed, true);
+});
+
+test('§4 / §5.9 指定用券的审计和账本只记选择，重启后仍能核对未决单', async t => {
+  const {r, s, m} = await withBound(t);
+  const id = '7300000000000000042';
+  const title = '仅顾客可见的测试券';
+  m.couponRows = [{id, title, unUseStatus:1, userCouponCanDisAmount:3}];
+  const {ref} = (await prepare(s)).coupons.usable[0];
+  const chosen = () => success(s, 'prepare_order', {...basket, couponChoice:'specific', couponRef:ref});
+  const draft = await chosen();
+  const other = await r.session();
+  await bind(other);
+  await failure(other, 'place_order', argsFor(draft), /令牌无效/);
+  await failure(s, 'place_order', {...argsFor(draft), couponRef:ref}, /多余的：couponRef/);
+  assert.equal((await place(s, draft)).placed, true);
+
+  m.override.set(PATHS.create, () => ({status:false, code:100002, message:'模拟拒绝'}));
+  await failure(s, 'place_order', argsFor(await chosen()), /这一单没有创建/);
+  assert.equal(count(r, PATHS.create), 2);
+  m.override.set(PATHS.create, () => ok({}));
+  await failure(s, 'place_order', argsFor(await chosen()), /结果未知/);
+  const records = bookRecords(r);
+  assert.deepEqual(records.map(row => [row.state, row.couponChoice]), [
+    ['success', 'specific'], ['failed', 'specific'], ['unknown', 'specific']
+  ]);
+  m.orders = [{orderNo:number(42), userId:memberA, orderAt:records[2].time}];
+  await r.restart();
+  const resumed = await r.session(s.device);
+  await bind(resumed);
+  assert.equal((await success(resumed, 'my_orders')).resolvedPendingWrites, 1);
+  const audit = await writeAudit(r);
+  assert.deepEqual(audit.map(row => [row.outcome, row.couponChoice]), [
+    ['rejected', undefined], ['rejected', 'specific'], ['sending', 'specific'], ['success', 'specific'],
+    ['sending', 'specific'], ['failed', 'specific'], ['sending', 'specific'], ['unknown', 'specific'],
+    ['resolved', 'specific']
+  ]);
+  assert.equal(audit.at(-1).requestKey, records[2].key);
+  assert.equal(count(r, PATHS.create), 3);
+  const logs = await Promise.all(['access', 'write', 'upstream'].map(name => readFile(join(r.logDir, name + '.jsonl'), 'utf8')));
+  for (const value of [...logs, JSON.stringify(bookRecords(r))]) {
+    for (const privateField of [id, title, ref]) assert.ok(!value.includes(privateField));
+  }
+});

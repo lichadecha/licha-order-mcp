@@ -27,7 +27,7 @@ const isDigest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(val
 function validateRecord(record) {
   return record && isDigest(record.key) && isDigest(record.memberHash)
     && typeof record.storeId === 'string' && decimalId(record.storeId) !== null
-    && (record.couponChoice === undefined || record.couponChoice === 'none' || record.couponChoice === 'default')
+    && (record.couponChoice === undefined || ['default', 'none', 'specific'].includes(record.couponChoice))
     && (record.products === undefined || (Array.isArray(record.products) && record.products.length >= 1
       && record.products.length <= 20 && record.products.every(item => item && typeof item.goodsId === 'string'
         && decimalId(item.goodsId) === item.goodsId && (item.nameHash === null || isDigest(item.nameHash))

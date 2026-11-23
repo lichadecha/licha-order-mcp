@@ -199,7 +199,7 @@ test('R25 PRE-07 按找店给出的前导零编号组单，保留对应店名与
   r.mock.override.set(PATHS.storeStatus, () => ok({}));
   r.mock.override.set(PATHS.item, () => ok([product()]));
   r.mock.override.set(PATHS.coupons, ({ multiMark }) => ok(multiMark === '005'
-    ? [{ title: '门店券', unUseStatus: 1, userCouponCanDisAmount: 1 }] : []));
+    ? [{ id: '801', title: '门店券', unUseStatus: 1, userCouponCanDisAmount: 1 }] : []));
   const { store } = await success(s, 'find_store', { query: '测试门店' });
   assert.equal(store.openStatusText, '营业中');
   const draft = await success(s, 'prepare_order', { ...args, storeId: store.storeId });
