@@ -272,7 +272,7 @@ test('SHL-07 普通 404、断连、5xx、畸形应答和超时均不重发，薄
     }
     return true;
   });
-  const shell = startShell(t, dir, url, {env:{LICHA_SHELL_TIMEOUT_MS:'500'}});
+  const shell = startShell(t, dir, url, { env: { LICHA_SHELL_TIMEOUT_MS: '2000' } });
   await shell.connect();
   const ids = [1, 2, 3, 4, 5];
   shell.send(...ids.map(call));
@@ -375,22 +375,26 @@ test('SHL-06 同批标记 404 共享重建失败结果，后续独立请求仍�
     [1, 2, 3, 3]);
 });
 
-test('SHL-07 配置 75 毫秒，服务端 250 毫秒后成功也不重放', async t => {
+test('SHL-07 调用超时后服务端才返回成功，薄壳只报错一次且不重放', async (t) => {
   const dir = await sandbox(t);
-  const {url,requests} = await remote(t, async ({message}) => {
-    if (message?.method === 'tools/call') await sleep(250);
-  });
-  const shell = startShell(t, dir, url, {env:{LICHA_SHELL_TIMEOUT_MS:'75'}});
+  // 挂起工具调用，等薄壳报超时后再回送成功。握手和列工具照常应答。
+  const { url, requests } = await remote(t, ({ message }) => message?.method === 'tools/call');
+  const shell = startShell(t, dir, url, { env: { LICHA_SHELL_TIMEOUT_MS: '2000' } });
   await shell.connect();
   shell.send(call(1));
   const failure = (await shell.read(1)).result;
-  assert.equal(failure.isError,true);
-  assert.match(failure.content[0].text,/先查我的订单核对/);
+  assert.equal(failure.isError, true);
+  assert.match(failure.content[0].text, /先查我的订单核对/);
+
+  const order = requests.find(({ message }) => message?.method === 'tools/call');
+  assert.deepEqual(order?.message, call(1));
+  respond(order.res, result(1, { content: [{ type: 'text', text: '迟到的成功回包' }] }));
   shell.send(list(2));
-  assert.deepEqual((await shell.read(2)).result.tools,[testTool]);
-  await sleep(250);
-  assert.equal(shell.messages.filter(m => m.id === 1).length,1);
-  assert.equal(requests.filter(e => e.message?.id === 1).length,1);
+  assert.deepEqual((await shell.read(2)).result.tools, [testTool]);
+  shell.child.stdin.end();
+  assert.equal(await shell.closed, 0);
+  assert.equal(shell.messages.filter(({ id }) => id === 1).length, 1);
+  assert.equal(requests.filter(({ message }) => message?.method === 'tools/call').length, 1);
 });
 
 test('SHL-02 禁用硬链接并延迟首次写入，两个薄壳仍共用私有设备文件',async t => {

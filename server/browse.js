@@ -10,6 +10,16 @@ const channel = {saleType:1, saleChannel:3, appChannel:1};
 const statusNames = ['休息中','营业中','繁忙'];
 const statusText = n => statusNames[n] ?? '状态未知';
 
+function readError(label, error = {}, fallback) {
+  const hint = readHint(error, fallback);
+  const reason = error.kind === 'business' ? error.message : '未知错误';
+  if (label === '按分类查商品失败') {
+    if (['timeout','network','http'].includes(error.kind)) return new Error(hint);
+    return new Error(`${label}：${reason}`);
+  }
+  return Object.assign(new Error(`${label}：${reason}（${hint}）`), {reason:error.kind === 'business' ? reason : hint});
+}
+
 function openedHours(entries) {
   const ranges = [];
   for (const group of list(entries).flatMap(entry => [...list(entry.opentime), ...list(entry.opentimes)])) {
@@ -56,10 +66,7 @@ export class Browse {
       return await this.qmai.read(path, params);
     } catch (error) {
       if (error.kind === 'credentials') throw error;
-      const hint = readHint(error, fallback);
-      const suffix = label === '按分类查商品失败' && error.kind === 'business' ? '' : `（${hint}）`;
-      const reason = error.kind === 'business' ? error.message : '未知错误';
-      throw Object.assign(new Error(`${label}：${reason}${suffix}`), {reason: error.kind === 'business' ? reason : hint});
+      throw readError(label, error, fallback);
     }
   }
 
@@ -69,7 +76,7 @@ export class Browse {
       const pageSize = 50;
       for (let pageNum = 1; ; pageNum++) {
         const data = await this.#read(PATHS.stores, {pageNum, pageSize}, '门店列表拉取失败');
-        if (!Array.isArray(data?.list)) throw new Error('门店列表拉取失败：回执无法识别（网络异常，稍后再试）');
+        if (!Array.isArray(data?.list)) throw readError('门店列表拉取失败');
         const previous = records.size;
         for (const row of list(data.list)) {
           const storeId = id(row.id);
@@ -139,7 +146,7 @@ export class Browse {
     keyword = keyword.trim();
     const categories = await this.#cached(['categories',storeId], this.config.LICHA_CACHE_CATEGORIES_MS, async () => {
       const data = await this.#read(PATHS.categories, {storeId,...channel}, '分类菜单拉取失败');
-      if (!Array.isArray(data)) throw new Error('分类菜单拉取失败：回执无法识别（网络异常，稍后再试）');
+      if (!Array.isArray(data)) throw readError('分类菜单拉取失败');
       return list(data).filter(row => id(row.frontCategoryId)).sort((a,b) => (numeric(a.categorySort) ?? Infinity) - (numeric(b.categorySort) ?? Infinity))
         .map(row => ({categoryName:projectText(row.categoryName), frontCategoryId:id(row.frontCategoryId)}));
     });
@@ -152,9 +159,9 @@ export class Browse {
       ...(category ? {frontCategoryId:category.frontCategoryId} : {name:keyword})};
     const {items,count} = await this.#cached([via,storeId,category ? decimalId(category.frontCategoryId) : keyword],
       category ? this.config.LICHA_CACHE_CATEGORIES_MS : this.config.LICHA_CACHE_SEARCH_MS, async () => {
-        const rows = await this.#read(category ? PATHS.categoryItems : PATHS.search, params,
-          category ? '按分类查商品失败' : '搜索失败', '换个商品名试试');
-        if (!Array.isArray(rows)) throw new Error(category ? '按分类查商品失败：回执无法识别' : '搜索失败：回执无法识别（网络异常，稍后再试）');
+        const label = category ? '按分类查商品失败' : '搜索失败';
+        const rows = await this.#read(category ? PATHS.categoryItems : PATHS.search, params, label, '换个商品名试试');
+        if (!Array.isArray(rows)) throw readError(label);
         return {items:list(rows).map(menuItem).filter(Boolean), count:rows.length};
       });
     let hint = listingHint;

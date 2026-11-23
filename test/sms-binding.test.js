@@ -132,6 +132,14 @@ function timedBinding(t, sms) {
     logs:{access() {}}, book:{checkSmsAllowed() {}, recordSmsSending() { return {}; }}});
 }
 
+test('BND-11 发码结果不明时按秒告知重发时间', async t => {
+  const r = await setup(t, {LICHA_SMS_COOLDOWN_SEC:'1'});
+  r.mock.override.set(PATHS.smsSend, () => ({}));
+  const receipt = await send(await r.session());
+  assert.equal(receipt.verificationSent, 'unknown');
+  assert.equal(receipt.note, '验证码可能已经发出（短信服务没有回话）。请顾客看一下尾号 0000 的手机：收到了就照常报验证码；过 1 秒 还没收到，再只带手机号调用一次重新发。');
+});
+
 test('BND-11 验证码在有效期边界作废，过期提示优先于格式预检', async t => {
   const flow = timedBinding(t, async (path, _, {beforeSend}) => {
     assert.equal(path, PATHS.smsSend);
@@ -157,7 +165,7 @@ test('BND-13/14 真实工具回包、三本日志及账本不暴露手机号和�
   r.mock.override.set(PATHS.smsSend, (_params, {res}) => { res.end('{'); });
   const unknown = await send(s, thirdPhone);
   assert.equal(unknown.verificationSent, 'unknown');
-  assert.equal(unknown.note, '验证码可能已经发出（短信服务没有回话）。请顾客看一下尾号 2223 的手机：收到了就照常报验证码；过 1 分钟还没收到，再只带手机号调用一次重新发。');
+  assert.equal(unknown.note, '验证码可能已经发出（短信服务没有回话）。请顾客看一下尾号 2223 的手机：收到了就照常报验证码；过 1 分钟 还没收到，再只带手机号调用一次重新发。');
   output.push(unknown);
   r.mock.override.set(PATHS.smsCheck, () => ({status:true}));
   output.push(await verify(s, thirdPhone));

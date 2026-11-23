@@ -25,7 +25,10 @@ function rejectDuplicateIds(options, field, kind, itemName) {
 }
 
 function selectSku(card, input) {
-  if (!card.available) throw new SelectionError(`「${card.name}」${card.unavailableReason}`, '换一款试试');
+  if (!card.available) {
+    const reason = card.unavailableReason === '非售卖条目' && !card.skus.length ? '没有可用规格' : card.unavailableReason;
+    throw new SelectionError(`「${card.name}」${reason}`, '换一款试试');
+  }
   if (input.skuId === undefined && card.skus.length > 1) {
     throw new SelectionError(`「${card.name}」有 ${card.skus.length} 个规格`, '可选：' + card.skus.map(s => s.specName).join('、'));
   }

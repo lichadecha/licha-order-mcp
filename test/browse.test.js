@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {rig} from '../test-support/rig.js';
 import {bind} from '../test-support/commerce.js';
+import {Browse} from '../server/browse.js';
 import {PATHS, Qmai, parseResponse, sign} from '../server/qmai.js';
 
 const good = data => ({status:true, code:0, data});
@@ -363,25 +364,55 @@ test('OUT-01 BRW-07 畸形公开 ID 字段不能携出无关的识别值', async
 
 test('BRW-04 BRW-08 错形分类不缓存；算价失败只给一次商品原因', async t => {
   let categories = 0;
-  const r = await rig(t,{upstream(path) {
-    if (path === PATHS.categories) return good(++categories === 1 ? {records:[]} : []);
-    if (path === PATHS.item) return good({0:product()});
+  const r = await rig(t,{upstream(path,params) {
+    if (path === PATHS.categories) return good(++categories === 1 ? {records:[]} : [{frontCategoryId:1,categoryName:'奶茶'}]);
+    if (path === PATHS.stores || path === PATHS.categoryItems || (path === PATHS.search && params.name === '错形')) return good({});
+    if (path === PATHS.item) {
+      const goodsId = String(params.goodsIds[0]);
+      if (goodsId === '2' || goodsId === '3') return good([product({goodsId, goodsSkuList:[], status:goodsId === '3' ? 20 : 10})]);
+      return good({0:product()});
+    }
     return {status:false,code:999,message:'测试异常'};
   }});
   const s = await r.session();
   const first = await s.call('get_menu',{storeId:301});
   assert.equal(first.isError,true);
-  assert.match(first.content[0].text,/回执无法识别/);
-  assert.deepEqual((await invoke(s,'get_menu',{storeId:301})).categories,[]);
+  assert.equal(first.content[0].text,'分类菜单拉取失败：未知错误（网络异常，稍后再试）');
+  assert.deepEqual((await invoke(s,'get_menu',{storeId:301})).categories,[{frontCategoryId:'1',categoryName:'奶茶'}]);
+  const category = await s.call('get_menu',{storeId:301,keyword:'奶茶'});
+  assert.equal(category.content[0].text,'按分类查商品失败：未知错误');
+  const stores = await s.call('find_store',{query:'测试'});
+  assert.equal(stores.content[0].text,'门店列表拉取失败：未知错误（网络异常，稍后再试）');
+  const malformedSearch = await s.call('get_menu',{storeId:301,keyword:'错形'});
+  assert.equal(malformedSearch.content[0].text,'搜索失败：未知错误（网络异常，稍后再试）');
   const search = await s.call('get_menu',{storeId:301,keyword:'测试'});
   assert.equal(search.content[0].text,'搜索失败：测试异常（接口暂时异常，换个问法试试）');
   const preview = await invoke(s,'preview_order',{storeId:301,items:[{goodsId:digits,quantity:1}]});
   assert.deepEqual(preview.error,{code:'PREVIEW_INVALID', message:'商品查询失败：商品不存在或已下架',hint:'换个商品试试'});
+  for (const [goodsId,reason] of [['2','没有可用规格'],['3','已下架']]) {
+    const result = await invoke(s,'preview_order',{storeId:301,items:[{goodsId,quantity:1}]});
+    assert.deepEqual(result.error,{code:'PREVIEW_INVALID',message:`「测试奶茶」${reason}`,hint:'换一款试试'});
+  }
 });
 
 test('UPS-01 R21 损坏的密钥封装不作为普通字符串签名', () => {
   assert.throws(()=>new Qmai({QMAI_OPEN_KEY:'go-keyring-base64:FAKE$BAD#ENCODED'},()=>{}),
     e=>e.message === '配置无效：QMAI_OPEN_KEY');
+});
+
+test('BRW-04 分类商品业务失败照抄原因，传输失败给通用提示', async () => {
+  for (const [kind,message,expected] of [
+    ['business','分类不可用','按分类查商品失败：分类不可用'],
+    ['timeout','','门店系统这会儿反应慢，刚才那一步没查到结果，稍等几秒我再帮你问一次。'],
+    ['network','','网络异常，稍后再试']
+  ]) {
+    const browse = new Browse({LICHA_CACHE_CATEGORIES_MS:1000}, {async read(path) {
+      if (path === PATHS.categories) return [{frontCategoryId:1,categoryName:'奶茶'}];
+      assert.equal(path,PATHS.categoryItems);
+      throw Object.assign(new Error(message), {kind});
+    }});
+    await assert.rejects(browse.call('get_menu',{storeId:301,keyword:'奶茶'}), {message:expected});
+  }
 });
 
 test('BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至创建请求',async t => {

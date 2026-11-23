@@ -145,7 +145,7 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
     const wait = cooldown % 60 === 0 ? `${cooldown / 60} 分钟` : `${cooldown} 秒`;
     const note = verificationSent === true
       ? `验证码已发到尾号 ${last4} 的手机，${minutes} 分钟内有效。请顾客把短信里的数字告诉你，再调用一次 bind_member，带上同一个手机号和 captcha。`
-      : `验证码可能已经发出（短信服务没有回话）。请顾客看一下尾号 ${last4} 的手机：收到了就照常报验证码；过 ${wait}还没收到，再只带手机号调用一次重新发。`;
+      : `验证码可能已经发出（短信服务没有回话）。请顾客看一下尾号 ${last4} 的手机：收到了就照常报验证码；过 ${wait} 还没收到，再只带手机号调用一次重新发。`;
     return {bound:false, verificationSent, phoneLast4:tail(phone), expiresInMinutes:minutes, note};
   }
 
