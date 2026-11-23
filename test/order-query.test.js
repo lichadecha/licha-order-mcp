@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PATHS } from '../server/qmai.js';
+import { rowTime } from '../server/commerce-view.js';
 import {
   argsFor, bookRecords, count, failure, goodsId, memberA, memberB, number, ok, place, prepare, shop, success, withBound
 } from '../test-support/commerce.js';
@@ -268,4 +269,38 @@ test('UNR-04 总数为零，归属缺失的越界行仍阻止判无单，换成�
   assert.equal(empty.resolvedPendingWrites, 1);
   assert.match(empty.pendingWriteNote, /企迈侧没有建单/);
   assert.equal(bookRecords(r)[0].state, 'absent');
+});
+
+test('R10 先读北京时间的 createdAt，缺失时按顺序读取旧毫秒字段', () => {
+  const leapDay = { createdAt: '2024-02-29 00:00:00' };
+  const millis = Date.UTC(2024, 1, 28, 16);
+  assert.equal(rowTime({ ...leapDay, orderAt: millis + 1, createTime: millis + 2 }), millis);
+  assert.equal(rowTime({ orderAt: millis + 1, createTime: millis + 2 }), millis + 1);
+  assert.equal(rowTime({ createdAt: null, createTime: String(millis + 2) }), millis + 2);
+});
+
+test('R10 无效日历日期、缺秒、时区后缀和非字符串均无下单时间', () => {
+  for (const createdAt of [
+    '2026-02-29 10:11:12', '2026-04-31 10:11:12', '2026-11-23 24:00:00',
+    '2026-11-23 10:11', '2026-11-23 10:11:12+08:00', '2026-11-23 10:11:12Z',
+    '2026-11-23 10:11:12.000', '2026-11-23T10:11:12', 1795400000000, ['2026-11-23 10:11:12']
+  ]) {
+    assert.equal(rowTime({ createdAt, orderAt: 1795400000000 }), null, String(createdAt));
+  }
+  assert.equal(rowTime({ updatedAt: '2026-11-23 10:11:12' }), null);
+});
+
+test('QRY-04 UNR-03/04 本人订单的 createdAt 无效时省略时间，过静默期仍保持未决', async t => {
+  const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '10' });
+  const { r, s, m } = service;
+  await unknownOrder(service);
+  const [pending] = bookRecords(r);
+  m.orders = [{ ...candidate(pending.time), createdAt: '2026-04-31 10:11:12' }];
+  await delay(20);
+  const result = await success(s, 'my_orders');
+  assert.equal(result.orders[0].orderNo, number(1));
+  assert.equal(result.orders[0].orderTime, undefined);
+  assert.equal(result.unresolvedPendingWrites, 1);
+  assert.equal(result.resolvedPendingWrites, undefined);
+  assert.equal(bookRecords(r)[0].state, 'unknown');
 });

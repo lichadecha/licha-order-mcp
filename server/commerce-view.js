@@ -178,6 +178,13 @@ export function reconciledPaymentNote(rows) {
 }
 
 export function rowTime(row) {
+  const createdAt = row?.createdAt;
+  if (createdAt != null) {
+    if (typeof createdAt !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(createdAt)) return null;
+    const time = Date.parse(createdAt.replace(' ', 'T') + '+08:00');
+    // Date.parse 会将 4 月 31 日等值顺延，转回北京时间核对原文。
+    return Number.isFinite(time) && beijingTime(time) === createdAt + ' +08:00' ? time : null;
+  }
   const digits = integerDigits(row?.orderAt ?? row?.createTime);
   return digits?.length === 13 ? Number(digits) : null;
 }
@@ -241,5 +248,5 @@ export function orderView(row) {
   const time = rowTime(row);
   const amount = nonnegativeInteger(row?.actualAmount);
   return { orderNo: orderNumber(row), ...statusView(row?.status), actualAmountYuan: amount === null ? null : yuan(amount),
-    ...(time && { orderTime: beijingTime(time) }), items };
+    ...(time !== null && { orderTime: beijingTime(time) }), items };
 }
