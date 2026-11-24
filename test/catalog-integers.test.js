@@ -204,7 +204,7 @@ test('R25 PRE-07 按找店给出的前导零编号组单，保留对应店名与
   assert.equal(store.openStatusText, '营业中');
   const draft = await success(s, 'prepare_order', { ...args, storeId: store.storeId });
   assert.equal(draft.store.name, '测试门店');
-  assert.equal(draft.coupons.predicted.title, '门店券');
+  assert.equal(draft.coupons.usable[0].title, '门店券');
   assert.equal(count(r, PATHS.coupons), 1);
 });
 

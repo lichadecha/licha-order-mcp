@@ -30,7 +30,7 @@ test('R25 BND-02/03 WRT-18 QRY-03 金额分、状态与会员编号按原文的�
     ];
     const draft = await prepare(s);
     assert.deepEqual(draft.coupons.usable.map(coupon => coupon.title), ['测试券乙']);
-    assert.equal(draft.coupons.predicted.basis, 'max_discount');
+    assert.equal(draft.coupons.usable[0].couponCenterType, undefined);
     r.mock.override.set(PATHS.orderDetail, () => ok({ ...r.mock.last, userId: encode(memberA + '.0'),
       actualAmount: encode('2000.0') }));
     const receipt = await place(s, draft);
@@ -126,7 +126,7 @@ test('§4 创建回执的元、详情的分与券的抵扣金额逐分一致', a
   m.override.set(PATHS.orderDetail, () => ok({ orderNo, userId: memberA, actualAmount: 9007199254740985 }));
   m.couponRows = [{ id: '803', title: '金额核对券', unUseStatus: 1, userCouponCanDisAmount: JSON.rawJSON(amount) }];
   const draft = await prepare(s);
-  assert.equal(draft.coupons.predicted.canDisYuan, amount);
+  assert.equal(draft.coupons.usable[0].canDisYuan, amount);
   const receipt = await place(s, draft);
   assert.equal(receipt.qmaiActualAmountYuan, amount);
   assert.equal(receipt.qmaiPayAmountYuanFromCreate, receipt.qmaiActualAmountYuan);
@@ -141,11 +141,11 @@ test('§4 券抵扣按原文四舍五入，支持指数、字符串和整分进�
   ];
   for (const encode of [JSON.rawJSON, String]) {
     m.couponRows = cases.map(([amount], i) => ({
-      id: String(810 + i), title: '测试券' + i, unUseStatus: 1, userCouponCanDisAmount: encode(amount)
+      id: String(810 + i), customerId: memberA, title: '测试券' + i, unUseStatus: 1, userCouponCanDisAmount: encode(amount)
     }));
     const { coupons } = await prepare(s);
     assert.deepEqual(coupons.usable.map(coupon => coupon.canDisYuan), cases.map(([, expected]) => expected));
-    assert.equal(coupons.predicted.title, '测试券4');
+    assert.equal(coupons.chosen.title, '测试券3');
   }
 });
 

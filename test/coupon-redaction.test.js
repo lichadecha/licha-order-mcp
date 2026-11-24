@@ -45,12 +45,12 @@ test('OUT-02 筛券时用整次响应里的 ID 遮盖券名和原因，含后续
   m.couponRows = [main, { id: '42', title: '满额券' + rawIds, unUseDesc: '换店' + rawIds },
     { ...available, customerId: memberB }];
   const draft = await prepare(s);
-  const { usable, predicted, unusable } = draft.coupons;
+  const { usable, chosen: picked, unusable } = draft.coupons;
   assert.equal(draft.store.name, '茶店' + maskedIds);
   assert.equal(draft.lines[0].name, '红茶' + maskedIds);
   assert.equal(draft.lines[0].specName, '常规杯' + maskedIds);
   assert.equal(usable[0].title, '会员券' + maskedIds);
-  assert.equal(predicted.title, usable[0].title);
+  assert.equal(picked.title, usable[0].title);
   assert.deepEqual(unusable, [{ title: '满额券' + maskedIds, reason: '换店' + maskedIds }]);
   checkNoIds(draft);
 
@@ -86,7 +86,7 @@ test('OUT-02 默认与指定单读回的优惠名、摘要和念单核对均遮�
     const result = await place(s, draft);
     assert.equal(result.couponApplied.items[0].name, '三元券' + maskedIds);
     assert.equal(result.couponApplied.items[0].summary, '摘要' + maskedIds);
-    assert.equal(result.couponApplied[choice === 'default' ? 'matchesPrediction' : 'matchesChoice'], true);
+    assert.equal(result.couponApplied.matchesChoice, true);
     checkNoIds(result);
   }
   await checkLogs(r, ref);

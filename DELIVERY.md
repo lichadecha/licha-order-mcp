@@ -1,8 +1,14 @@
-# 李茶的茶点单 MCP v1.13 交付清单
+# 李茶的茶点单 MCP v1.14 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.13 查询当前会员的积分和等级
+## v1.14 默认用券与实付核对
+
+- 默认组单时，服务端只从本单可指定、抵扣为正且抵后仍需付款的券中挑选。选中后将抵扣最多的一张登记到待确认单，下单时按 R26 指定该券；金额并列取上游先返回的一张。挑不到时按原因提示顾客，创建请求各层均省略用券字段。[选券与请求体测试](test/coupon-preparation.test.js)
+- 下单后，用登记的券实例与券后实付核对读回。告警比较读回实付和念单时的预计实付，`diffYuan` 仍比较读回实付和券前预估。两项预测字段均已移除。[读回与告警测试](test/coupon-readback.test.js)
+- 规格 §8 第 1 条的真实订单验证留待上线后进行，需核对默认单实际使用的券与实付金额。[开放前核验](spec/SPEC.md)
+
+## v1.13 查询当前会员的积分和等级（历史记录）
 
 - **工具与绑定（ORD-01、SES-04）。** 服务端仅在 `LICHA_ENABLE_ORDERING=1` 时注册第十个工具 `my_member_info`。入参为空对象。未绑定时直接返回绑定提示。查询成功（含只查到一项）刷新本设备当前绑定的闲置计时。[工具契约 §10](spec/tool-contract.md#10-my_member_info查积分和等级v113)
 - **企迈读出口（ORD-02、ORD-03、BRW-10）。** 每次按当前会员编号分别查 4.1.6 积分和 4.1.15 等级，直接读取最新回执。临时故障仅重试受影响的请求，每次重新签名，最多尝试三次。两条路径加入读出口白名单，服务器专用应用所需权限共 16 项。[读出口](server/qmai.js) · [企迈契约](spec/qmai-contract.md)
@@ -350,7 +356,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | PRE-04 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219) |
 | PRE-05 | [server/price.js](server/price.js) · priceLine | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219) |
 | PRE-06 | [server/commerce.js](server/commerce.js) · prepare、checkOrderFields，分行内部 ID 核对见 price.js | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219)<br>[BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至创建请求](test/browse.test.js#L504)<br>[递归拒绝七个预约字段 PRE-06](test/commerce.test.js#L129) |
-| PRE-07 | [server/commerce-view.js](server/commerce-view.js) · couponView，单次筛券见 commerce.js 的 prepare | [券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99) |
+| PRE-07 | [server/commerce-view.js](server/commerce-view.js) · couponView，单次筛券见 commerce.js 的 prepare | [默认挑券、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L114) |
 | PRE-08 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19)<br>[设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | PRE-09 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | PRE-10 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
@@ -438,8 +444,8 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
-| OUT-01 | [server/catalog.js](server/catalog.js) · itemCard、menuItem，交易投影见 commerce-view.js | [BRW-07 OUT-01 卡片投影、空值、估清优先级和商品一致性](test/browse.test.js#L112)<br>[OUT-01 BRW-07 畸形公开 ID 字段不能携出无关的识别值](test/browse.test.js#L431)<br>[券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99) |
-| OUT-02 | [server/common.js](server/common.js) · projectText | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285)<br>[券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99)<br>[OUT-02 错误文本投影按码点截断并移除网址、凭证、电话与长数字](test/session.test.js#L190) |
+| OUT-01 | [server/catalog.js](server/catalog.js) · itemCard、menuItem，交易投影见 commerce-view.js | [BRW-07 OUT-01 卡片投影、空值、估清优先级和商品一致性](test/browse.test.js#L112)<br>[OUT-01 BRW-07 畸形公开 ID 字段不能携出无关的识别值](test/browse.test.js#L431)<br>[默认挑券、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L114) |
+| OUT-02 | [server/common.js](server/common.js) · projectText | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285)<br>[默认挑券、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L114)<br>[OUT-02 错误文本投影按码点截断并移除网址、凭证、电话与长数字](test/session.test.js#L190) |
 | OUT-03 | [server/qmai.js](server/qmai.js) · readHint，写结果未知文案见 commerce.js 的 unknownMessage | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201) |
 
 ### 薄壳

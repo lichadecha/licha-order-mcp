@@ -14,16 +14,17 @@ const couponKeys = new Set(['lastSelect', 'attendCouponIds', 'attendCouponType',
 const dayMs = 86400000;
 
 function couponFields(choice, id) {
-  if (choice === 'default') return {};
-  return { lastSelect: { type: -1, value: choice === 'specific' ? id : '' },
-    attendCouponIds: choice === 'specific' ? [id] : [], attendCouponType: 1 };
+  if (choice === 'default' && id === undefined) return {};
+  return { lastSelect: { type: -1, value: id ?? '' },
+    attendCouponIds: id === undefined ? [] : [id], attendCouponType: 1 };
 }
 
 export function checkOrderFields(params, couponChoice = 'default', chosenId) {
   function rejectCoupon(path) {
     throw Error(`组单自检失败：下单参数里的用券字段与本单的用券选择不符（命中路径：${path}）`);
   }
-  if (couponChoice === 'specific' && (typeof chosenId !== 'string' || couponInstanceId(chosenId) !== chosenId)) {
+  if (couponChoice === 'none' && chosenId !== undefined) rejectCoupon('params.lastSelect');
+  if ((couponChoice === 'specific' || chosenId !== undefined) && (typeof chosenId !== 'string' || couponInstanceId(chosenId) !== chosenId)) {
     rejectCoupon('params.lastSelect');
   }
   const expected = couponFields(couponChoice, chosenId);
@@ -124,7 +125,6 @@ export async function createCommerce(config, qmai, browse, logs) {
       ...(b.phone && { mobile: b.phone, reservePhone: b.phone }),
       ...couponFields(couponChoice, selected?.id) };
     checkOrderFields(params, couponChoice, selected?.id);
-    const paramsJson = JSON.stringify(params);
     let store;
     try { store = await browse.storeForOrder(storeId); } catch { /* 门店名录失败时仍可按门店 ID 组单 */ }
     let rows;
@@ -138,15 +138,20 @@ export async function createCommerce(config, qmai, browse, logs) {
       } catch { /* couponView 按选择处理未查到的券信息 */ }
     }
     const maskCouponIds = couponTextMask(rows);
-    const { coupons, prediction } = couponView(rows, totalFen, !store || hasCode, couponChoice, b, selected, maskCouponIds);
+    const { coupons, chosenId } = couponView(rows, totalFen, !store || hasCode, couponChoice, b, selected, maskCouponIds);
+    if (coupons.autoPicked) {
+      Object.assign(params, couponFields(couponChoice, chosenId));
+      checkOrderFields(params, couponChoice, chosenId);
+    }
+    const paramsJson = JSON.stringify(params);
     if (book.fault) throw Error(bookProblem);
     const now = Date.now();
     const confirmation = issueConfirmation();
     const confirmToken = confirmation.token;
     const discarded = supersede(draft => draft.hash === b.hash);
     drafts.set(confirmToken, { confirmation, paramsJson, couponChoice, maskCouponIds,
-      ...(selected && { chosenCoupon: { id: selected.id, ...coupons.chosen } }),
-      totalFen, products: productEvidence, prediction, storeId, hash: b.hash,
+      ...(chosenId && { chosenCoupon: { id: chosenId, ...coupons.chosen } }),
+      totalFen, products: productEvidence, storeId, hash: b.hash,
       device, expires: now + tokenTtl, state: 'ready' });
     logs.access({event:'prepare_order',totalFen}, {device,memberId:b.id,confirmation});
     const result = { confirmToken, member: memberView(b), store: { storeId, ...(store?.name && { name: maskCouponIds(store.name) }) },
@@ -167,7 +172,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     if (discarded) Object.assign(result, { supersededPendingOrders: discarded,
       supersedeNote: '顾客之前还没确认的那张待确认单已作废，只有这张能提交；别拿旧的 confirmToken。' });
     return { ...result, pickup: '堂食（本店当前只开堂食）：付款后按小程序订单页的提示取餐', expiresInMinutes: minutes,
-      note: `请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；coupons.choice 为 none 或 specific 时，念完合计按 coupons.note 说一句这单不用券 / 用哪张券；其余情况念「系统没提示会用券，以门店收银台为准」（不要说「你没有券」）。数量、优惠、金额三样都要顾客明确确认；totalQuantity 达到 10 或合计达到 300 元时，再单独复述一次「一共 N 杯、实付约 X 元」并得到第二次确认（v1.12.2）。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 ${minutes} 分钟内有效、只能用一次，过期请重新组单。` };
+      note: `请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。优惠一项一律按 coupons.note 说（coupons.autoPicked 为 true 时要把可用券逐张念给顾客并问用这张、换一张还是不用券；不要说「你没有券」）。数量、优惠、金额三样都要顾客明确确认；totalQuantity 达到 10 或合计达到 300 元时，再单独复述一次「一共 N 杯、实付约 X 元」并得到第二次确认（v1.12.2）。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 ${minutes} 分钟内有效、只能用一次，过期请重新组单。` };
   }
 
   function deviceDraft(confirmToken, device) {

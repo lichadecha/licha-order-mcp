@@ -20,7 +20,7 @@ test('PRE-12/13 仅 prepare_order 公开三种用券选择和可选的券编号�
   assert.deepEqual(prepareTool.inputSchema.properties.couponRef, { type: 'string', minLength: 1, maxLength: 128 });
   assert.ok(!prepareTool.inputSchema.required.includes('couponRef'));
   assert.match(prepareTool.description, /顾客明确说这单不用券时传 "none"；顾客点名要用某一张时传 "specific"，并在 couponRef 里带上那张券的 ref/);
-  assert.ok(prepareTool.description.includes('数量（每行数量与总杯数 totalQuantity）、优惠（系统默认会用哪张券省多少 / 不用券 / 用指定的哪张）、金额（合计与预计实付）'));
+  assert.ok(prepareTool.description.includes('数量（每行数量与总杯数 totalQuantity）、优惠（这单用哪张券、省多少，或不用券）、金额（合计与预计实付）'));
   assert.ok(prepareTool.description.includes('三样没有得到顾客明确的「确认」，不得调用 place_order。总杯数 10 杯及以上、或合计 300 元及以上的大单，念完后再单独复述一次「一共 N 杯、实付约 X 元」，得到第二次确认才可下单。'));
   const placeTool = tools.find(tool => tool.name === 'place_order');
   assert.ok(placeTool.description.includes('只有在顾客对念给他听的待确认单——数量、优惠、金额三样——明确说了确认之后才能调用'));
@@ -43,7 +43,7 @@ test('PRE-12/13 仅 prepare_order 公开三种用券选择和可选的券编号�
   assert.equal(r.requests.length, before);
 });
 
-test('PRE-07/12 缺省与显式 default 同样预测，none 省掉筛券并只给选择与念单说明', async t => {
+test('PRE-07/12 缺省与显式 default 同样替顾客挑券，none 省掉筛券并只给选择与念单说明', async t => {
   const { r, s, m } = await withBound(t);
   m.couponRows = [{ id: '809', customerId: memberA, title: '会员券', userCouponCanDisAmount: 5, unUseStatus: 1, couponCenterType: 1 }];
   const omitted = await prepare(s);
@@ -51,8 +51,8 @@ test('PRE-07/12 缺省与显式 default 同样预测，none 省掉筛券并只�
   assert.ok(ref);
   assert.deepEqual(omitted.coupons, {
     choice: 'default', available: true, usable: [{ ref, title: '会员券', canDisYuan: '5.00', couponCenterType: 1 }],
-    unusable: [], predicted: { title: '会员券', canDisYuan: '5.00', payAfterYuan: '15.00', basis: 'max_discount' },
-    note: '顾客有 1 张券可用于本单。念单时要加一句：「系统默认会用你的『会员券』，省 5.00 元，实付大约 ¥15.00；想换一张或不用券的话跟我说。」这是按企迈默认用券规则的预测，下单后以读回为准。顾客说这单不用券，就带 couponChoice="none" 重新组单；点名要用 usable 里的另一张，就带 couponChoice="specific" 和那张的 ref 重新组单。'
+    unusable: [], chosen: { title: '会员券', canDisYuan: '5.00', payAfterYuan: '15.00' }, autoPicked: true,
+    note: '顾客有 1 张券可用于本单，系统替顾客选了『会员券』，下单时会指定用这张。念完合计要加一句：「这单会用你的『会员券』，省 5.00 元，实付大约 ¥15.00；不想用券的话跟我说。」顾客说不用，就带 couponChoice="none" 重新组单；顾客没意见就照这张待确认单下单。'
   });
   assert.equal(count(r, PATHS.coupons), 1);
   const explicit = await success(s, 'prepare_order', { ...basket, couponChoice: 'default' });
@@ -62,11 +62,11 @@ test('PRE-07/12 缺省与显式 default 同样预测，none 省掉筛券并只�
   assert.deepEqual(none.coupons, {
     choice: 'none', note: '顾客选了这单不用券。念完合计要加一句：「这单按你说的不用券。」下单后会核对门店系统有没有照办。'
   });
-  assert.equal(none.note, '请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；coupons.choice 为 none 或 specific 时，念完合计按 coupons.note 说一句这单不用券 / 用哪张券；其余情况念「系统没提示会用券，以门店收银台为准」（不要说「你没有券」）。数量、优惠、金额三样都要顾客明确确认；totalQuantity 达到 10 或合计达到 300 元时，再单独复述一次「一共 N 杯、实付约 X 元」并得到第二次确认（v1.12.2）。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 5 分钟内有效、只能用一次，过期请重新组单。');
+  assert.equal(none.note, '请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。优惠一项一律按 coupons.note 说（coupons.autoPicked 为 true 时要把可用券逐张念给顾客并问用这张、换一张还是不用券；不要说「你没有券」）。数量、优惠、金额三样都要顾客明确确认；totalQuantity 达到 10 或合计达到 300 元时，再单独复述一次「一共 N 杯、实付约 X 元」并得到第二次确认（v1.12.2）。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 5 分钟内有效、只能用一次，过期请重新组单。');
   assert.equal(count(r, PATHS.coupons), 2);
 });
 
-test('R26 缺省与 default 的完整请求等于 v1.8，none 只在顶层增加三项', async t => {
+test('R26 缺省与 default 无可用券时的完整请求等于 v1.8，none 只在顶层增加三项', async t => {
   const { r, s, m } = await withBound(t);
   m.override.set(PATHS.item, () => ok([{
     goodsId, name: '测试茶', goodsSkuList: [{ skuId, salePrice: 2000 }],
@@ -156,7 +156,7 @@ test('PRE-13 R26 指定非默认券按本次筛券列单，实付最低为零，
   const auto = { ...threeYuan, id: '204', title: '折扣券', couponCenterType: 2, userCouponCanDisAmount: 5 };
   m.couponRows = [auto, threeYuan];
   const first = (await prepare(s)).coupons;
-  assert.equal(first.predicted.title, '折扣券');
+  assert.equal(first.chosen.title, '折扣券');
   const [autoRef, selectedRef] = first.usable.map(row => row.ref);
   m.couponRows = [
     { ...threeYuan, id: JSON.rawJSON(threeYuan.id + '0e-1'), userCouponCanDisAmount: 22, title: '免单券' },
@@ -181,26 +181,28 @@ test('PRE-13 R26 指定非默认券按本次筛券列单，实付最低为零，
   assert.equal(count(r, PATHS.coupons), 2);
 });
 
-test('PRE-06 指定券自检拒绝错层、缺项、非字符串 ID 和与登记不一致的三项', () => {
+test('PRE-06 指定与替顾客挑券的自检拒绝错层、缺项、非字符串 ID 和与登记不一致的三项', () => {
   const id = '123';
   const valid = { lastSelect: { type: -1, value: id }, attendCouponIds: [id], attendCouponType: 1 };
-  checkOrderFields(valid, 'specific', id);
-  for (const key of Object.keys(valid)) {
-    const { [key]: removed, ...rest } = valid;
-    assert.throws(() => checkOrderFields(rest, 'specific', id), { message: mismatch('params.' + key) });
+  for (const choice of ['specific', 'default']) {
+    checkOrderFields(valid, choice, id);
+    for (const key of Object.keys(valid)) {
+      const { [key]: removed, ...rest } = valid;
+      assert.throws(() => checkOrderFields(rest, choice, id), { message: mismatch('params.' + key) });
+    }
+    for (const key of [...Object.keys(valid), 'couponId', 'useCouponId']) {
+      assert.throws(() => checkOrderFields({ ...valid, items: [{ [key]: id }] }, choice, id),
+        { message: mismatch('params.items[0].' + key) });
+    }
+    for (const [key, value] of [
+      ['lastSelect', { type: -1, value: 123 }], ['lastSelect', { type: -1, value: id, extra: true }],
+      ['lastSelect', { type: 1, value: id }], ['attendCouponIds', [123]], ['attendCouponIds', ['124']],
+      ['attendCouponIds', [id, id]], ['attendCouponType', '1'], ['couponId', id], ['useCouponId', id]
+    ]) {
+      assert.throws(() => checkOrderFields({ ...valid, [key]: value }, choice, id), { message: mismatch('params.' + key) });
+    }
+    assert.throws(() => checkOrderFields(valid, choice, '124'), { message: mismatch('params.lastSelect') });
   }
-  for (const key of [...Object.keys(valid), 'couponId', 'useCouponId']) {
-    assert.throws(() => checkOrderFields({ ...valid, items: [{ [key]: id }] }, 'specific', id),
-      { message: mismatch('params.items[0].' + key) });
-  }
-  for (const [key, value] of [
-    ['lastSelect', { type: -1, value: 123 }], ['lastSelect', { type: -1, value: id, extra: true }],
-    ['lastSelect', { type: 1, value: id }], ['attendCouponIds', [123]], ['attendCouponIds', ['124']],
-    ['attendCouponIds', [id, id]], ['attendCouponType', '1'], ['couponId', id], ['useCouponId', id]
-  ]) {
-    assert.throws(() => checkOrderFields({ ...valid, [key]: value }, 'specific', id), { message: mismatch('params.' + key) });
-  }
-  assert.throws(() => checkOrderFields(valid, 'specific', '124'), { message: mismatch('params.lastSelect') });
   assert.throws(() => checkOrderFields(noneFields, 'specific'), { message: mismatch('params.lastSelect') });
 });
 
@@ -243,7 +245,7 @@ test('PRE-13 R13 无门店编码直接拒绝，筛券失败仅问一次，均不
   assert.equal((await place(s, original)).placed, true);
 });
 
-test('PRE-07/13 只删一行的 id，三张券照常列出，缺 ID 的券仍可预测', async t => {
+test('PRE-07/13 只删一行的 id，三张券照常列出，默认改挑下一张', async t => {
   const { r, s, m } = await withBound(t);
   m.couponRows = [
     { ...threeYuan }, { ...threeYuan, id: '204', title: '五元券', userCouponCanDisAmount: 5 },
@@ -253,10 +255,11 @@ test('PRE-07/13 只删一行的 id，三张券照常列出，缺 ID 的券仍可
   const [threeRef, fiveRef] = before.usable.map(row => row.ref);
   delete m.couponRows[1].id;
   const after = (await prepare(s)).coupons;
-  const expected = structuredClone(before);
-  delete expected.usable[1].ref;
-  assert.deepEqual(after, expected);
-  assert.equal(after.predicted.title, '五元券');
+  const expected = structuredClone(before.usable);
+  delete expected[1].ref;
+  assert.deepEqual(after.usable, expected);
+  assert.equal(before.chosen.title, '五元券');
+  assert.equal(after.chosen.title, '三元券');
   await failure(s, 'prepare_order', choose(fiveRef), /这单用不了/);
   const selected = await success(s, 'prepare_order', choose(threeRef));
   assert.deepEqual(selected.coupons.usable, after.usable);
@@ -281,14 +284,16 @@ test('PRE-13 两个归属字段指向乙、出现无效归属或互相矛盾时�
     assert.equal(coupons.available, true);
     assert.deepEqual(coupons.usable, []);
     assert.deepEqual(coupons.unusable, []);
-    assert.ok(!coupons.predicted);
+    assert.ok(!Object.hasOwn(coupons, 'chosen'));
+    assert.ok(!Object.hasOwn(coupons, 'autoPicked'));
+    assert.ok(!Object.hasOwn(coupons, 'predicted'));
     assert.equal(await failure(s, 'prepare_order', choose(ref), /这单用不了/),
       '「三元券」这单用不了。可以换一张，或按默认、不用券组单。');
   }
   assert.equal(count(r, PATHS.create), 0);
 });
 
-test('PRE-13 任一归属字段数值匹配可指定，两个字段都缺仍可预测但不发编号', async t => {
+test('PRE-13 任一归属字段数值匹配可指定，两个字段都缺时列出但不能挑选或指定', async t => {
   const { r, s, m } = await withBound(t);
   const { customerId, ...noOwner } = threeYuan;
   m.couponRows = [{ ...noOwner, user_id: JSON.rawJSON(memberA + '0e-1') }];
@@ -298,9 +303,12 @@ test('PRE-13 任一归属字段数值匹配可指定，两个字段都缺仍可�
   m.couponRows = [{ ...noOwner, customerId: '0' + memberA + '.0', user_id: memberA }];
   assert.equal((await success(s, 'prepare_order', choose(ref))).coupons.chosen.title, '三元券');
   m.couponRows = [noOwner];
-  const expected = structuredClone(coupons);
-  delete expected.usable[0].ref;
-  assert.deepEqual((await prepare(s)).coupons, expected);
+  const expected = { ...coupons.usable[0] };
+  delete expected.ref;
+  const after = (await prepare(s)).coupons;
+  assert.deepEqual(after.usable, [expected]);
+  assert.equal(Object.hasOwn(after, 'chosen'), false);
+  assert.equal(Object.hasOwn(after, 'autoPicked'), false);
   await failure(s, 'prepare_order', choose(ref), /这单用不了/);
   assert.equal(count(r, PATHS.create), 0);
 });
@@ -323,14 +331,14 @@ test('PRE-13 同实例可用性、金额、原券名或归属冲突，正序倒�
       const { coupons } = await prepare(s);
       assert.deepEqual(coupons.usable, [retained]);
       assert.deepEqual(coupons.unusable, []);
-      assert.equal(coupons.predicted.title, other.title);
+      assert.equal(coupons.chosen.title, other.title);
       await failure(s, 'prepare_order', choose(selected.ref), /这单用不了/);
     }
   }
   assert.equal(count(r, PATHS.create), 0);
 });
 
-test('PRE-13 同实例一致的重复行只计一次，调换顺序保持编号与预测', async t => {
+test('PRE-13 同实例一致的重复行只计一次，调换顺序保持编号与所选的券', async t => {
   const { s, m } = await withBound(t);
   const unavailable = { ...threeYuan, id: '207', title: '周末券', unUseStatus: 0, unUseDesc: '限周末' };
   m.couponRows = [threeYuan, unavailable];
@@ -346,3 +354,61 @@ test('PRE-13 同实例一致的重复行只计一次，调换顺序保持编号�
     assert.equal(chosen.chosen.title, threeYuan.title);
   }
 });
+
+test('PRE-07 默认在可指定、抵扣为正且抵后仍需付款的券中选最优惠的一张，并按 R26 提交', async t => {
+  const { r, s, m } = await withBound(t);
+  m.couponRows = [
+    { ...threeYuan, id: null, title: '无编号', userCouponCanDisAmount: 19 },
+    { ...threeYuan, id: '111', title: '免单券', userCouponCanDisAmount: 20 },
+    { ...threeYuan, id: '112', title: '零元券', userCouponCanDisAmount: 0 },
+    { ...threeYuan, id: '113', title: '自动生效券', userCouponCanDisAmount: 2, couponCenterType: 2 },
+    { ...threeYuan, id: '114', title: '不可用券', userCouponCanDisAmount: 18, unUseStatus: 0 },
+    threeYuan
+  ];
+  const draft = await prepare(s);
+  assert.equal(draft.coupons.choice, 'default');
+  assert.equal(draft.coupons.autoPicked, true);
+  assert.equal(Object.hasOwn(draft.coupons, 'predicted'), false);
+  assert.deepEqual(draft.coupons.chosen, { title: '三元券', canDisYuan: '3.00', payAfterYuan: '17.00' });
+  assert.equal(draft.coupons.note, '顾客有 5 张券可用于本单，系统替顾客选了抵得最多的『三元券』（省 3.00 元，实付大约 ¥17.00），下单时会指定用这张。念完合计要把 usable 里的券逐张念给顾客（券名、能省多少），然后问：「用这张、换一张，还是这单不用券？」顾客说用这张或随便，就照这张待确认单下单；点名另一张（只能是带 ref 的），就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。');
+  await place(s, draft);
+  const { raw } = r.requests.find(req => req.path === PATHS.create);
+  const { params } = JSON.parse(raw);
+  assert.deepEqual(params.lastSelect, { type: -1, value: threeYuan.id });
+  assert.deepEqual(params.attendCouponIds, [threeYuan.id]);
+  assert.equal(params.attendCouponType, 1);
+});
+
+test('PRE-07 同额券取上游第一张，即使后一张是自动生效类', async t => {
+  const { s, m } = await withBound(t);
+  const other = { ...threeYuan, id: '322', title: '同额券', couponCenterType: 2 };
+  for (const rows of [[threeYuan, other], [other, threeYuan]]) {
+    m.couponRows = rows;
+    const { coupons } = await prepare(s);
+    assert.equal(coupons.chosen.title, rows[0].title);
+  }
+});
+
+const zeroCoupon = { ...threeYuan, id: '333', userCouponCanDisAmount: 0 };
+const noRefCoupon = { ...threeYuan, id: null };
+for (const [reason, rows] of [
+  ['这些券缺少指定所需的信息', [zeroCoupon, noRefCoupon]],
+  ['能用的券会把这单抵成 0 元，用不用要顾客自己定', [noRefCoupon, { ...threeYuan, userCouponCanDisAmount: 22 }]],
+  ['抵扣金额都为 0', [zeroCoupon]]
+]) {
+  test('PRE-07 没挑券时请求任意层级均不含用券字段，原因：' + reason, async t => {
+    const { r, s, m } = await withBound(t);
+    m.couponRows = rows;
+    const draft = await prepare(s);
+    const { coupons } = draft;
+    assert.equal(coupons.choice, 'default');
+    assert.equal(coupons.usable.length, rows.length);
+    for (const key of ['predicted', 'chosen', 'autoPicked']) assert.equal(Object.hasOwn(coupons, key), false);
+    assert.equal(coupons.note, rows.length === 1
+      ? '查到可用券但抵扣金额都为 0。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」'
+      : `顾客有 2 张券可用于本单，但系统这次没法替顾客挑（${reason}）。念单时优惠一项说：「门店系统可能会自动用你的一张券，实付以下单后为准；想指定用哪张或不用券跟我说。」顾客点名 usable 里带 ref 的某一张，就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。`);
+    await place(s, draft);
+    const { raw } = r.requests.find(req => req.path === PATHS.create);
+    assert.doesNotMatch(raw, /"(lastSelect|attendCouponIds|attendCouponType|useCouponId|couponId)"\s*:/);
+  });
+}

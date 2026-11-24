@@ -56,10 +56,10 @@ test('R26 WRT-10/12/14 不用券被明确拒绝只发送一次，令牌作废并
   assert.equal(count(r, PATHS.create), 2);
 });
 
-test('WRT-17 OUT-02 按完整券名及摘要比对，类型不明的同名优惠保留不确定', async t => {
+test('WRT-21 OUT-02 券名及摘要截断展示，缺少券实例 ID 时不能认定用了选中的券', async t => {
   const { s, m } = await withBound(t);
   async function compare(title, discountList) {
-    m.couponRows = [{ id: '809', title, unUseStatus: 1, userCouponCanDisAmount: 1 }];
+    m.couponRows = [{ id: '809', customerId: memberA, title, unUseStatus: 1, userCouponCanDisAmount: 1 }];
     const draft = await prepare(s);
     m.override.set(PATHS.orderDetail, () => ok({ ...m.last, discountList }));
     const { couponApplied } = await place(s, draft);
@@ -68,14 +68,14 @@ test('WRT-17 OUT-02 按完整券名及摘要比对，类型不明的同名优惠
 
   const longSummary = '有'.repeat(81) + '生日券';
   const suffix = await compare('生日券', [{ discountType: 2, discountSummary: longSummary }]);
-  assert.equal(suffix.couponApplied.matchesPrediction, true);
+  assert.equal(suffix.couponApplied.matchesChoice, undefined);
   assert.equal(suffix.couponApplied.items[0].summary, '有'.repeat(80) + '…');
   assert.ok(!JSON.stringify(suffix.couponApplied).includes(longSummary));
 
   const common = '券'.repeat(80);
   const different = await compare(common + '甲', [{ discountType: 2, discountName: common + '乙' }]);
-  assert.equal(different.couponApplied.matchesPrediction, false);
-  assert.equal(different.draft.coupons.predicted.title, common + '…');
+  assert.equal(different.couponApplied.matchesChoice, undefined);
+  assert.equal(different.draft.coupons.chosen.title, common + '…');
   assert.doesNotMatch(JSON.stringify(different), /[甲乙]/);
 
   const uncertain = await compare('生日券', [
@@ -83,8 +83,8 @@ test('WRT-17 OUT-02 按完整券名及摘要比对，类型不明的同名优惠
   ]);
   assert.equal(uncertain.couponApplied.items[0].isCoupon, true);
   assert.equal(uncertain.couponApplied.items[1].isCoupon, undefined);
-  assert.equal(uncertain.couponApplied.matchesPrediction, undefined);
-  assert.match(uncertain.couponApplied.note, /无法确认/);
+  assert.equal(uncertain.couponApplied.matchesChoice, undefined);
+  assert.match(uncertain.couponApplied.note, /没法确认/);
 });
 
 test('PRE-07 R13 筛券收到名录中的原始门店编码，顾客看到的编码已脱敏', async t => {
@@ -96,7 +96,7 @@ test('PRE-07 R13 筛券收到名录中的原始门店编码，顾客看到的编
   assert.equal(found.store.shopCode, '***0007');
   const draft = await prepare(s);
   assert.equal(r.requests.find(x => x.path === PATHS.coupons).params.multiMark, m.code);
-  assert.equal(draft.coupons.predicted.title, '门店券');
+  assert.equal(draft.coupons.usable[0].title, '门店券');
   assert.ok(!JSON.stringify({ found, draft }).includes(m.code));
 });
 

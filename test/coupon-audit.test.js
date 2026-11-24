@@ -125,7 +125,7 @@ test('§5.9 v1.8 账本中没有用券选择的未决记录按默认用券核对
   assert.deepEqual([last.outcome, last.couponChoice], ['resolved', 'default']);
 });
 
-test('WRT-10 指定券的两处字段即使同值，也须与签发时登记的实例一致', async t => {
+test('WRT-10 顾客指定或默认挑券时，两处字段即使同值，也须与签发时登记的实例一致', async t => {
   // 在测试子进程中模拟待发请求被错配为另一张券，保留登记时的选择供提交核对。
   const preload = `const parse = JSON.parse;
 JSON.parse = function (...args) {
@@ -138,15 +138,19 @@ JSON.parse = function (...args) {
 };`;
   const {r, s, m} = await withBound(t, {NODE_OPTIONS:'--import=data:text/javascript;base64,' + Buffer.from(preload).toString('base64')});
   m.couponRows = [{customerId:memberA, id:'7200000000000000001', title:'三元券', unUseStatus:1, userCouponCanDisAmount:3}];
-  const {ref} = (await prepare(s)).coupons.usable[0];
-  const draft = await success(s, 'prepare_order', {...basket, couponChoice:'specific', couponRef:ref});
-  await failure(s, 'place_order', argsFor(draft), /用券字段与本单的用券选择不符/);
-  await failure(s, 'place_order', argsFor(draft), /令牌无效/);
-  assert.equal(count(r, PATHS.create), 0);
-  assert.deepEqual(bookRecords(r), []);
-  assert.deepEqual((await writeAudit(r)).map(row => [row.reason, row.couponChoice]), [
-    ['WRT-10', 'specific'], ['WRT-03', 'specific']
-  ]);
+  const auto = await prepare(s);
+  const {ref} = auto.coupons.usable[0];
+  for (const choice of ['default', 'specific']) {
+    const draft = choice === 'default' ? auto : await success(s, 'prepare_order', {...basket, couponChoice:choice, couponRef:ref});
+    await failure(s, 'place_order', argsFor(draft), /用券字段与本单的用券选择不符/);
+    await failure(s, 'place_order', argsFor(draft), /令牌无效/);
+    assert.equal(count(r, PATHS.create), 0);
+    assert.deepEqual(bookRecords(r), []);
+    assert.deepEqual((await writeAudit(r)).slice(-2).map(row => [row.reason, row.couponChoice]), [
+      ['WRT-10', choice], ['WRT-03', choice]
+    ]);
+  }
+  m.couponRows = [];
   assert.equal((await place(s, await prepare(s))).placed, true);
 });
 

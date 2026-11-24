@@ -69,13 +69,14 @@ test('WRT-18/20/21 四种读回失败都丢弃金额和优惠，按顾客用券�
     [{ ...detail, userId: memberB }, '读回的订单归属校验不通过，内容已丢弃'],
     [{ ...detail, actualAmount: null }, '读回里没有可用的实付金额']
   ]) {
-    for (const [couponChoice, suffix] of [
-      ['default', ''],
-      ['none', '这单顾客选了不用券，核对金额时请顺便看一下有没有用券。'],
-      ['specific', '这单顾客指定了用『茶券』，核对金额时请顺便看一下用的是不是这张。']
+    for (const [couponChoice, chosen, suffix] of [
+      ['default', false, ''],
+      ['default', true, '这单顾客指定了用『茶券』，核对金额时请顺便看一下用的是不是这张。'],
+      ['none', false, '这单顾客选了不用券，核对金额时请顺便看一下有没有用券。'],
+      ['specific', true, '这单顾客指定了用『茶券』，核对金额时请顺便看一下用的是不是这张。']
     ]) {
       const draft = { totalFen: 2000, couponChoice };
-      if (couponChoice === 'specific') draft.chosenCoupon = { id: '205', title: '茶券' };
+      if (chosen) draft.chosenCoupon = { id: '205', title: '茶券' };
       const receipt = placedView({ orderNo, payAmount: 15 }, data, '', draft, { id: memberA });
       assert.deepEqual(receipt, {
         placed: true, orderNo, readbackFailed: true,
@@ -86,7 +87,7 @@ test('WRT-18/20/21 四种读回失败都丢弃金额和优惠，按顾客用券�
   }
 });
 
-test('WRT-17 默认用券仅在有优惠条目或预测时给出读回核对，只比对预测', () => {
+test('WRT-17 默认未挑券时仅对读回的优惠条目作说明', () => {
   const orderNo = number(1);
   const draft = { totalFen: 2000, couponChoice: 'default' };
   const detail = { orderNo, userId: memberA, actualAmount: 2000, discountAmount: 0 };
@@ -97,23 +98,22 @@ test('WRT-17 默认用券仅在有优惠条目或预测时给出读回核对，�
   assert.deepEqual(read().couponApplied, {
     items, note: '门店系统自动使用了优惠券：茶券（金额未知）。请如实告知顾客「系统自动用了你的券」，不是算错。'
   });
-  draft.prediction = { title: '茶券', rawTitle: '茶券' };
-  assert.deepEqual(read().couponApplied, {
-    items, matchesPrediction: true, note: '与组单时告知的一致：茶券（金额未知）。'
-  });
 });
 
 const activity = { discountType: 3, discountName: '满减', discountAmount: 100 };
 
-test('WRT-19 默认用券与预测不一致，零实付时只说请如实更正', () => {
+test('WRT-19 默认未挑券但读回门店自动用券时，付款指引按实付区分', () => {
   const orderNo = number(1);
-  const draft = { totalFen: 2000, couponChoice: 'default', prediction: { title: '茶券', rawTitle: '茶券' } };
-  for (const [actualAmount, ending] of [[0, '请如实更正。'], [1, '请如实更正后再引导付款。']]) {
+  const draft = { totalFen: 2000, couponChoice: 'default' };
+  for (const actualAmount of [0, 1]) {
     const detail = { orderNo, userId: memberA, actualAmount,
       discountList: [{ discountType: 2, discountName: '活动券', discountAmount: 1999 }] };
-    const { couponApplied } = placedView({ orderNo }, detail, '', draft, { id: memberA });
-    assert.equal(couponApplied.matchesPrediction, false);
-    assert.equal(couponApplied.note, '与组单时告知的不一致——念单时说的是「茶券」，实际用的是：活动券（抵 ¥19.99）。' + ending);
+    const receipt = placedView({ orderNo }, detail, '', draft, { id: memberA });
+    assert.deepEqual(receipt.couponApplied, {
+      items: [{ name: '活动券', isCoupon: true, amountYuan: '19.99' }],
+      note: '门店系统自动使用了优惠券：活动券（抵 ¥19.99）。请如实告知顾客「系统自动用了你的券」，不是算错。'
+    });
+    assert.match(receipt.nextStep, actualAmount === 0 ? /不要说「去付款」/ : /先说清金额差额并核对，再引导顾客/);
   }
 });
 
@@ -121,7 +121,6 @@ function readDiscounts(couponChoice, discountList, discountAmount) {
   const orderNo = number(1);
   const detail = { orderNo, userId: memberA, actualAmount: 1800, discountAmount, discountList };
   const draft = { totalFen: 2000, couponChoice };
-  if (couponChoice === 'default') draft.prediction = { title: '茶券', rawTitle: '茶券' };
   return placedView({ orderNo }, detail, '', draft, { id: memberA }).couponApplied;
 }
 
@@ -152,7 +151,7 @@ test('WRT-17/20 明细金额之和与合计不符时不能断言没用券，相�
     for (const [list, total] of [[rows, 150], [rows, undefined], [[activity, { discountType: 5 }], 150]]) {
       const applied = readDiscounts(choice, list, total);
       if (choice === 'none') assert.equal(applied.matchesChoice, true);
-      else assert.equal(applied.matchesPrediction, false);
+      else assert.equal(Object.hasOwn(applied, 'matchesChoice'), false);
       assert.match(applied.note, /这不是用券/);
     }
   }
@@ -162,7 +161,7 @@ test('WRT-17/20 有明确券时，未知条目或合计不符均保留已用券�
   const coupon = { discountType: 2, discountName: '茶券', discountAmount: 100 };
   for (const rows of [[activity, null, coupon], [activity, coupon]]) {
     assert.equal(readDiscounts('none', rows, 300).matchesChoice, false);
-    assert.equal(readDiscounts('default', rows, 300).matchesPrediction, true);
+    assert.match(readDiscounts('default', rows, 300).note, /^门店系统自动使用了优惠券/);
   }
 });
 
@@ -196,7 +195,7 @@ test('WRT-21/R25 通过下单入口按读回券实例的精确整数值核对，
 
 test('WRT-21 同名异券和额外用券都不符合选择，付款指引随差额和零实付变化', () => {
   for (const rows of [[other], [selected, other]]) {
-    for (const [actualAmount, hasWarning] of [[1950, false], [1700, true], [0, true]]) {
+    for (const [actualAmount, hasWarning] of [[1950, true], [1700, false], [0, true]]) {
       const receipt = specificReceipt({ actualAmount, discountList: rows });
       assert.equal(receipt.couponApplied.matchesChoice, false);
       assert.equal(receipt.couponApplied.note, `顾客指定了『三元券』，但门店系统读回用的是：${rows.map(() => '三元券（抵 ¥3.00）').join('；')}。请先如实告诉顾客，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。`);
@@ -257,8 +256,8 @@ test('WRT-21④ 念单省三元，指定券只抵五角或抵零时按登记的�
     assert.equal(receipt.couponApplied.amountAsPromised, false);
     assert.equal(receipt.couponApplied.note,
       `用了顾客指定的『三元券』，但这张只抵了 ¥${discount}（念单时说省 ¥3.00），实付 ¥${actual}，比念单时说的 ¥17.00 多 ¥${extra}。请先如实告诉顾客这个差额，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。`);
-    assert.equal(receipt.warning, undefined);
-    assert.equal(receipt.nextStep, '订单已创建但尚未支付。门店系统没有按顾客指定的券办（见 couponApplied.note），请先如实说明：顾客接受这个金额，再引导他去小程序「我的订单」完成付款；不接受，就请他在小程序「我的订单」里取消这一单（没付款的单门店不会做，也不会扣钱）。我们不代付、不碰任何支付凭据。');
+    assert.equal(receipt.warning, `金额与念单时说的不一致：企迈实付 ¥${actual}，念单时说的实付约 ¥17.00，差额 ¥${extra}。请先向顾客说清这个差额并核对。`);
+    assert.equal(receipt.nextStep, '订单已创建但尚未支付。门店系统没有按顾客指定的券办（见 couponApplied.note），请先如实说明并说清金额差额：顾客接受这个金额，再引导他去小程序「我的订单」完成付款；不接受，就请他在小程序「我的订单」里取消这一单（没付款的单门店不会做，也不会扣钱）。我们不代付、不碰任何支付凭据。');
   }
   assert.equal(count(r, PATHS.create), 2);
 });
@@ -270,7 +269,7 @@ test('WRT-19/21④ 读回实付高一分就提示确认，实付相等或更低�
     assert.equal(receipt.couponApplied.amountAsPromised, actualAmount <= 1700);
     if (actualAmount === 1701) {
       assert.match(receipt.couponApplied.note, /这张实际抵了多少没读到（念单时说省 ¥3\.00），实付 ¥17\.01，比念单时说的 ¥17\.00 多 ¥0\.01/);
-      assert.match(receipt.nextStep, /指定的券办.*并说清金额差额.*接受这个金额.*取消这一单/);
+      assert.match(receipt.nextStep, /指定的券办.*请先如实说明：顾客接受这个金额.*取消这一单/);
     } else {
       assert.match(receipt.couponApplied.note, /按顾客的选择用了『三元券』/);
       assert.doesNotMatch(receipt.nextStep, /接受这个金额/);
@@ -298,11 +297,71 @@ test('WRT-17/20/21 三种用券选择遇到非数组明细时，即使合计为�
       const applied = choice === 'specific'
         ? specificReceipt({ discountList, discountAmount: 0 }).couponApplied
         : readDiscounts(choice, discountList, 0);
+      if (choice === 'default') {
+        assert.equal(applied, undefined);
+        continue;
+      }
       assert.deepEqual(applied.items, []);
       assert.equal(Object.hasOwn(applied, 'matchesPrediction'), false);
       assert.equal(Object.hasOwn(applied, 'matchesChoice'), false);
       assert.equal(Object.hasOwn(applied, 'amountAsPromised'), false);
       assert.match(applied.note, /没取到优惠明细|没法确认用的是不是这张/);
     }
+  }
+});
+
+for (const [outcome, coupon, actualAmount, expected] of [
+  ['按约兑现', selected, 1700, {
+    matchesChoice: true, amountAsPromised: true, note: '按顾客的选择用了『三元券』：三元券（抵 ¥3.00）。'
+  }],
+  ['用了同名的另一张券', other, 1700, {
+    matchesChoice: false, note: '顾客指定了『三元券』，但门店系统读回用的是：三元券（抵 ¥3.00）。请先如实告诉顾客，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。'
+  }],
+  ['用对券但金额没兑现', { ...selected, discountAmount: 200 }, 1800, {
+    matchesChoice: true, amountAsPromised: false, note: '用了顾客指定的『三元券』，但这张只抵了 ¥2.00（念单时说省 ¥3.00），实付 ¥18.00，比念单时说的 ¥17.00 多 ¥1.00。请先如实告诉顾客这个差额，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。'
+  }]
+]) {
+  test(`PRE-08/WRT-21 默认挑中的券从组单到读回：${outcome}`, async t => {
+    const { s, m } = await withBound(t);
+    m.couponRows = [{ ...chosenCoupon, customerId: memberA, unUseStatus: 1, userCouponCanDisAmount: 3 }];
+    m.override.set(PATHS.orderDetail, () => ok({ ...m.last, actualAmount, discountAmount: coupon.discountAmount, discountList: [coupon] }));
+    const draft = await success(s, 'prepare_order', basket);
+    assert.equal(draft.coupons.choice, 'default');
+    assert.equal(draft.coupons.autoPicked, true);
+    assert.equal(Object.hasOwn(draft.coupons, 'predicted'), false);
+    const receipt = await place(s, draft);
+    const applied = receipt.couponApplied;
+    assert.equal(applied.matchesChoice, expected.matchesChoice);
+    assert.equal(applied.amountAsPromised, expected.amountAsPromised);
+    assert.equal(applied.note, expected.note);
+    assert.equal(Object.hasOwn(applied, 'matchesPrediction'), false);
+    if (actualAmount === 1700) {
+      assert.equal(receipt.diffYuan, '-3.00');
+      assert.equal(Object.hasOwn(receipt, 'warning'), false);
+    } else {
+      assert.equal(receipt.diffYuan, '-2.00');
+      assert.equal(receipt.warning, '金额与念单时说的不一致：企迈实付 ¥18.00，念单时说的实付约 ¥17.00，差额 ¥1.00。请先向顾客说清这个差额并核对。');
+    }
+    if (expected.amountAsPromised === true) assert.match(receipt.nextStep, /如实告诉顾客，引导顾客/);
+    else assert.match(receipt.nextStep, /没有按顾客指定的券办.*顾客接受这个金额.*取消这一单/);
+  });
+}
+
+test('WRT-16 默认未挑券和不用券时按预估合计判定差额，超过阈值一分才告警', () => {
+  const orderNo = number(1);
+  for (const couponChoice of ['default', 'none']) {
+    const draft = { totalFen: 2000, couponChoice };
+    const read = actualAmount => placedView({ orderNo }, { orderNo, userId: memberA, actualAmount }, '', draft, { id: memberA });
+    for (const actual of [1900, 2000, 2100]) assert.equal(Object.hasOwn(read(actual), 'warning'), false);
+    const receipt = read(1899);
+    assert.equal(receipt.diffYuan, '-1.01');
+    assert.equal(receipt.warning, '金额与念单时说的不一致：企迈实付 ¥18.99，念单时说的实付约 ¥20.00，差额 ¥-1.01。请先向顾客说清这个差额并核对。');
+  }
+});
+
+test('WRT-16 用后实付的百分之五为阈值，正负差额都严格超过才告警', () => {
+  for (const actualAmount of [1614, 1615, 1700, 1785, 1786]) {
+    const receipt = specificReceipt({ actualAmount, discountList: [selected] });
+    assert.equal(Object.hasOwn(receipt, 'warning'), Math.abs(actualAmount - 1700) > 85);
   }
 });

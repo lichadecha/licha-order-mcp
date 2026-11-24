@@ -111,22 +111,22 @@ test('设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03',
   assert.deepEqual(new Set(r.requests.filter(x => x.path === PATHS.create).map(x => x.params.userId)),new Set([memberA,memberB]));
 });
 
-test('券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02', async t => {
+test('默认挑券、投影、一次查询和缺门店编码 PRE-07 OUT-01/02', async t => {
   const { r, s, m } = await withBound(t);
   m.couponRows = [
-    { title: '大券', userCouponCanDisAmount: 30, unUseStatus: 1, couponCenterType: 1, id: memberA },
-    { id: '804', title: '测试5折', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
-    { id: '805', title: '并列', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
+    { title: '大券', userCouponCanDisAmount: 30, unUseStatus: 1, couponCenterType: 1, id: memberA, customerId: memberA },
+    { id: '804', customerId: memberA, title: '测试5折', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
+    { id: '805', customerId: memberA, title: '并列', userCouponCanDisAmount: 10, unUseStatus: 1, couponCenterType: 2 },
     { title: null, unUseStatus: 0, unUseDesc: '原因 openToken:FAKE_SECRET +8613800000000' }
   ];
   let coupons = (await prepare(s)).coupons;
-  assert.deepEqual(coupons.predicted, { title:'测试5折', canDisYuan:'10.00', payAfterYuan:'10.00', basis:'auto_type' });
+  assert.deepEqual(coupons.chosen, { title:'测试5折', canDisYuan:'10.00', payAfterYuan:'10.00' });
   assert.deepEqual(coupons.unusable, [{ title:'（未命名的券）', reason:'原因 ***0000' }]);
   assert.ok(!JSON.stringify(coupons).includes(memberA));
   m.couponRows.splice(1, 2);
   coupons = (await prepare(s)).coupons;
-  assert.equal(coupons.predicted.basis, 'max_discount');
-  assert.equal(coupons.predicted.payAfterYuan, '0.00');
+  assert.equal(coupons.chosen, undefined);
+  assert.match(coupons.note, /能用的券会把这单抵成 0 元/);
   m.couponRows[0].userCouponCanDisAmount = null;
   coupons = (await prepare(s)).coupons;
   assert.equal(coupons.predicted, undefined);
@@ -157,14 +157,14 @@ test('递归拒绝七个预约字段 PRE-06', () => {
 
 test('并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 PRE-11', async t => {
   const { r, s, m } = await withBound(t);
-  m.couponRows = [{ id: '806', title:'半价券', unUseStatus:1, userCouponCanDisAmount:10 }];
+  m.couponRows = [{ id: '806', customerId: memberA, title:'半价券', unUseStatus:1, userCouponCanDisAmount:10 }];
   const draft = await prepare(s);
   const args = argsFor(draft);
   await failure(s,'place_order',{...args, other:{userId:memberB}},/只接受/);
   await failure(s,'place_order',{...args,confirmAmountYuan:20.02},/20.02.*20.00/);
   assert.equal(count(r, PATHS.create), 0);
-  m.override.set(PATHS.orderDetail, p => ok({ ...m.last, actualAmount: 0, discountList: [{ discountType:2,
-    discountName:'优惠券', discountSummary:'半价券', discountAmount:2000, discountId:memberA }] }));
+  m.override.set(PATHS.orderDetail, () => ok({ ...m.last, actualAmount: 0, discountAmount: 2000, discountList: [{ discountType:2,
+    discountName:'优惠券', discountSummary:'半价券', discountAmount:2000, discountId:'806' }] }));
   const outcomes = await Promise.all([s.call('place_order', {...args,confirmAmountYuan:20.01}), s.call('place_order',args)]);
   assert.equal(outcomes.filter(x => x.isError).length, 1);
   const receipt = JSON.parse(outcomes.find(x => !x.isError).content[0].text);
@@ -172,7 +172,7 @@ test('并发提交、复述金额与成功回读 WRT-01/05/10/12/13/15/16/17/19 
   assert.equal(receipt.diffYuan, '-20.00');
   assert.ok(receipt.warning);
   assert.match(receipt.nextStep, /确认这一单的状态/);
-  assert.equal(receipt.couponApplied.matchesPrediction, true);
+  assert.equal(receipt.couponApplied.matchesChoice, true);
   assert.equal(receipt.couponApplied.items[0].discountId, undefined);
   assert.equal(count(r, PATHS.create), 1);
   assert.equal(count(r, PATHS.orderDetail), 1);
@@ -272,17 +272,16 @@ test('安全读回和优惠证据 WRT-15/16/17/18/19', async t => {
   assert.equal(count(r,PATHS.create),writes+1);
   const zeroDiscount = await orderWith(row => ({...row,actualAmount:1900,discountAmount:0}));
   assert.equal(zeroDiscount.warning,undefined);
-  assert.match(zeroDiscount.couponApplied.note,/没有任何优惠/);
+  assert.equal(zeroDiscount.couponApplied, undefined);
   const missing = await orderWith(row => ({...row,actualAmount:1899,discountAmount:null}));
   assert.ok(missing.warning);
-  assert.match(missing.couponApplied.note,/没取到优惠明细/);
-  assert.equal(missing.couponApplied.matchesPrediction,undefined);
+  assert.equal(missing.couponApplied, undefined);
   const noncoupon = await orderWith(row => ({...row,actualAmount:1900,discountAmount:100,
     discountList:[{discountType:3,discountAmount:100,discountName:'满减'}]}));
-  assert.equal(noncoupon.couponApplied.matchesPrediction,false);
+  assert.equal(Object.hasOwn(noncoupon.couponApplied, 'matchesPrediction'), false);
   assert.match(noncoupon.couponApplied.note,/门店系统自动给了优惠/);
   const otherCoupon = await orderWith(row => ({...row,discountList:[{discountType:2,discountAmount:100,discountName:'别的券'}]}));
-  assert.match(otherCoupon.couponApplied.note,/与组单时告知的不一致/);
+  assert.match(otherCoupon.couponApplied.note,/门店系统自动使用了优惠券：别的券/);
   m.couponRows = [];
   const auto = await orderWith(row => ({...row,discountList:[{discountType:2,discountAmount:200,discountName:'自动券'}]}));
   assert.match(auto.couponApplied.note,/自动使用了优惠券/);
@@ -835,13 +834,13 @@ test('WRT-17 WRT-19 金额未知的券保留、类型未知保留不确定、零
     { name: '测试券', amountYuan: null, isCoupon: true },
     { name: '测试满减', amountYuan: '1.00', isCoupon: false }
   ]);
-  assert.equal(result.couponApplied.matchesPrediction, true);
-  assert.match(result.couponApplied.note, /与组单时告知的一致.*测试券（金额未知）/);
-  assert.equal(result.warning, '金额与预估不一致：企迈实付 ¥0.00，本地预估 ¥1.00，差额 ¥-1.00。请先向顾客说清这个差额并核对。');
+  assert.equal(Object.hasOwn(result.couponApplied, 'matchesPrediction'), false);
+  assert.match(result.couponApplied.note, /自动使用了优惠券：测试券（金额未知）/);
+  assert.equal(result.warning, '金额与念单时说的不一致：企迈实付 ¥0.00，念单时说的实付约 ¥1.00，差额 ¥-1.00。请先向顾客说清这个差额并核对。');
   assert.match(result.nextStep, /确认这一单的状态/);
   discounts = [{ discountName: '另一张券', discountType: 2, discountAmount: 100 }];
   const different = await place(s, await prepare(s));
-  assert.equal(different.couponApplied.matchesPrediction, false);
+  assert.equal(Object.hasOwn(different.couponApplied, 'matchesPrediction'), false);
   assert.doesNotMatch(different.couponApplied.note, /引导付款/);
   for (const typeFields of [{}, { discountType: 999 }, { discountType: [3] }]) {
     discounts = [{ discountName: '活动', discountAmount: 0, ...typeFields }];
