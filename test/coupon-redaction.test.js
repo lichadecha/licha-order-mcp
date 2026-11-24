@@ -176,7 +176,7 @@ test('OUT-02 全页读回揭示的券实例、当前短会员编号与非典型�
   assert.deepEqual((await success(s, 'my_orders')).orders[0].items, [visible]);
 });
 
-test('OUT-02 业务错误码回显短会员编号或券实例时，两条审计路径都不写原值', async t => {
+test('OUT-02 业务错误码回显短会员编号或券实例时，两条审计都保留遮盖标记', async t => {
   const r = await setup(t);
   const s = await r.session();
   const member = '842913';
@@ -191,7 +191,25 @@ test('OUT-02 业务错误码回显短会员编号或券实例时，两条审计�
   for (const [file, field] of [['upstream','code'], ['write','qmaiCode']]) {
     const rows = (await readFile(join(r.logDir, file + '.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
       .filter(row => row.outcome === 'business' || row.reason === 'business');
-    assert.deepEqual(rows.map(row => row[field]), [undefined, undefined, 100002]);
+    assert.deepEqual(rows.map(row => row[field]), ['***', '***', 100002]);
+  }
+});
+
+test('LOG-02 LOG-04 下单错误码是手机号形态或当前会员编号时，上游和写审计只记尾四位', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  const member = '74281903';
+  r.mock.override.set(PATHS.member, () => ok({customerId:member}));
+  await bind(s);
+  const codes = [12912345678, '13912345678', Number(member), JSON.rawJSON(memberA + '.0')];
+  for (const code of codes) {
+    r.mock.override.set(PATHS.create, () => ({status:false, code, message:'下单受限'}));
+    await failure(s, 'place_order', argsFor(await prepare(s)), /下单失败/);
+  }
+  for (const [file, field] of [['upstream', 'code'], ['write', 'qmaiCode']]) {
+    const rows = (await readFile(join(r.logDir, file + '.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
+      .filter(row => row.outcome === 'business' || row.reason === 'business');
+    assert.deepEqual(rows.map(row => row[field]), ['***5678', '***5678', '***1903', '***1234']);
   }
 });
 
@@ -222,5 +240,5 @@ test('OUT-02 失败读回携带优惠明细时，错误文案和错误码也遮�
   const rows = (await readFile(join(r.logDir, 'upstream.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   const error = rows.find(row => row.path === PATHS.orderDetail && row.outcome === 'business');
   assert.ok(error);
-  assert.equal(error.code, undefined);
+  assert.equal(error.code, '***');
 });

@@ -85,7 +85,7 @@ export function parseResponse(raw, path) {
       if (typeof token === 'string' && /[.eE]/.test(token)) {
         const digits = integerDigits(token);
         if (digits === null) return null;
-        return typeof value === 'number' ? Number(digits) : digits;
+        return typeof value === 'number' && Number.isSafeInteger(value) ? value : digits;
       }
     }
     if (typeof value !== 'number') return value;
@@ -144,6 +144,13 @@ export function readHint(error, fallback) {
     ?? (error.code == null ? fallback : undefined) ?? '接口暂时异常，换个问法试试';
 }
 
+function auditCode(code, mask) {
+  if (!Number.isSafeInteger(code) && !(typeof code === 'string' && /^\d+$/.test(code))) return undefined;
+  const text = String(code);
+  const masked = mask(text);
+  return masked === text ? code : masked;
+}
+
 function post(url, path, payload, timeout, onFlush, maskText, couponIds) {
   const transport = url.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
@@ -174,8 +181,7 @@ function post(url, path, payload, timeout, onFlush, maskText, couponIds) {
             const businessCode = Number.isSafeInteger(code) || (typeof code === 'string' && /^\d{1,9}$/.test(code)) ? code : undefined;
             reject(new QmaiError('business', projectText(message, mask) || fallback, {
               code: businessCode,
-              auditCode: businessCode !== undefined && mask(String(businessCode)) === String(businessCode)
-                ? businessCode : undefined,
+              auditCode: auditCode(code, mask),
               messageLength: typeof message === 'string' ? [...message].length : 0
             }));
           } else if (envelope?.status === true) resolve(envelope.data);
@@ -267,15 +273,12 @@ export class Qmai {
     }
   }
 
-  #attempt(path, params, {beforeSend, couponIds = [], maskText = couponIds.length ? identifierTextMask(couponIds) : currentTextMask()}) {
+  #attempt(path, params, {beforeSend, couponIds = [], maskText}) {
     const c = this.config;
     if (!this.key?.length || !c.QMAI_OPEN_ID || !c.QMAI_GRANT_CODE) throw new QmaiError('credentials', MISSING_CREDENTIALS);
     const write = path === PATHS.create || smsPaths.has(path);
     const phone = path === PATHS.create ? params.mobile : path === PATHS.member ? params.customerCode?.code : undefined;
-    const project = phone === undefined ? maskText : text => {
-      const normalized = String(Number(phone));
-      return maskText(text).replaceAll(phone, '***').replace(/\d+/g, digits => digits === normalized ? '***' : digits);
-    };
+    const project = maskText ?? (phone || couponIds.length ? identifierTextMask(couponIds, undefined, phone) : currentTextMask());
     const timeout = write ? c.LICHA_WRITE_TIMEOUT_MS : c.LICHA_READ_TIMEOUT_MS;
     const deadline = write ? performance.now() + timeout : Infinity;
     const url = new URL(path, c.QMAI_BASE_URL.replace(/\/?$/, '/'));

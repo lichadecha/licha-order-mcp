@@ -54,7 +54,7 @@ export function yuan(fen) {
   return (fen < 0 ? '-' : '') + digits.slice(0, -2) + '.' + digits.slice(-2);
 }
 
-const privateNumbers = /\d{15,}|(?:0086|\+?86)?1[3-9]\d{9}/g;
+const privateNumbers = /\d{15,}|(?:0086|\+?86)?1\d{10}/g;
 export function maskNumbers(value) {
   return value.replace(privateNumbers, tail);
 }
@@ -73,7 +73,7 @@ export function readbackCouponIds(detail) {
   return Array.isArray(detail?.discountList) ? detail.discountList.map(row => row?.discountId) : [];
 }
 
-export function identifierTextMask(values, binding = memberText.getStore()?.binding) {
+export function identifierTextMask(values, binding = memberText.getStore()?.binding, requestPhone) {
   const ids = new Map();
   for (const value of values) {
     const id = couponInstanceId(value);
@@ -86,14 +86,17 @@ export function identifierTextMask(values, binding = memberText.getStore()?.bind
     ids.set(binding.phone, tail(binding.phone));
     ids.set(String(Number(binding.phone)), tail(binding.phone));
   }
+  if (requestPhone) ids.set(requestPhone, tail(requestPhone));
   if (!ids.size) return maskNumbers;
   // R25 的合法数字原文中，只有小数点和指数的加号需要正则转义。
   const patterns = [...ids.keys()].sort((a, b) => b.length - a.length)
     .map(id => id.replace(/[.+]/g, '\\$&'));
-  const known = new RegExp(patterns.join('|'), 'g');
+  const known = new RegExp([privateNumbers.source, ...patterns].join('|'), 'g');
+  // 查询待绑定号码时，上游也可能把它作为数值回显，丢掉前导零。
+  if (requestPhone) ids.set(String(Number(requestPhone)), tail(requestPhone));
   return value => value.replace(/\+?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g, number => {
     // 完整实例优先，例如以手机号开头的 12 位券码。其他数字片段沿用通用遮盖。
-    return ids.get(number) ?? maskNumbers(number).replace(known, match => ids.get(match));
+    return ids.get(number) ?? number.replace(known, match => ids.get(match) ?? tail(match));
   });
 }
 

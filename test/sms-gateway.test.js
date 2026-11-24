@@ -90,7 +90,9 @@ test('BND-13 查会员与创建订单的失败回执中，手机号和去掉前�
     assert.ok([...logs, ...output].every(text => !text.includes(secret)));
   }
   const rows = logs[0].trim().split('\n').map(JSON.parse).filter(row => row.outcome === 'business');
-  assert.deepEqual(rows.map(row => row.code), [undefined, undefined, undefined, 110004, undefined, undefined]);
+  assert.deepEqual(rows.map(row => row.code), ['***8901', '***6789', '***6789', 110004, '***8901', '***6789']);
+  const writes = logs[2].trim().split('\n').map(JSON.parse).filter(row => row.reason === 'business');
+  assert.deepEqual(writes.map(row => row.qmaiCode), ['***8901', '***6789']);
 });
 
 test('ORD-02 短信出口隔离、关停和一次性凭据绑定到实际发出的手机号', async t => {
