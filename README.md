@@ -33,7 +33,7 @@ npm run rebuild:runtimes
 npm test
 ```
 
-仓库根是顾客端包，随包分发约 114 KiB 的薄壳协议运行库。发布时客户端的命令形式为 `npx -y github:lichadecha/licha-order-mcp#<标签>`。正式地址和公开准入串集中在 `bin/licha-order-mcp.js`；发布前替换占位常量。仓库未发布。
+仓库根是顾客端包，随包分发约 114 KiB 的薄壳协议运行库。发布时客户端的命令形式为 `npx -y github:lichadecha/licha-order-mcp#<标签>`。正式地址和公开准入串集中在 `bin/licha-order-mcp.js`。2026-11-24 发布公开测试版 `v1.0.0-beta.1`：`npx -y github:lichadecha/licha-order-mcp#v1.0.0-beta.1`；内置的是测试版专用准入串，服务端删掉即作废。
 
 ## 服务端环境
 
@@ -89,7 +89,7 @@ npm test
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
-| `LICHA_MCP_URL` | `https://licha-mcp.invalid/mcp` | 品牌服务端的完整 MCP 端点。本机可用 `http://127.0.0.1:3000/mcp` |
+| `LICHA_MCP_URL` | `https://lichadecha.com/mcp` | 品牌服务端的完整 MCP 端点。本机可用 `http://127.0.0.1:3000/mcp` |
 | `LICHA_ACCESS_KEY` | 内置公开占位串 | 须匹配服务端允许列表中的一项 |
 | `LICHA_HOME` | 当前系统用户主目录下的 `.licha` | 首次生成设备凭据文件 `device-id`，后续复用 |
 | `LICHA_SHELL_TIMEOUT_MS` | 75000 | 单次转发等待服务端答复的最长毫秒数，取 1 至 2147483647 的整数 |

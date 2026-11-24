@@ -4,8 +4,9 @@ import { join } from 'node:path';
 import { StdioServerTransport, EventSourceParserStream } from './protocol-runtime.js';
 import { deviceId } from './device.js';
 
-const defaultUrl = 'https://licha-mcp.invalid/mcp';
-const defaultAccess = 'PUBLIC_LICHA_ACCESS_PLACEHOLDER';
+const defaultUrl = 'https://lichadecha.com/mcp';
+// 公开准入串：随薄壳公开分发，只挡公网裸扫、不代表顾客身份（规格 §3.1）；测试版专用，服务端删掉即作废。
+const defaultAccess = 'beta1-MOw0T8jUGH20qAY8l51tJXX8';
 class StartupError extends Error {}
 const diagnostic = (message) => process.stderr.write(message + '\n');
 
