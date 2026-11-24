@@ -1,6 +1,6 @@
 {
   "name": "licha-order-mcp",
-  "version": "1.0.0-beta.1",
+  "version": "1.0.0-beta.2",
   "description": "李茶的茶点单 MCP 顾客端薄壳",
   "type": "module",
   "bin": {

@@ -33,7 +33,7 @@ npm run rebuild:runtimes
 npm test
 ```
 
-仓库根是顾客端包，随包分发约 114 KiB 的薄壳协议运行库。发布时客户端的命令形式为 `npx -y github:lichadecha/licha-order-mcp#<标签>`。正式地址和公开准入串集中在 `bin/licha-order-mcp.js`。2026-11-24 发布公开测试版 `v1.0.0-beta.1`：`npx -y github:lichadecha/licha-order-mcp#v1.0.0-beta.1`；内置的是测试版专用准入串，服务端删掉即作废。
+仓库根是顾客端包，随包分发约 114 KiB 的薄壳协议运行库。发布时客户端的命令形式为 `npx -y github:lichadecha/licha-order-mcp#<标签>`。正式地址和公开准入串集中在 `bin/licha-order-mcp.js`。2026-11-24 发布公开测试版（当前 `v1.0.0-beta.2`，含规格 v1.16 与顾客说明书 v1.8.0）：`npx -y github:lichadecha/licha-order-mcp#v1.0.0-beta.2`；内置的是测试版专用准入串，服务端删掉即作废。
 
 ## 服务端环境
 
