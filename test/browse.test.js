@@ -381,6 +381,11 @@ test('ORD-02 ORD-03 出口白名单与未知路径发前拒绝', async t => {
     const api = new Qmai({...r.env,LICHA_ENABLE_ORDERING:ordering},()=>{});
     assert.throws(()=>api.read(PATHS.create,{}),/读出口/);
     assert.throws(()=>api.read('v3/unknown',{}),/读出口/);
+    for (const path of ['v3/crm/points/getCustomerPoints', 'v3/crm/customer/getLevelExperience']) {
+      assert.throws(()=>api.read(path + '/other',{}),/读出口/);
+      assert.throws(()=>api.write(path,{}),/写出口/);
+      await assert.rejects(api.sms(path,{}),/短信出口/);
+    }
     assert.throws(()=>api.write(PATHS.stores,{}),/写出口/);
     assert.throws(()=>api.write('v3/unknown',{}),/写出口/);
     if (!ordering) assert.throws(()=>api.write(PATHS.create,{}),/写出口/);

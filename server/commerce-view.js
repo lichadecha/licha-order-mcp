@@ -287,14 +287,32 @@ export function reconciledPaymentNote(rows) {
     + (unknown ? `其中 ${unknown} 笔状态未查清，请在小程序「我的订单」核对状态。` : '');
 }
 
-export function rowTime(row) {
-  const createdAt = row?.createdAt;
-  if (createdAt != null) {
-    if (typeof createdAt !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(createdAt)) return null;
-    const time = Date.parse(createdAt.replace(' ', 'T') + '+08:00');
-    // Date.parse 会将 4 月 31 日等值顺延，转回北京时间核对原文。
-    return Number.isFinite(time) && beijingTime(time) === createdAt + ' +08:00' ? time : null;
+function parseBeijingTime(text) {
+  if (typeof text !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(text)) return null;
+  const time = Date.parse(text.replace(' ', 'T') + '+08:00');
+  // Date.parse 会将 4 月 31 日等值顺延，转回北京时间核对原文。
+  return Number.isFinite(time) && beijingTime(time) === text + ' +08:00' ? time : null;
+}
+
+export function pointsView(data) {
+  if (data?.totalPoints == null) return;
+  const points = { total: data.totalPoints };
+  if (data.soonExpiredPoints != null && data.soonExpiredPoints !== '0') {
+    points.expiringSoon = data.soonExpiredPoints;
+    const time = parseBeijingTime(data.expiredTime);
+    if (time !== null) points.nextExpireAt = beijingTime(time);
   }
+  return points;
+}
+
+export function levelView(data, memberId) {
+  if (!data || (Object.hasOwn(data, 'customerId') && responseId(data.customerId) !== memberId)) return;
+  const name = projectText(data.levelName);
+  if (name) return { name };
+}
+
+export function rowTime(row) {
+  if (row?.createdAt != null) return parseBeijingTime(row.createdAt);
   const digits = integerDigits(row?.orderAt ?? row?.createTime);
   return digits?.length === 13 ? Number(digits) : null;
 }

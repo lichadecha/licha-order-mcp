@@ -9,7 +9,8 @@ const descriptions = {
   "prepare_order": "两阶段下单的第一步（只读，不会创建任何订单）：本地算价、组装下单参数，返回一张「待确认单」和一个限时有效、只能用一次的确认令牌。需先用 bind_member 绑定会员身份。拿到待确认单后必须逐项念给顾客（下到哪位会员名下、门店、每杯商品与规格做法、每行数量），并让顾客**明确确认三样：数量（每行数量与总杯数 totalQuantity）、优惠（系统默认会用哪张券省多少 / 不用券 / 用指定的哪张）、金额（合计与预计实付）**；三样没有得到顾客明确的「确认」，不得调用 place_order。总杯数 10 杯及以上、或合计 300 元及以上的大单，念完后再单独复述一次「一共 N 杯、实付约 X 元」，得到第二次确认才可下单。入参与 preview_order 相同，另有可选的 couponChoice：不传或传 \"default\" = 门店系统按默认规则自动用券；顾客明确说这单不用券时传 \"none\"；顾客点名要用某一张时传 \"specific\"，并在 couponRef 里带上那张券的 ref（取自上一次待确认单 coupons.usable 里的 ref）。不接受 userId、金额与渠道参数。",
   "place_order": "两阶段下单的第二步（写）：凭 prepare_order 签发的确认令牌创建真实订单。**只有在顾客对念给他听的待确认单——数量、优惠、金额三样——明确说了确认之后才能调用**；confirmAmountYuan 必须是刚念给顾客、顾客确认过的那个合计金额。下单参数完全来自那张待确认单，本工具不接受任何订单内容参数——这保证「下的单 = 念给顾客听过的那张单」。下单成功后会强制读回企迈的实付金额与优惠明细，与本地预估比对；差额超阈值时返回体带 warning，必须先向顾客说清差额再引导付款。我们不代付、不碰支付凭据，只引导顾客去小程序「我的订单」自行付款。",
   "get_order_status": "查询一个订单的当前状态。只能查当前绑定会员自己的订单——查询别人的订单会被拒绝。",
-  "my_orders": "列出当前绑定会员最近几天的订单（订单号、状态、实付金额、下单时间、商品）。只查当前绑定的会员本人——不接受指定他人身份，最多返回最近 10 条。"
+  "my_orders": "列出当前绑定会员最近几天的订单（订单号、状态、实付金额、下单时间、商品）。只查当前绑定的会员本人——不接受指定他人身份，最多返回最近 10 条。",
+  "my_member_info": "查当前绑定会员的积分和会员等级。只查当前绑定的会员本人；只查不改——本工具不能兑换积分、不能领券，顾客问积分怎么用，请引导他去李茶小程序的积分商城。需先用 bind_member 绑定。"
 };
 
 const text = {type:'string'};
@@ -35,7 +36,8 @@ const schemas = {
   place_order: shape({confirmToken:nonempty,confirmAmountYuan:{type:'number',exclusiveMinimum:0,
     description:'刚念给顾客的合计金额（元），最多两位小数。'}},['confirmToken','confirmAmountYuan']),
   get_order_status: shape({orderNo:nonempty},['orderNo']),
-  my_orders: shape({days:{type:'integer',minimum:1,maximum:90,default:7}})
+  my_orders: shape({days:{type:'integer',minimum:1,maximum:90,default:7}}),
+  my_member_info: shape({})
 };
 const ajv = new Ajv();
 export const tools = Object.entries(schemas).map(([name,inputSchema]) => ({

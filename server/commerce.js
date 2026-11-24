@@ -4,7 +4,7 @@ import { currentQuotaDay, issueConfirmation } from './logs.js';
 import { beijingTime, couponInstanceId, couponTextMask, decimalId, digest, responseId, yuan } from './common.js';
 import { PATHS, readHint } from './qmai.js';
 import { Ledger } from './ledger.js';
-import { couponView, listedProducts, sameProducts, nonnegativeInteger, pendingCount, orderNumber, orderView, placedView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
+import { couponView, levelView, listedProducts, sameProducts, nonnegativeInteger, pendingCount, orderNumber, orderView, placedView, pointsView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
 
 const bookProblem = '安全账本不可用，已拒绝下单。未决核对、当日额度、防重复都靠这本账本，读不出它就等于没有护栏。请稍后再试或直接在小程序下单；看菜单和查订单不受影响。';
 const missingToken = '确认令牌无效（不存在或已被使用过）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。';
@@ -317,6 +317,25 @@ export async function createCommerce(config, qmai, browse, logs) {
     return result;
   }
 
+  async function memberInfo(args, binding) {
+    const params = { customerId: binding.id };
+    const [pointsData, levelData] = await Promise.allSettled([
+      qmai.read(PATHS.points, params), qmai.read(PATHS.level, params)
+    ]);
+    const points = pointsView(pointsData.value);
+    const level = levelView(levelData.value, binding.id);
+    if (!points && !level) throw Error('会员信息暂时没查到（是我们这边的问题，不是你的会员有问题），稍后再试。');
+
+    const result = { member: memberView(binding), note: '积分可以在李茶小程序的积分商城兑换；这里只能查，不能兑换。' };
+    if (points) result.points = points;
+    if (level) result.level = level;
+    if (!points || !level) {
+      result.unavailable = [points ? 'level' : 'points'];
+      result.note += (points ? '会员等级' : '积分') + '暂时没查到，稍后可以再问一次。';
+    }
+    return result;
+  }
+
   async function orders({ days = 7 }, b, device) {
     const end = Date.now();
     const start = end - days * dayMs;
@@ -411,7 +430,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       else if (name === 'bind_member') result = await bindingFlow.bind(args, device, arrivedAt);
       else {
         const binding = requireBinding(name, device);
-        const handler = { prepare_order: prepare, get_order_status: status, my_orders: orders }[name];
+        const handler = { prepare_order: prepare, get_order_status: status, my_orders: orders, my_member_info: memberInfo }[name];
         result = await handler(args, binding, device);
       }
       if (name !== 'bind_member' || result.bound) bindingFlow.current(device).touched = Date.now();

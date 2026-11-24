@@ -1,8 +1,16 @@
-# 李茶的茶点单 MCP v1.12.3 交付清单
+# 李茶的茶点单 MCP v1.13 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.12.3 点单卡片的品牌描述与多号绑定
+## v1.13 查询当前会员的积分和等级
+
+- **工具与绑定（ORD-01、SES-04）。** 服务端仅在 `LICHA_ENABLE_ORDERING=1` 时注册第十个工具 `my_member_info`。入参为空对象。未绑定时直接返回绑定提示。查询成功（含只查到一项）刷新本设备当前绑定的闲置计时。[工具契约 §10](spec/tool-contract.md#10-my_member_info查积分和等级v113)
+- **企迈读出口（ORD-02、ORD-03、BRW-10）。** 每次按当前会员编号分别查 4.1.6 积分和 4.1.15 等级，直接读取最新回执。临时故障仅重试受影响的请求，每次重新签名，最多尝试三次。两条路径加入读出口白名单，服务器专用应用所需权限共 16 项。[读出口](server/qmai.js) · [企迈契约](spec/qmai-contract.md)
+- **结果（QRY-07、QRY-08）。** 积分去掉小数末尾多余的零，近期过期数量大于零才展示数量及可解析的过期时间。等级回执带会员编号时须核对归属。只查到一项时附 `unavailable` 和对应提示，两项都没查到才返回查询失败。出参只给绑定尾号及绑定方式、查到的积分与等级、必要的缺项标记和兑换指引。兑换请到李茶小程序的积分商城。[积分实测样本](spec/samples/live-20261124/4.1.6_getCustomerPoints_20261124.json) · [等级实测样本](spec/samples/live-20261124/4.1.15_getLevelExperience_20261124.json)
+
+Node 22.23.1 下连续运行三次完整 `npm test`，每轮 270 项全部通过，失败、跳过、取消均为 0。测试使用本机模拟企迈。另以两份规格原始样本验证解析结果，有效积分为 `"30"`、会员等级为 `"VIP1"`，近期将过期积分为零时省略过期字段。
+
+## v1.12.3 点单卡片的品牌描述与多号绑定（历史记录）
 
 - **商品描述（BRW-11）。** 卡片将企迈 `goodsExtra.goodsDesc` 的 `desc` 和 `detail` 分别投影为 `description.summary` 和 `description.detail`。去掉 HTML 标签、还原常见实体，段落用「；」连接，连续空白压为一个空格。按 OUT-02 去网址与疑似凭证，手机号和长数字串只留尾号。两项分别按 60 和 400 个 Unicode 码点截断，超长加省略号，空项省略，两项都空时省略整个对象。菜单列表不带描述。[工具契约 §3](spec/tool-contract.md#3-get_item_detail点单卡片)
 - **组单刷新（PRE-03、BRW-09）。** 浏览卡片和组单现读共用商品详情请求。两处均保留 `includeProperties` 并带上 `includeExtras: ["GOODS_DESC"]`，组单刷新缓存后，后续卡片也能显示最新的品牌描述。[详情请求与缓存](server/browse.js)
@@ -272,7 +280,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 
 ## 逐项实现与测试
 
-下表列出规格 §5 的全部 107 个 ID。链接指向实现模块与测试定义，同一端到端用例可验证多条规则。测试中使用的故障、时钟偏移和假钥匙均不属于生产配置。
+下表按规格 §5 的 ID 链接实现模块与测试定义，同一端到端用例可验证多条规则。测试中使用的故障、时钟偏移和假钥匙均不属于生产配置。
 
 ### 会话和设备
 
@@ -281,7 +289,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | SES-01 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L27) |
 | SES-02 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77)<br>[SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64)<br>[SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单](test/session.test.js#L269) |
 | SES-03 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77)<br>[SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64) |
-| SES-04 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64)<br>[SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单](test/session.test.js#L269) |
+| SES-04 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L67)<br>[SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单](test/session.test.js#L274) · [会员查询部分成功也续期](test/window.test.js#L135) |
 | SES-05 | [server/commerce.js](server/commerce.js) · createCommerce、sweep、call | [同会员在途、最后总额度与会员配额原子竞争 WRT-07/09 LED-01/05/07 SES-05](test/commerce.test.js#L161)<br>[SES-05 SES-09 跨会话共用滑动窗口；重启清除限流与绑定](test/session.test.js#L86) · [重启清除设备状态及查询限流，保留发码记录](test/sms-binding-recovery.test.js#L94) |
 | SES-06 | [server/session.js](server/session.js) · makeEndpoint | [SES-02 SES-03 SES-04 SES-06 绑定跨会话保留、跨设备隔离，浏览与拒绝不续期](test/session.test.js#L64)<br>[SES-06 已进入会话的 POST 在接收消息期间保持活动](test/session.test.js#L224)<br>[SES-02 SES-04 SES-06 关会话保留待确认单，绑定过期后同会员重绑也不能提交旧单](test/session.test.js#L269) |
 | SES-07 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L27)<br>[SES-07 正在接收握手的连接占名额，中止后只归还一次](test/session.test.js#L207) |
@@ -292,7 +300,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
-| ORD-01 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L27) |
+| ORD-01 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L28) · [下单开关与工具数量](test/session.test.js) · [会员工具契约](test/member-info.test.js) |
 | ORD-02 | [server/qmai.js](server/qmai.js) · readPaths、Qmai.write、Qmai.sms · [账本发送凭据](server/ledger.js) | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L378)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12)<br>[ORD-02 增加路径常量不会自动获得读权限](test/write-gate.test.js#L37) · [短信出口、关停与落盘凭据](test/sms-gateway.test.js#L81) |
 | ORD-03 | [server/qmai.js](server/qmai.js) · Qmai.read、Qmai.write、Qmai.sms | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L378) |
 
@@ -402,7 +410,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | UNR-07 | [server/commerce.js](server/commerce.js) · unresolved、orders | [未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304)<br>[已发出与核对结果持久化失败仍保留未决 LED-01/03/07 UNR-04/05/07](test/commerce.test.js#L409)<br>[恢复多笔未决后按请求时间认领并引导人工复核 UNR-03/05/06/07](test/commerce.test.js#L536) |
 | UNR-08 | [server/commerce.js](server/commerce.js) · unresolved、orders | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268)<br>[未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/02/03/04/05/06/07/08](test/commerce.test.js#L304) |
 
-### 查单
+### 查单与会员信息
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
@@ -411,6 +419,8 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | QRY-03 | [server/commerce-view.js](server/commerce-view.js) · statusView | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268) |
 | QRY-04 | [server/commerce.js](server/commerce.js) · orders · [orderNumber、orderView](server/commerce-view.js) · [decimalId](server/common.js) | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268)<br>[WRT-14 QRY-04 R23 占位文字不算订单号；列表逐行校验 12 至 40 位英数](test/commerce.test.js#L680)<br>[QRY-04 R24 归属缺失与形态异常分别处理、商品名称按主备字段投影](test/commerce.test.js#L700) |
 | QRY-05 | [server/commerce.js](server/commerce.js) · requireBinding、status、orders | [查单严格核对归属、时间和状态 QRY-02/03/04/05 UNR-02/08](test/commerce.test.js#L268) |
+| QRY-07 | [会员工具](server/commerce.js) · [企迈读出口](server/qmai.js) | [积分格式、过期时间、等级归属、部分与全部失败](test/member-info.test.js) |
+| QRY-08 | [工具描述与空对象入参](server/tools.js) · [会员工具](server/commerce.js) | [会员信息出参与积分商城提示](test/member-info.test.js) |
 
 ### 审计
 

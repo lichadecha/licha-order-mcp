@@ -13,6 +13,8 @@ export const PATHS = Object.freeze({
   search: 'v3/goods/item/getShopGoodsList/search',
   item: 'v3/goods/item/getShopGoodsDetail',
   member: 'v3/crm/customer/getCustomerIdByCode',
+  points: 'v3/crm/points/getCustomerPoints',
+  level: 'v3/crm/customer/getLevelExperience',
   coupons: 'v3/bsns/customer/chooseCouponAsOne',
   orderDetail: 'v3/order/standard/cyOrderDetail',
   orderStatus: 'v3/order/status',
@@ -24,7 +26,7 @@ export const PATHS = Object.freeze({
 const smsPaths = new Set([PATHS.smsSend, PATHS.smsCheck]);
 const readPaths = new Set([
   PATHS.stores, PATHS.storeStatus, PATHS.categories, PATHS.categoryItems, PATHS.search,
-  PATHS.item, PATHS.member, PATHS.coupons, PATHS.orderDetail, PATHS.orderStatus, PATHS.orderList
+  PATHS.item, PATHS.member, PATHS.points, PATHS.level, PATHS.coupons, PATHS.orderDetail, PATHS.orderStatus, PATHS.orderList
 ]);
 // 只为实际 HTTP 成功回执签发审计依据，保留收到时的值，调用方不能用同形对象代替。
 const orderResponses = new WeakMap();
@@ -55,9 +57,29 @@ const catalogIntegers = new Set(['salePrice', 'showPriceLow', 'price', 'attachGo
 const orderIntegerFields = new Set(['userId', 'total', 'status', 'actualAmount', 'discountAmount',
   'discountType', 'discountId', 'goodsId', 'num', 'storeId', 'orderAt', 'createTime']);
 
+// §3.20 只认 JSON 数值。直接整理十进制原文，避免大积分和长小数经浮点舍入。
+function pointAmount(value, source) {
+  if (!Number.isFinite(value)) return null;
+  const [mantissa, exponent = '0'] = source.split(/[eE]/);
+  const [whole, fraction = ''] = mantissa.split('.');
+  if (!/[1-9]/.test(mantissa)) return '0';
+  if (mantissa.startsWith('-')) return null;
+  const digits = (whole + fraction).replace(/^0+/, '');
+  const point = digits.length - fraction.length + Number(exponent);
+  const significant = digits.replace(/0+$/, '');
+  // 极小的指数保留指数写法，避免把短回执展开为任意长度的零串。
+  if (value === 0 && Number(exponent) < 0) return mantissa.replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1') + 'e' + exponent;
+  if (point <= 0) return '0.' + '0'.repeat(-point) + significant;
+  if (point >= significant.length) return significant.padEnd(point, '0');
+  return significant.slice(0, point) + '.' + significant.slice(point);
+}
+
 export function parseResponse(raw, path) {
   const orderRead = orderReadPaths.has(path);
   return JSON.parse(raw, function (key, value, context) {
+    if (path === PATHS.points && (key === 'totalPoints' || key === 'soonExpiredPoints')) {
+      return pointAmount(value, context?.source);
+    }
     if (key === 'code' && this.status === false) {
       const token = typeof value === 'number' ? context.source : value;
       if (typeof token === 'string' && /[.eE]/.test(token)) {
@@ -67,6 +89,7 @@ export function parseResponse(raw, path) {
       }
     }
     if (typeof value !== 'number') return value;
+    if (path === PATHS.level && key === 'levelName') return null;
     // R23：大整数保留原文之前，先排除以 JSON 数字返回的订单号。
     if ((orderRead || path === PATHS.create) && key === 'orderNo') return null;
     const token = context.source;
@@ -80,13 +103,14 @@ export function parseResponse(raw, path) {
     // 大整数直接取原文。交易证据中的分数和指数也保留词法，让整数校验能识别舍入前的值。
     const integerField = (orderRead && orderIntegerFields.has(key))
       || (path === PATHS.coupons && (['id', 'customerId', 'user_id', 'unUseStatus', 'couponCenterType'].includes(key)))
+      || (path === PATHS.level && key === 'customerId')
       || (path === PATHS.member && (key === 'customerId' || key === 'data'));
     return /^-?\d{15,}$/.test(token) || (integerField && /[.eE]/.test(token)) ? token : value;
   });
 }
 
 const numericKeys = new Set(['userId', 'customerId', 'goodsId', 'skuId', 'id', 'valueId', 'frontCategoryId', 'storeId', 'shopId']);
-function encode(body) {
+function encode(body, path) {
   return JSON.stringify(body, (key, value) => {
     if (key === 'goodsIds' && (!Array.isArray(value) || value.some(id => typeof id !== 'string' || !decimalId(id)))) {
       throw new Error('企迈请求中的商品编号无效');
@@ -95,6 +119,7 @@ function encode(body) {
     if (!numericKeys.has(key)) return value;
     const digits = decimalId(value);
     if (!digits) throw new Error('企迈请求中的标识无效');
+    if (key === 'customerId' && (path === PATHS.points || path === PATHS.level)) return digits;
     return JSON.rawJSON(digits);
   });
 }
@@ -266,7 +291,7 @@ export class Qmai {
         clearTimeout(timer);
         const fields = {openId: c.QMAI_OPEN_ID, grantCode: c.QMAI_GRANT_CODE, nonce: randomInt(1000000, 1000000000),
           timestamp: Math.floor(Date.now() / 1000)};
-        const payload = encode({...fields, token: sign(this.key, fields), params});
+        const payload = encode({...fields, token: sign(this.key, fields), params}, path);
         if (path === PATHS.create || path === PATHS.smsSend) {
           const attempt = Object.freeze({});
           const receipt = beforeSend(attempt);

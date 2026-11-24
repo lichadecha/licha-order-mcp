@@ -132,6 +132,25 @@ test('SES-04/BND-15 当前号码的查单只续它自己的闲置期，失效的
   assert.deepEqual((await success(s, 'my_orders')).member, second.member);
 });
 
+test('SES-04 QRY-07 会员查询仅查到一项也刷新绑定闲置时间', async t => {
+  const {service, at} = await withClock(t, {LICHA_BINDING_IDLE_TTL_MS:'10000'}, path => {
+    if (path === PATHS.member) return {status:true, data:1234};
+    if (path === 'v3/crm/points/getCustomerPoints') return {status:true, data:{totalPoints:0}};
+    if (path === 'v3/crm/customer/getLevelExperience') return {status:false};
+    return {status:true};
+  });
+  const s = await service.session();
+  await bind(s);
+  for (const offset of [9000, 18000]) {
+    await at(offset);
+    assert.deepEqual((await success(s, 'my_member_info')).unavailable, ['level']);
+  }
+  await at(28001);
+  const before = service.requests.length;
+  await failure(s, 'my_member_info', {}, /尚未绑定/);
+  assert.equal(service.requests.length, before);
+});
+
 test('SES-03/05/BND-15 同号在别的设备和服务重启后都要重新收码', async t => {
   const {service, at} = await withClock(t, {LICHA_SMS_COOLDOWN_SEC:'1'},
     (path, params) => path === PATHS.member

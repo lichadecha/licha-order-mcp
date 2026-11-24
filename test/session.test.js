@@ -52,6 +52,8 @@ test('SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关�
   const list = await post({...bound,'x-licha-device':device.toUpperCase(),'x-licha-access':'FAKE_ROTATED_KEY'},
     {...ping,method:'tools/list'});
   assert.deepEqual((await list.json()).result.tools.map(t=>t.name),['find_store','get_menu','get_item_detail','preview_order']);
+  const info = await post(bound, {...ping, method:'tools/call', params:{name:'my_member_info', arguments:{}}});
+  assert.equal((await info.json()).result.isError, true);
   const closed = await fetch(r.url+'/mcp',{method:'DELETE',headers:bound});
   assert.equal(closed.status,200);
   for (const method of ['GET','POST','DELETE']) {
@@ -254,7 +256,7 @@ test('§3.2 凭证缺项仍可握手，非法环境变量阻止启动且不回�
   const {serverPath} = await import('../test-support/rig.js');
   const r = await rig(t,{env:{QMAI_OPEN_ID:undefined}});
   const a = await r.session();
-  assert.equal((await a.rpc('tools/list')).tools.length,9);
+  assert.equal((await a.rpc('tools/list')).tools.length,10);
   for (const [name,args] of [['find_store',{query:'茶'}],['bind_member',phone]]) {
     const result = await a.call(name,args);
     assert.equal(result.isError,true);
