@@ -62,7 +62,7 @@ test('PRE-07/12 缺省与显式 default 同样预测，none 省掉筛券并只�
   assert.deepEqual(none.coupons, {
     choice: 'none', note: '顾客选了这单不用券。念完合计要加一句：「这单按你说的不用券。」下单后会核对门店系统有没有照办。'
   });
-  assert.match(none.note, /coupons.choice 为 none 或 specific 时，念完合计按 coupons.note 说一句这单不用券 \/ 用哪张券；其余情况不提券/);
+  assert.equal(none.note, '请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；coupons.choice 为 none 或 specific 时，念完合计按 coupons.note 说一句这单不用券 / 用哪张券；其余情况念「系统没提示会用券，以门店收银台为准」（不要说「你没有券」）。数量、优惠、金额三样都要顾客明确确认；totalQuantity 达到 10 或合计达到 300 元时，再单独复述一次「一共 N 杯、实付约 X 元」并得到第二次确认（v1.12.2）。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 5 分钟内有效、只能用一次，过期请重新组单。');
   assert.equal(count(r, PATHS.coupons), 2);
 });
 

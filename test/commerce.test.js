@@ -128,16 +128,24 @@ test('券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01
   assert.equal(coupons.predicted.basis, 'max_discount');
   assert.equal(coupons.predicted.payAfterYuan, '0.00');
   m.couponRows[0].userCouponCanDisAmount = null;
-  assert.equal((await prepare(s)).coupons.predicted, undefined);
+  coupons = (await prepare(s)).coupons;
+  assert.equal(coupons.predicted, undefined);
+  assert.equal(coupons.note, '查到可用券但抵扣金额都为 0。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」');
+  m.couponRows = [{ unUseStatus: 0 }];
+  assert.equal((await prepare(s)).coupons.note, '顾客没有可用于本单的券（1 张不可用）。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」');
+  m.couponRows = [];
+  assert.equal((await prepare(s)).coupons.note, '顾客没有可用于本单的券。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」');
   m.override.set(PATHS.coupons, (_, { res }) => { res.statusCode = 503; res.end(); });
   const before = count(r, PATHS.coupons);
-  assert.equal((await prepare(s)).coupons.available, false);
+  coupons = (await prepare(s)).coupons;
+  assert.equal(coupons.available, false);
+  assert.equal(coupons.note, '券信息暂时没查到。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」下单后以门店系统读回的实付为准，如有优惠会在读回里体现。');
   assert.equal(count(r, PATHS.coupons) - before, 1);
   m.code = '';
   await r.restart();
   const newSession = await r.session();
   await bindAgain(newSession);
-  assert.match((await prepare(newSession)).coupons.note, /门店暂时查不了券/);
+  assert.equal((await prepare(newSession)).coupons.note, '这家门店暂时查不了券；下单后以门店系统读回的实付为准。');
   assert.equal(count(r, PATHS.coupons) - before, 1);
 });
 

@@ -153,17 +153,29 @@ test('UNR-07 匹配订单缺少状态时提示去小程序核对状态', async t
   assert.doesNotMatch(result.pendingWriteNote, /不是待支付|小程序「我的订单」付款/);
 });
 
-test('QRY-02 QRY-03 状态接口回传另一合格单号时拒绝，省略单号可查', async t => {
-  const { m, s } = await withBound(t);
-  const orderNo = number(1);
-  for (const userId of [memberA, memberB]) {
-    m.override.set(PATHS.orderStatus, () => ok({ orderNo: number(2), userId, status: 10 }));
-    const error = await failure(s, 'get_order_status', { orderNo }, /查询失败/);
-    assert.ok(!error.includes(number(2)));
-    assert.doesNotMatch(error, /待支付|完成付款|不属于/);
+test('QRY-06 订单号不合 R23 时本地拒绝，不回显原值、不调用企迈', async t => {
+  const { r, s } = await withBound(t);
+  const before = r.requests.length;
+  for (const orderNo of ['13800000000', 'a'.repeat(41), 'abc-123456789', '单12345678901', number(1) + '\n']) {
+    const error = await failure(s, 'get_order_status', { orderNo }, /订单号格式不对/);
+    assert.equal(error, '订单号格式不对：请照小程序订单页上的订单号报（字母 D 开头加一串数字）。');
   }
+  assert.equal(r.requests.length, before);
+});
+
+test('QRY-02 QRY-06 状态接口优先返回本人回执单号，缺失时使用已校验的入参', async t => {
+  const { m, s } = await withBound(t);
+  const orderNo = 'aB1234567890';
+  const receiptOrderNo = number(2);
+  m.override.set(PATHS.orderStatus, () => ok({ orderNo: receiptOrderNo, userId: memberA, status: 10 }));
+  assert.equal((await success(s, 'get_order_status', { orderNo })).orderNo, receiptOrderNo);
+  m.override.set(PATHS.orderStatus, () => ok({ orderNo: receiptOrderNo, userId: memberB, status: 10 }));
+  const error = await failure(s, 'get_order_status', { orderNo }, /不属于/);
+  assert.ok(!error.includes(receiptOrderNo));
+  assert.doesNotMatch(error, /待支付|完成付款/);
   m.override.delete(PATHS.orderStatus);
-  assert.equal((await success(s, 'get_order_status', { orderNo })).status, 10);
+  const longest = '9'.repeat(40);
+  assert.equal((await success(s, 'get_order_status', { orderNo: longest })).orderNo, longest);
 });
 
 test('QRY-02/03 状态回执的单号已提供但不合格时，拒绝返回状态和付款提示', async t => {

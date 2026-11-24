@@ -26,7 +26,8 @@ test('BND-11 工具契约、两步回执、同设备跨会话和幂等免验', a
   const first = await r.session(), same = await r.session(first.device), other = await r.session();
   const schema = (await first.rpc('tools/list')).tools.find(tool => tool.name === 'bind_member');
   assert.match(schema.description, /同一个手机号和 captcha/);
-  assert.match(schema.description, /每个号只在第一次收验证码，之后报哪个号就直接切到哪个号/);
+  assert.match(schema.description, /每个号在这台设备上验证过、且记录还有效（闲置不超过保留期、服务没重启）时，再报它就直接切过去、不用收码（出参同换绑）/);
+  assert.match(schema.description, /两个号属于同一位会员时，仍按那位会员现在的绑定，不算换人/);
   assert.deepEqual(schema.inputSchema.properties.captcha, {type:'string', minLength:1, maxLength:16});
   for (const malformed of [123456, '', '1'.repeat(17)]) {
     await denied(first, phone, malformed, /参数/);

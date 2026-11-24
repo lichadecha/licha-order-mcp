@@ -167,7 +167,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     if (discarded) Object.assign(result, { supersededPendingOrders: discarded,
       supersedeNote: '顾客之前还没确认的那张待确认单已作废，只有这张能提交；别拿旧的 confirmToken。' });
     return { ...result, pickup: '堂食（本店当前只开堂食）：付款后按小程序订单页的提示取餐', expiresInMinutes: minutes,
-      note: `请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；coupons.choice 为 none 或 specific 时，念完合计按 coupons.note 说一句这单不用券 / 用哪张券；其余情况不提券。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 ${minutes} 分钟内有效、只能用一次，过期请重新组单。` };
+      note: `请把以上内容逐项念给顾客确认（下到哪位会员名下、门店、每杯商品与规格做法、杯数、总金额）。coupons.predicted 存在时，念完合计再按 coupons.note 说一句系统默认会用哪张券、实付大约多少；coupons.choice 为 none 或 specific 时，念完合计按 coupons.note 说一句这单不用券 / 用哪张券；其余情况念「系统没提示会用券，以门店收银台为准」（不要说「你没有券」）。数量、优惠、金额三样都要顾客明确确认；totalQuantity 达到 10 或合计达到 300 元时，再单独复述一次「一共 N 杯、实付约 X 元」并得到第二次确认（v1.12.2）。顾客确认后调用 place_order，传入 confirmToken 与你刚念出的总金额（元，是券前的预估合计，不是券后实付）。令牌 ${minutes} 分钟内有效、只能用一次，过期请重新组单。` };
   }
 
   function deviceDraft(confirmToken, device) {
@@ -297,17 +297,20 @@ export async function createCommerce(config, qmai, browse, logs) {
     return result;
   }
 
-  async function status({ orderNo }, b, device) {
+  async function status(args, b, device) {
+    const orderNo = orderNumber(args);
+    if (!orderNo) throw Error('订单号格式不对：请照小程序订单页上的订单号报（字母 D 开头加一串数字）。');
     let row;
     try { row = await qmai.read(PATHS.orderStatus, { orderNo }); }
     catch (error) { throw Error(queryError(error, '查询失败：查无此单或接口异常')); }
     if (!row || typeof row !== 'object') throw Error('查询失败：查无此单或接口异常');
-    if (Object.hasOwn(row, 'orderNo') && orderNumber(row) !== orderNo) throw Error('查询失败：返回的订单号与查询不符');
+    const receiptOrderNo = orderNumber(row);
+    if (Object.hasOwn(row, 'orderNo') && !receiptOrderNo) throw Error('查询失败：返回的订单号与查询不符');
     if (owner(row) !== b.id) {
       logs.access({event:'ownership_rejected', orderNo}, {device,memberId:b.id});
       throw Error('无法查询：该订单不属于当前绑定的会员');
     }
-    const result = { orderNo, ...statusView(row.status, true) };
+    const result = { orderNo: receiptOrderNo || orderNo, ...statusView(row.status, true) };
     const pending = unresolved(b.hash);
     if (pending.length) Object.assign(result, { unresolvedPendingWrites: pending.length,
       pendingWriteNote: '此前有下单请求结果未知、下单闸门仍然关着。这一次按单号查到的单不能用来核对那笔请求——订单状态接口的回执里没有下单时间，无法判断它是不是那一次建出来的。请改用 my_orders（按时间段列最近订单）核对，那条路径带下单时间。' });
