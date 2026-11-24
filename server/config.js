@@ -11,7 +11,10 @@ const defaults = {
   SMS_COOLDOWN_SEC: 60,
   SMS_PER_PHONE_PER_HOUR: 5,
   SMS_PER_PHONE_PER_DAY: 10,
-  SMS_GLOBAL_PER_DAY: 100,
+  SMS_GLOBAL_PER_DAY: 2000,
+  SMS_BRAKE_WINDOW_SEC: 3600,
+  SMS_BRAKE_MIN_SAMPLE: 20,
+  SMS_BRAKE_MAX_UNFILLED_PERCENT: 50,
   SMS_MAX_WRONG: 5,
   SESSION_IDLE_TTL_MS: 1800000,
   ORDER_MATCH_WINDOW_MS: 600000,
@@ -47,6 +50,8 @@ export function readConfig(env = process.env) {
     config[name] = integer(env[name] ?? initial, name, initial === 0 ? 0 : 1);
   }
   if (config.LICHA_SMS_CODE_TTL_SEC < 30 || config.LICHA_SMS_CODE_TTL_SEC > 300) invalid('LICHA_SMS_CODE_TTL_SEC');
+  if (config.LICHA_SMS_BRAKE_WINDOW_SEC <= config.LICHA_SMS_CODE_TTL_SEC) invalid('LICHA_SMS_BRAKE_WINDOW_SEC');
+  if (config.LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT > 100) invalid('LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT');
   config.PORT = integer(env.PORT ?? 3000, 'PORT');
   if (config.PORT > 65535) invalid('PORT');
   config.HOST = nonempty('HOST', '127.0.0.1');

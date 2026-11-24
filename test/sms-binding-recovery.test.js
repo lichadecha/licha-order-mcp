@@ -187,3 +187,22 @@ test('LED-02/BND-12 运行中写入失败或重启发现发码表缺失，bind_m
   assert.equal(count(r, PATHS.smsSend), 0);
   assert.equal(count(r, PATHS.smsCheck), 0);
 });
+
+test('LED-02/BND-12 校验通过但回填写入失败时保留原绑定，账本停止发新码', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  await success(s, 'bind_member', args);
+  await success(s, 'bind_member', verify);
+  await success(s, 'bind_member', {...args, code:phoneB});
+  const db = new DatabaseSync(bookFile(r));
+  try {
+    db.exec(`CREATE TRIGGER deny_fill BEFORE UPDATE ON sms_sends
+      BEGIN SELECT RAISE(ABORT, 'write failed'); END`);
+    await failure(s, 'bind_member', {...verify, code:phoneB}, /安全账本写入失败，本次未完成绑定/);
+    assert.equal(db.prepare('SELECT count(*) AS n FROM sms_sends WHERE filled=1').get().n, 1);
+    const before = r.requests.length;
+    assert.equal((await success(s, 'bind_member', args)).member.last4, '***' + phone.slice(-4));
+    await failure(s, 'bind_member', {...args, code:phoneB}, /安全账本不可用/);
+    assert.equal(r.requests.length, before);
+  } finally { db.close(); }
+});

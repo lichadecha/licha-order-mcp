@@ -21,7 +21,8 @@ test('§3.2 短信配置使用正整数、有效期上下界，绑定默认闲�
   assert.equal(config.LICHA_BINDING_IDLE_TTL_MS, 30 * 86400000);
   const defaults = {
     LICHA_SMS_CODE_TTL_SEC:300, LICHA_SMS_COOLDOWN_SEC:60,
-    LICHA_SMS_PER_PHONE_PER_HOUR:5, LICHA_SMS_PER_PHONE_PER_DAY:10, LICHA_SMS_GLOBAL_PER_DAY:100, LICHA_SMS_MAX_WRONG:5
+    LICHA_SMS_PER_PHONE_PER_HOUR:5, LICHA_SMS_PER_PHONE_PER_DAY:10, LICHA_SMS_GLOBAL_PER_DAY:2000, LICHA_SMS_MAX_WRONG:5,
+    LICHA_SMS_BRAKE_WINDOW_SEC:3600, LICHA_SMS_BRAKE_MIN_SAMPLE:20, LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT:50
   };
   for (const [key, expected] of Object.entries(defaults)) {
     assert.equal(config[key], expected);
@@ -38,10 +39,24 @@ test('§3.2 短信配置使用正整数、有效期上下界，绑定默认闲�
   }
 });
 
-test('§3.2 短信事件编号缺失、无效或全服务日额无效时拒绝启动', async t => {
+test('§3.2 刹车窗口严格大于配置的有效期，样本下限可设为 1，百分数含两端', () => {
+  const env = {LICHA_ACCESS_KEYS:'FAKE', LICHA_SMS_CODE_TTL_SEC:'60', LICHA_SMS_BRAKE_MIN_SAMPLE:'1'};
+  for (const window of ['59', '60']) {
+    assert.throws(() => readConfig({...env, LICHA_SMS_BRAKE_WINDOW_SEC:window}), {message:'配置无效：LICHA_SMS_BRAKE_WINDOW_SEC'});
+  }
+  for (const percent of ['1', '100']) {
+    const config = readConfig({...env, LICHA_SMS_BRAKE_WINDOW_SEC:'61', LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT:percent});
+    assert.equal(config.LICHA_SMS_BRAKE_WINDOW_SEC, 61);
+    assert.equal(config.LICHA_SMS_BRAKE_MIN_SAMPLE, 1);
+    assert.equal(config.LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT, Number(percent));
+  }
+});
+
+test('§3.2 短信事件编号、全服务日额或刹车配置无效时拒绝启动', async t => {
   const r = await rig(t, {env:event});
   for (const [key, value] of [['LICHA_SMS_EVENT_NO', undefined], ['LICHA_SMS_EVENT_NO', 'FAKE_PRIVATE_EVENT_NUMBER'],
-    ['LICHA_SMS_GLOBAL_PER_DAY', '0']]) {
+    ['LICHA_SMS_GLOBAL_PER_DAY', '0'], ['LICHA_SMS_BRAKE_WINDOW_SEC', '300'], ['LICHA_SMS_BRAKE_MIN_SAMPLE', '0'],
+    ['LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT', '101']]) {
     const env = {...r.env, [key]:value};
     if (value === undefined) delete env[key];
     await assert.rejects(promisify(execFile)(process.execPath, [serverPath], {cwd:r.cwd, env, timeout:5000}),

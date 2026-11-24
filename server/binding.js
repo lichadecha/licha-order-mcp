@@ -84,6 +84,9 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     logs.access({event:'sms_send', outcome:error.kind === 'sms_limit' ? 'rate_limited' : 'ledger_fault',
       tier:error.tier, tiers:error.tiers}, source);
     if (error.firstGlobalRejection) logs.access({event:'sms_global_day_exhausted'}, source);
+    if (error.firstBrakeRejection) {
+      logs.access({event:'sms_brake_engaged', expiredCount:error.expiredCount, unfilledCount:error.unfilledCount}, source);
+    }
     reject(source, error.kind, error.message);
   }
 
@@ -163,7 +166,7 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     logs.access({event:'sms_send', outcome:verificationSent === true ? 'sent' : 'unknown'}, source);
     const expires = sentAt + ttlSeconds * 1000;
     if (Date.now() >= expires) rejectExpired(source);
-    challenges.set(device, {...member, phone, phoneHash:source.phoneHash, bizId, expires, wrong:0});
+    challenges.set(device, {...member, phone, phoneHash:source.phoneHash, bizId, sentAt, expires, wrong:0});
     const last4 = phone.slice(-4);
     const cooldown = config.LICHA_SMS_COOLDOWN_SEC;
     const wait = cooldown % 60 === 0 ? `${cooldown / 60} 分钟` : `${cooldown} 秒`;
@@ -230,6 +233,11 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     if (result === true) {
       challenges.delete(device);
       logs.access({event:'sms_check', outcome:'passed'}, source);
+      try {
+        book.markSmsFilled(phone, challenge.sentAt);
+      } catch {
+        reject(source, 'ledger_fault', '验证码已校验通过，但安全账本写入失败，本次未完成绑定。请直接在小程序里下单。');
+      }
       return finish(source, previous, challenge);
     }
     const remaining = config.LICHA_SMS_MAX_WRONG - ++challenge.wrong;

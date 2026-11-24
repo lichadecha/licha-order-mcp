@@ -11,11 +11,13 @@ import { orderNumber } from './commerce-view.js';
 
 const bookName = 'orders.sqlite';
 const initialName = '.orders-init.sqlite';
-const formatVersion = 4;
+const formatVersion = 5;
 const hourMs = 3600_000;
 const dayMs = 24 * hourMs;
+const filledColumn = 'filled INTEGER NOT NULL DEFAULT 0 CHECK (filled IN (0, 1))';
 const smsSchema = `CREATE TABLE sms_sends (
   phone_hash TEXT NOT NULL, sent_at INTEGER NOT NULL, checksum TEXT NOT NULL,
+  ${filledColumn},
   PRIMARY KEY (phone_hash, sent_at)
 ) STRICT;
 CREATE INDEX sms_sends_time ON sms_sends(sent_at);
@@ -41,8 +43,9 @@ export function consumeSmsReceipt(receipt, attempt, phone) {
   smsReceipts.delete(receipt);
 }
 
-function smsChecksum(phoneHash, time) {
-  return digest(phoneHash + ':' + time);
+function smsChecksum(phoneHash, time, filled = 0) {
+  // 未回填沿用旧格式校验和；成功回填时连同状态一起更新。
+  return digest(phoneHash + ':' + time + (filled ? ':filled' : ''));
 }
 
 function smsLimits(times, config, now, midnight, globalDayFull) {
@@ -75,10 +78,13 @@ function createSmsTables(db) {
   db.prepare('INSERT INTO sms_key VALUES (1, ?, ?)').run(secret, digest(secret));
 }
 
-function verifySmsRecords(db) {
-  for (const row of db.prepare('SELECT phone_hash, sent_at, checksum FROM sms_sends').iterate()) {
+function verifySmsRecords(db, version) {
+  const filled = version >= 5 ? 'filled' : '0 AS filled';
+  for (const row of db.prepare(`SELECT phone_hash, sent_at, checksum, ${filled} FROM sms_sends`).iterate()) {
     if (!isDigest(row.phone_hash) || !Number.isSafeInteger(row.sent_at) || row.sent_at <= 0
-      || row.checksum !== smsChecksum(row.phone_hash, row.sent_at)) throw Error('发码记录损坏');
+      || ![0, 1].includes(row.filled) || row.checksum !== smsChecksum(row.phone_hash, row.sent_at, row.filled)) {
+      throw Error('发码记录损坏');
+    }
   }
 }
 
@@ -115,6 +121,7 @@ export function persistedAuditFields(record) {
 
 export class Ledger {
   #smsKey;
+  #braking = false;
 
   constructor(directory, {initializeIfEmpty = true} = {}) {
     this.records = new Map();
@@ -154,7 +161,7 @@ export class Ledger {
       this.db = new DatabaseSync(this.file);
       this.db.exec('PRAGMA synchronous=FULL');
       const version = this.db.prepare('PRAGMA user_version').get().user_version;
-      if (![2, 3, formatVersion].includes(version)) {
+      if (![2, 3, 4, formatVersion].includes(version)) {
         this.faultReason = cutover;
         throw Error(cutover);
       }
@@ -168,19 +175,23 @@ export class Ledger {
         }
         recovered.set(record.key, record);
       }
-      if (version >= 3) verifySmsRecords(this.db);
+      if (version >= 3) verifySmsRecords(this.db, version);
       if (version < formatVersion) {
-        // v2 无发码表；v3 的无密钥摘要无法换算。先核验旧账本，再一次性切换。
+        // v2 无发码表；v3 的无密钥摘要无法换算；v4 的 HMAC 和限频记录原样保留。
         if (version === 3) this.db.exec('PRAGMA secure_delete=ON');
         this.db.exec('BEGIN IMMEDIATE');
-        if (version === 3) this.db.exec('DROP TABLE sms_sends');
-        createSmsTables(this.db);
+        if (version === 4) {
+          this.db.exec(`ALTER TABLE sms_sends ADD COLUMN ${filledColumn}`);
+        } else {
+          if (version === 3) this.db.exec('DROP TABLE sms_sends');
+          createSmsTables(this.db);
+        }
         this.db.exec(`PRAGMA user_version=${formatVersion}`);
-        this.db.exec('COMMIT');
       }
       const key = this.db.prepare('SELECT secret, checksum FROM sms_key WHERE id=1').get();
       if (!isDigest(key?.secret) || digest(key.secret) !== key.checksum) throw Error('发码密钥损坏');
       this.db.prepare('SELECT day_start FROM sms_daily_alerts LIMIT 1').get();
+      if (version < formatVersion) this.db.exec('COMMIT');
       this.#smsKey = Buffer.from(key.secret, 'hex');
       this.records = recovered;
       for (const record of recovered.values()) rememberAuditFields(record);
@@ -266,7 +277,7 @@ export class Ledger {
         // 前置检查在本地同步完成。正式落账时在写事务里重新读取全部档位。
         if (onAllowed) this.db.exec('BEGIN IMMEDIATE');
         const midnight = Math.floor((now + 8 * hourMs) / dayMs) * dayMs - 8 * hourMs;
-        // 自定义冷却超过一天时仍保留其记录。
+        const windowStart = now - config.LICHA_SMS_BRAKE_WINDOW_SEC * 1000;
         const cutoff = now - Math.max(dayMs, config.LICHA_SMS_COOLDOWN_SEC * 1000);
         const history = this.db.prepare('SELECT sent_at FROM sms_sends WHERE phone_hash=? AND sent_at>? ORDER BY sent_at')
           .all(phoneHash, cutoff);
@@ -274,15 +285,30 @@ export class Ledger {
           .get(midnight, midnight + dayMs);
         const globalDayFull = total >= config.LICHA_SMS_GLOBAL_PER_DAY;
         const limits = smsLimits(history.map(row => row.sent_at), config, now, midnight, globalDayFull);
+        const {expiredCount, unfilledCount} = this.db.prepare(`SELECT count(*) AS expiredCount,
+          count(*) FILTER (WHERE filled=0) AS unfilledCount FROM sms_sends WHERE sent_at BETWEEN ? AND ?`)
+          .get(windowStart, now - config.LICHA_SMS_CODE_TTL_SEC * 1000);
+        const braking = expiredCount >= config.LICHA_SMS_BRAKE_MIN_SAMPLE
+          && unfilledCount * 100 > expiredCount * config.LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT;
+        if (braking) {
+          const minutes = Math.ceil(config.LICHA_SMS_BRAKE_WINDOW_SEC / 60);
+          const brake = {tier:'brake', message:`验证短信暂时停发了（系统检测到短时间内异常，自动暂停），请过一阵再试（最长约 ${minutes} 分钟），或直接在小程序里下单。`};
+          if (globalDayFull || limits.some(limit => limit.tier === 'day')) limits.push(brake);
+          else limits.unshift(brake);
+        }
         let firstGlobalRejection = false;
         if (globalDayFull) {
           const alert = this.db.prepare('INSERT INTO sms_daily_alerts (day_start) VALUES (?) ON CONFLICT DO NOTHING').run(midnight);
           firstGlobalRejection = alert.changes === 1;
         }
-        if (!limits.length) onAllowed?.(cutoff);
+        // 刹车窗口含左端点，即使配置超过 24 小时仍保留该条。
+        if (!limits.length) onAllowed?.(Math.min(cutoff, windowStart - 1));
         if (onAllowed) this.db.exec('COMMIT');
+        const firstBrakeRejection = braking && !this.#braking;
+        this.#braking = braking;
         if (limits.length) return Object.assign(Error(limits[0].message), {
-          kind:'sms_limit', tier:limits[0].tier, tiers:limits.map(limit => limit.tier), firstGlobalRejection
+          kind:'sms_limit', tier:limits[0].tier, tiers:limits.map(limit => limit.tier), firstGlobalRejection,
+          firstBrakeRejection, expiredCount, unfilledCount
         });
       });
     } catch {
@@ -306,6 +332,15 @@ export class Ledger {
     const receipt = Object.freeze({});
     smsReceipts.set(receipt, {attempt, phoneHash, ledger:this});
     return receipt;
+  }
+
+  markSmsFilled(phone, sentAt) {
+    const phoneHash = this.phoneHash(phone);
+    this.#withWritableBook(() => {
+      const result = this.db.prepare('UPDATE sms_sends SET filled=1, checksum=? WHERE phone_hash=? AND sent_at=?')
+        .run(smsChecksum(phoneHash, sentAt, 1), phoneHash, sentAt);
+      if (result.changes !== 1) throw Error('找不到待验证对应的发码记录');
+    });
   }
 
   unresolved(memberHash) {
