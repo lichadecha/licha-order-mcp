@@ -29,7 +29,9 @@ function createCouponRefs() {
 const sameMember = binding => ({ ...bindingView(binding), note: '本设备原本绑的就是这一位会员，无需重新绑定。' });
 const noChallenge = '还没给这个手机号发过验证码，或者之前那条已经作废。请先只带手机号调用一次 bind_member，让系统发验证码。';
 
-export function createBindingFlow({config, qmai, book, logs, bindings, unresolved, discardDrafts}) {
+export function createBindingFlow({config, qmai, book, logs, unresolved, discardDrafts, expireDrafts}) {
+  const devices = new Map();
+  const current = device => devices.get(device)?.current;
   const challenges = new Map();
   const queuedChecks = new Map();
   const bindTimes = new Map();
@@ -48,6 +50,17 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
   }
 
   function sweep(now) {
+    for (const [device, state] of devices) {
+      for (const binding of state.verified.values()) {
+        if (binding.busy || now - binding.touched <= config.LICHA_BINDING_IDLE_TTL_MS) continue;
+        state.verified.delete(binding.phone);
+        if (state.current === binding) {
+          state.current = undefined;
+          expireDrafts(device, binding.hash);
+        }
+      }
+      if (!state.verified.size) devices.delete(device);
+    }
     for (const [device, times] of bindTimes) if (times.at(-1) <= now - 3600000) bindTimes.delete(device);
     for (const [device, challenge] of challenges) {
       if (now < challenge.expires || queuedChecks.has(device)) continue;
@@ -118,10 +131,8 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
 
   async function send(source, previous) {
     const {phone, device} = source;
-    if (previous?.phone === phone) {
-      logs.access({event:'bind', reason:'sms_exempt'}, source);
-      return sameMember(previous);
-    }
+    const verified = devices.get(device)?.verified.get(phone);
+    if (verified) return activate(source, previous, verified, true);
     guardRebind(source, previous);
     const member = await findMember(source);
     const bizId = randomUUID();
@@ -162,24 +173,40 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
     return {bound:false, verificationSent, phoneLast4:tail(phone), expiresInMinutes:minutes, note};
   }
 
-  function finish(source, previous, {id, customerIdTail}) {
-    guardRebind(source, previous);
-    if (previous?.id === id) {
-      logs.access({event:'bind', reason:'same_member'}, {device:source.device, memberId:id});
+  function activate(source, previous, binding, exempt) {
+    const {device} = source;
+    const same = previous?.id === binding.id;
+    if (!same) guardRebind(source, previous);
+    binding.created ??= Date.now();
+    if (same) {
+      if (exempt) logs.access({event:'bind', reason:'sms_exempt'}, source);
+      else logs.access({event:'bind', reason:'same_member'}, {device, memberId:binding.id});
       return sameMember(previous);
     }
-    const {phone, device} = source;
-    const created = Date.now();
-    const binding = { id, hash:digest(id), customerIdTail, identifierTail:tail(phone),
-      phone, via:'phone', created, touched:created, couponRefs:createCouponRefs() };
     const discarded = previous ? discardDrafts(device, previous.hash) : 0;
-    bindings.set(device, binding);
-    logs.access({event:previous ? 'rebind' : 'bind', discarded}, {device, memberId:id, previousMemberId:previous?.id});
+    if (previous) delete previous.couponRefs;
+    binding.couponRefs = createCouponRefs();
+    devices.get(device).current = binding;
+    const event = previous ? 'rebind' : 'bind';
+    if (exempt) logs.access({event, discarded, reason:'verified_switch'}, source);
+    else logs.access({event, discarded}, {device, memberId:binding.id, previousMemberId:previous?.id});
     if (!previous) return bindingView(binding);
     return { ...bindingView(binding), rebound:true, previousCustomerIdLast4:previous.customerIdTail,
       previousMember:memberView(previous), discardedPendingOrders:discarded,
-      note:`已从${previous.identifierTail}换成${binding.identifierTail}。` +
+      note:`已从${previous.identifierTail}换成${binding.identifierTail}` +
+        (exempt ? '（这台设备之前验证过这个号，这次不用收验证码）。' : '。') +
         (discarded ? `原来那位顾客还没确认的 ${discarded} 张单已作废，需要重新组单。` : '') };
+  }
+
+  function finish(source, previous, {id, customerIdTail}) {
+    const {device, phone} = source;
+    const binding = {id, hash:digest(id), customerIdTail, identifierTail:tail(phone),
+      phone, via:'phone', touched:Date.now()};
+    const state = devices.get(device) ?? {verified:new Map(), current:undefined};
+    devices.set(device, state);
+    // 短信通过即记住号码；能否换人还要按原会员此刻的未决状态判断。
+    state.verified.set(phone, binding);
+    return activate(source, previous, binding, false);
   }
 
   async function verify(source, rawCaptcha, previous, arrivedAt) {
@@ -224,9 +251,9 @@ export function createBindingFlow({config, qmai, book, logs, bindings, unresolve
     if (!/^\d{11}$/.test(phone)) {
       reject({device}, 'format', `code 格式不正确：codeType=phone 要求去除空白后为 11 位纯数字（收到长度：${[...phone].length}，是否全为数字：${/^\d+$/.test(phone) ? '是' : '否'}）`);
     }
-    const previous = bindings.get(device);
+    const previous = current(device);
     const source = {device, phone, phoneHash:book.phoneHash(phone)};
     return captcha === undefined ? send(source, previous) : verify(source, captcha, previous, arrivedAt);
   }
-  return {bind, sweep, holdVerification};
+  return {bind, current, sweep, holdVerification};
 }

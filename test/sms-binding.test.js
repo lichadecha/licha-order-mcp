@@ -6,7 +6,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {createBindingFlow} from '../server/binding.js';
 import {digest} from '../server/common.js';
 import {PATHS} from '../server/qmai.js';
-import {argsFor, bind, bookFile, count, failure, ok, phone, phoneB, place, prepare, setup, success} from '../test-support/commerce.js';
+import {argsFor, bind, bookFile, count, failure, memberA, number, ok, phone, phoneB, place, prepare, setup, success} from '../test-support/commerce.js';
 import {mockCaptcha} from '../test-support/rig.js';
 
 const args = (code, captcha) => ({code, codeType:'phone', ...(captcha !== undefined && {captcha})});
@@ -26,6 +26,7 @@ test('BND-11 工具契约、两步回执、同设备跨会话和幂等免验', a
   const first = await r.session(), same = await r.session(first.device), other = await r.session();
   const schema = (await first.rpc('tools/list')).tools.find(tool => tool.name === 'bind_member');
   assert.match(schema.description, /同一个手机号和 captcha/);
+  assert.match(schema.description, /每个号只在第一次收验证码，之后报哪个号就直接切到哪个号/);
   assert.deepEqual(schema.inputSchema.properties.captcha, {type:'string', minLength:1, maxLength:16});
   for (const malformed of [123456, '', '1'.repeat(17)]) {
     await denied(first, phone, malformed, /参数/);
@@ -104,6 +105,57 @@ test('BND-07/11 发码后原会员新增未决，校验通过也拒绝换人并�
   await denied(s, phoneB, undefined, /暂时不能换人/);
   assert.equal((await send(s)).bound, true);
   assert.equal(r.requests.length, before);
+  r.mock.orders = [{userId:memberA, orderNo:number(1), orderAt:r.requests.find(req => req.path === PATHS.create).at}];
+  assert.equal((await success(s, 'my_orders')).resolvedPendingWrites, 1);
+  const afterReconciliation = r.requests.length;
+  assert.equal((await send(s, phoneB)).rebound, true);
+  assert.equal(r.requests.length, afterReconciliation);
+});
+
+test('BND-05/09/15 同会员另一号码验证后保留原绑定和订单，换人后可用该号码免验', async t => {
+  const r = await setup(t, {LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR:'3', LICHA_RATE_BINDS_GLOBAL_PER_MIN:'3'});
+  const s = await r.session(), sameDevice = await r.session(s.device);
+  const alias = '13800007777';
+  const first = await bind(s);
+  const draft = await prepare(s);
+  r.mock.override.set(PATHS.member, () => ok({customerId:'9000000000000001234'}));
+  const same = await bind(s, alias);
+  assert.deepEqual(same.member, first.member);
+  assert.equal(same.boundAt, first.boundAt);
+  assert.equal(same.rebound, undefined);
+  const before = r.requests.length;
+  assert.deepEqual(await send(sameDevice, alias), same);
+  assert.equal(r.requests.length, before);
+  await place(s, draft);
+  assert.equal(r.requests.find(row => row.path === PATHS.create).params.mobile, phone);
+  r.mock.override.delete(PATHS.member);
+  const other = await bind(s, phoneB);
+  const limitReached = r.requests.length;
+  await denied(s, '13900000001', undefined, /绑定尝试太频繁/);
+  const back = await send(sameDevice, alias);
+  assert.equal(back.rebound, true);
+  assert.deepEqual(back.previousMember, other.member);
+  assert.deepEqual(back.member, {last4:'***7777', via:'phone'});
+  assert.equal(r.requests.length, limitReached);
+  assert.deepEqual((await success(s, 'my_orders')).member, back.member);
+  await place(s, await prepare(s));
+  assert.equal(r.requests.findLast(row => row.path === PATHS.create).params.mobile, alias);
+});
+
+test('BND-07/15 原会员有未决时拒绝切换到已验证号码，仍可用当前号免验', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  await bind(s, phoneB);
+  const first = await bind(s);
+  r.mock.override.set(PATHS.create, () => ok({}));
+  await failure(s, 'place_order', argsFor(await prepare(s)), /结果未知/);
+  const before = r.requests.length;
+  await denied(s, phoneB, undefined, /暂时不能换人/);
+  const current = await send(s);
+  assert.equal(current.rebound, undefined);
+  assert.deepEqual(current.member, first.member);
+  assert.equal(current.boundAt, first.boundAt);
+  assert.equal(r.requests.length, before);
 });
 
 test('R27/BND-11/14 逐笔计数并审计错码和未知回执，超时、断线、5xx 不扣次数', async t => {
@@ -150,7 +202,7 @@ function timedBinding(t, sms) {
   const config = {QMAI_OPEN_ID:'test', QMAI_OPEN_KEY:'test', QMAI_GRANT_CODE:'test',
     LICHA_SMS_CODE_TTL_SEC:30, LICHA_SMS_COOLDOWN_SEC:60, LICHA_SESSION_IDLE_TTL_MS:1800000,
     LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR:2, LICHA_RATE_BINDS_GLOBAL_PER_MIN:2};
-  return createBindingFlow({config, bindings:new Map(), qmai:{read:async () => ({customerId:123}), sms},
+  return createBindingFlow({config, qmai:{read:async () => ({customerId:123}), sms},
     logs:{access() {}}, book:{phoneHash:() => 'mock-phone-hash', checkSmsAllowed() {}, recordSmsSending() { return {}; }}});
 }
 
@@ -193,6 +245,9 @@ test('BND-13/14 真实工具回包、三本日志及账本不暴露手机号和�
   output.push(unknown);
   r.mock.override.set(PATHS.smsCheck, () => ({status:true}));
   output.push(await verify(s, thirdPhone));
+  const before = r.requests.length;
+  output.push(await send(s));
+  assert.equal(r.requests.length, before);
   const files = await Promise.all(['upstream.jsonl','write.jsonl','access.jsonl'].map(file => readFile(join(r.logDir,file),'utf8')));
   const rows = files[2].trim().split('\n').map(JSON.parse);
   assert.deepEqual(rows.filter(row => row.event === 'sms_send').map(row => row.outcome),
@@ -202,6 +257,11 @@ test('BND-13/14 真实工具回包、三本日志及账本不暴露手机号和�
   const events = rows.filter(row => row.event.startsWith('sms_') || row.reason === 'sms_exempt');
   assert.deepEqual(events.map(row => row.phoneHash),
     [hashes[0], hashes[0], hashes[0], hashes[0], hashes[1], hashes[2], hashes[2]]);
+  const switches = rows.filter(row => row.reason === 'verified_switch');
+  assert.equal(switches.length, 1);
+  assert.equal(switches[0].phoneHash, hashes[0]);
+  assert.equal(switches[0].deviceHash, digest(s.device));
+  assert.equal(switches[0].memberHash, undefined);
   for (const row of events) {
     assert.equal(row.deviceHash, digest(s.device));
     assert.ok([phone, phoneB, thirdPhone].every(value => row.phoneHash !== digest(value)));

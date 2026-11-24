@@ -29,9 +29,12 @@ test('BND-04/05/06 PRE-10 按原编号取尾号，绑定、念单、查单说同
   assert.deepEqual(next.previousMember, phoneMember);
   assert.equal(next.note, '已从***0000换成***8888。原来那位顾客还没确认的 1 张单已作废，需要重新组单。');
   assert.deepEqual((await success(s, 'my_orders')).member, nextMember);
-  const back = await bindAgain(s);
+  const before = r.requests.length;
+  const back = await success(s, 'bind_member', { code: phone, codeType: 'phone' });
+  assert.equal(r.requests.length, before);
   assert.deepEqual(back.previousMember, nextMember);
-  assert.equal(back.note, '已从***8888换成***0000。');
+  assert.equal(back.discardedPendingOrders, 0);
+  assert.equal(back.note, '已从***8888换成***0000（这台设备之前验证过这个号，这次不用收验证码）。');
 });
 
 for (const unknown of [false, true]) {

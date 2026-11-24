@@ -61,8 +61,17 @@ test('绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/
   const reqB = r.requests.filter(x => x.path === PATHS.create).at(-1);
   assert.equal(reqB.params.mobile, phoneB);
   assert.equal(reqB.params.reservePhone, phoneB);
-  await bindAgain(s);
+  const pendingB = await prepare(s);
+  const callsBeforeSwitch = r.requests.length;
+  const back = await success(s, 'bind_member', { code: phone, codeType: 'phone' });
+  assert.equal(back.rebound, true);
+  assert.equal(back.boundAt, first.boundAt);
+  assert.equal(back.discardedPendingOrders, 1);
+  assert.equal(back.note, '已从***8888换成***0000（这台设备之前验证过这个号，这次不用收验证码）。原来那位顾客还没确认的 1 张单已作废，需要重新组单。');
   await failure(s, 'place_order', argsFor(old), /无效/);
+  await success(s, 'bind_member', { code: phoneB, codeType: 'phone' });
+  await failure(s, 'place_order', argsFor(pendingB), /无效/);
+  assert.equal(r.requests.length, callsBeforeSwitch);
   for (const file of [bookFile(r), ...['access','upstream','write'].map(n => join(r.logDir,n + '.jsonl'))]) {
     const bytes = await readFile(file, 'utf8');
     for (const secret of [phone, phoneB, memberA, memberB, 'FAKE-CARD', s.device]) assert.ok(!bytes.includes(secret), file);
@@ -512,7 +521,7 @@ async function secondInstance(t, first) {
   await second.stop();
   second.env.LICHA_ENABLE_ORDERING = '1';
   second.env.LICHA_SMS_COOLDOWN_SEC = first.env.LICHA_SMS_COOLDOWN_SEC;
-  second.env.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY = first.env.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY ?? '5';
+  second.env.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY = first.env.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY ?? '0';
   return second;
 }
 
@@ -644,7 +653,7 @@ syncBuiltinESMExports();`;
 });
 
 test('UNR-03 商品名称、编号和杯数随发送记录恢复，畸形时间不能用于正负核对', async t => {
-  const { r, s, m } = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '250' });
+  const { r, s, m } = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '250', LICHA_MAX_ORDERS_PER_DAY: '1' });
   m.override.set(PATHS.create, () => ok({}));
   const draft = await success(s, 'prepare_order', { storeId: shop, items: [
     { goodsId, quantity: 1 }, { goodsId, quantity: 2 }

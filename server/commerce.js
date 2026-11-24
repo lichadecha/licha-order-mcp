@@ -61,22 +61,20 @@ const owner = row => responseId(row?.userId);
 export async function createCommerce(config, qmai, browse, logs) {
   const book = new Ledger(config.LICHA_DATA_DIR);
   if (book.fault) console.error(book.faultReason ?? '安全账本不可用，需要人工检查；已停用下单。');
-  const bindings = new Map();
   const drafts = new Map();
   const flights = new Map();
-  const bindingFlow = createBindingFlow({ config, qmai, book, logs, bindings, unresolved,
+  const bindingFlow = createBindingFlow({ config, qmai, book, logs, unresolved,
+    expireDrafts(device, hash) {
+      for (const [token, draft] of drafts) {
+        if (draft.device === device && draft.hash === hash) drafts.delete(token);
+      }
+    },
     discardDrafts: (device, hash) => supersede(draft => draft.device === device && draft.hash === hash, 'rebound') });
   const tokenTtl = config.LICHA_CONFIRM_TOKEN_TTL_MS;
   const minutes = tokenTtl / 60000;
   const windowMs = config.LICHA_ORDER_MATCH_WINDOW_MS;
 
   function sweep(now) {
-    for (const [device, binding] of bindings) {
-      if (now - binding.touched > config.LICHA_BINDING_IDLE_TTL_MS && !binding.busy) {
-        bindings.delete(device);
-        for (const [token, draft] of drafts) if (draft.device === device) drafts.delete(token);
-      }
-    }
     for (const [token, draft] of drafts) if (now >= draft.expires + tokenTtl) drafts.delete(token);
     bindingFlow.sweep(now);
   }
@@ -99,7 +97,7 @@ export async function createCommerce(config, qmai, browse, logs) {
   }
 
   function requireBinding(name, device) {
-    const binding = bindings.get(device);
+    const binding = bindingFlow.current(device);
     if (!binding) {
       logs.access({event:'unbound', tool:name}, {device});
       throw Error('本会话尚未绑定会员身份，请先用 bind_member 绑定' + (name === 'place_order' ? '后再下单' : ''));
@@ -220,19 +218,24 @@ export async function createCommerce(config, qmai, browse, logs) {
       `单笔金额超上限（¥${yuan(config.LICHA_MAX_ORDER_AMOUNT_FEN)}），已拒绝下单。请减少商品后重新组单。`);
     if ([...flights.values()].some(row => row.memberHash === b.hash)) reject('WRT-09_in_flight',
       '这位会员的上一笔下单还在处理中，请等它有结果后再试，不要重复提交。');
-    // 已经落盘的在途请求只从账本计一次；排队中的占位从内存计。
     const reservation = currentQuotaDay();
     const day = reservation.day;
-    const occupied = [...book.records.values(), ...[...flights.values()].filter(row => !book.records.has(row.key))]
-      .filter(row => row.day === day && row.state !== 'failed');
-    if (occupied.filter(row => row.memberHash === b.hash).length >= config.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY)
-      reject('WRT-09_member', `今天的下单次数已到上限（每位会员每天最多 ${config.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY} 单）。明天可以继续，或者这一单直接在小程序里下。`);
-    if (occupied.length >= config.LICHA_MAX_ORDERS_PER_DAY) reject('WRT-09_global',
-      '今天 AI 点单的总单量已到上限，暂时不能再下单。这一单可以直接在小程序里下。');
-    const record = { key, memberHash: b.hash, day, storeId: draft.storeId, totalFen: draft.totalFen,
+    const memberLimit = config.LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY;
+    const globalLimit = config.LICHA_MAX_ORDERS_PER_DAY;
+    if (memberLimit || globalLimit) {
+      // 账本与尚未落盘的在途请求各算一次。v1.12 前的订单默认两项都占。
+      const occupied = [...book.records.values(), ...[...flights.values()].filter(row => !book.records.has(row.key))]
+        .filter(row => row.day === day && row.state !== 'failed');
+      if (memberLimit && occupied.filter(row => row.memberHash === b.hash && row.memberQuota !== false).length >= memberLimit)
+        reject('WRT-09_member', `今天的下单次数已到上限（每位会员每天最多 ${memberLimit} 单）。明天可以继续，或者这一单直接在小程序里下。`);
+      if (globalLimit && occupied.filter(row => row.globalQuota !== false).length >= globalLimit)
+        reject('WRT-09_global', '今天 AI 点单的总单量已到上限，暂时不能再下单。这一单可以直接在小程序里下。');
+      source.reservation = reservation;
+    }
+    const record = { key, memberHash: b.hash, day, memberQuota: memberLimit > 0, globalQuota: globalLimit > 0,
+      storeId: draft.storeId, totalFen: draft.totalFen,
       products: draft.products, couponChoice: draft.couponChoice, state: 'sent' };
     flights.set(key, record);
-    source.reservation = reservation;
     draft.state = 'submitted';
     delete draft.paramsJson;
     let created;
@@ -393,7 +396,7 @@ export async function createCommerce(config, qmai, browse, logs) {
 
   async function call(name, args, device, arrivedAt) {
     sweep(Date.now());
-    const current = bindings.get(device);
+    const current = bindingFlow.current(device);
     if (current) current.busy = true;
     try {
       let result;
@@ -404,7 +407,7 @@ export async function createCommerce(config, qmai, browse, logs) {
         const handler = { prepare_order: prepare, get_order_status: status, my_orders: orders }[name];
         result = await handler(args, binding, device);
       }
-      if (name !== 'bind_member' || result.bound) bindings.get(device).touched = Date.now();
+      if (name !== 'bind_member' || result.bound) bindingFlow.current(device).touched = Date.now();
       return result;
     } finally {
       if (current) current.busy = false;
@@ -412,7 +415,7 @@ export async function createCommerce(config, qmai, browse, logs) {
   }
   const cleanup = setInterval(() => sweep(Date.now()), Math.min(60000, tokenTtl, config.LICHA_BINDING_IDLE_TTL_MS)).unref();
   function isDeviceCouponRef(device, key) {
-    return !!bindings.get(device)?.couponRefs.get(key);
+    return !!bindingFlow.current(device)?.couponRefs.get(key);
   }
   return { call, holdVerification:bindingFlow.holdVerification, logPlaceRejection, isDeviceCouponRef,
     close() { clearInterval(cleanup); book.close(); } };

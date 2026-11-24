@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mockCaptcha, rig } from '../test-support/rig.js';
+import { bind, failure, phone, phoneB, success } from '../test-support/commerce.js';
 import { PATHS } from '../server/qmai.js';
 
 const baseTime = Date.UTC(2026, 0, 1, 12, 0, 57);
@@ -101,6 +102,60 @@ test('SES-09 任意连续六十秒内跨会话计数，拒绝不延长窗口，�
   await attempt(60_000, same, callsLimited);
   await attempt(69_999, same, callsLimited);
   await attempt(70_000, same);
+});
+
+test('SES-04/BND-15 当前号码的查单只续它自己的闲置期，失效的旧号需重新收码', async t => {
+  const {service, at} = await withClock(t, {LICHA_BINDING_IDLE_TTL_MS:'10000', LICHA_SMS_COOLDOWN_SEC:'1'},
+    (path, params) => {
+      if (path === PATHS.member) return {status:true, data:params.customerCode.code === phone ? 1234 : 5678};
+      if (path === PATHS.orderList) return {status:true, data:{data:[], total:0}};
+      return {status:true};
+    });
+  const s = await service.session();
+  const first = await bind(s);
+  await at(2000);
+  const second = await bind(s, phoneB);
+  await at(4000);
+  const back = await success(s, 'bind_member', valid);
+  assert.equal(back.boundAt, first.boundAt);
+  await at(6000);
+  const again = await success(s, 'bind_member', {...valid, code:phoneB});
+  assert.equal(again.boundAt, second.boundAt);
+  await at(9000);
+  assert.deepEqual((await success(s, 'my_orders')).member, second.member);
+  await at(18000);
+  const before = service.requests.length;
+  const expired = await success(s, 'bind_member', valid);
+  assert.equal(expired.verificationSent, true);
+  assert.equal(expired.bound, false);
+  assert.deepEqual(service.requests.slice(before).map(row => row.path), [PATHS.member, PATHS.smsSend]);
+  assert.deepEqual((await success(s, 'my_orders')).member, second.member);
+});
+
+test('SES-03/05/BND-15 同号在别的设备和服务重启后都要重新收码', async t => {
+  const {service, at} = await withClock(t, {LICHA_SMS_COOLDOWN_SEC:'1'},
+    (path, params) => path === PATHS.member
+      ? {status:true, data:params.customerCode.code === phone ? 1234 : 5678} : {status:true});
+  const first = await service.session();
+  await bind(first);
+  await bind(first, phoneB);
+  await at(2000);
+  const other = await service.session();
+  await failure(other, 'my_orders', {}, /尚未绑定/);
+  await bind(other);
+  const before = service.requests.length;
+  const switched = await success(first, 'bind_member', valid);
+  assert.equal(switched.rebound, true);
+  assert.equal(service.requests.length, before);
+  await at(4000);
+  await service.restart();
+  const resumed = await service.session(first.device);
+  await failure(resumed, 'my_orders', {}, /尚未绑定/);
+  for (const code of [phone, phoneB]) {
+    const before = service.requests.length;
+    await bind(resumed, code);
+    assert.deepEqual(service.requests.slice(before).map(row => row.path), [PATHS.member, PATHS.smsSend, PATHS.smsCheck]);
+  }
 });
 
 test('BND-09 格式预检、设备一小时与全局一分钟滑窗分别计数，在边界释放', async (t) => {

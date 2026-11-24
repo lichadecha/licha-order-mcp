@@ -3,8 +3,8 @@ import { uuidPattern } from './common.js';
 
 const defaults = {
   MAX_ORDER_AMOUNT_FEN: 10000,
-  MAX_ORDERS_PER_CUSTOMER_PER_DAY: 5,
-  MAX_ORDERS_PER_DAY: 10,
+  MAX_ORDERS_PER_CUSTOMER_PER_DAY: 0,
+  MAX_ORDERS_PER_DAY: 0,
   CONFIRM_TOKEN_TTL_MS: 300000,
   BINDING_IDLE_TTL_MS: 2592000000,
   SMS_CODE_TTL_SEC: 300,
@@ -32,8 +32,8 @@ const defaults = {
 
 export function readConfig(env = process.env) {
   function invalid(name) { throw new Error('配置无效：' + name); }
-  function positive(value, name) {
-    if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < 1) invalid(name);
+  function integer(value, name, minimum = 1) {
+    if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < minimum) invalid(name);
     return Number(value);
   }
   function nonempty(name, fallback) {
@@ -44,10 +44,10 @@ export function readConfig(env = process.env) {
   const config = {};
   for (const [key, initial] of Object.entries(defaults)) {
     const name = 'LICHA_' + key;
-    config[name] = positive(env[name] ?? initial, name);
+    config[name] = integer(env[name] ?? initial, name, initial === 0 ? 0 : 1);
   }
   if (config.LICHA_SMS_CODE_TTL_SEC < 30 || config.LICHA_SMS_CODE_TTL_SEC > 300) invalid('LICHA_SMS_CODE_TTL_SEC');
-  config.PORT = positive(env.PORT ?? 3000, 'PORT');
+  config.PORT = integer(env.PORT ?? 3000, 'PORT');
   if (config.PORT > 65535) invalid('PORT');
   config.HOST = nonempty('HOST', '127.0.0.1');
   config.QMAI_BASE_URL = nonempty('QMAI_BASE_URL', 'https://openapi.qmai.cn/');
@@ -65,11 +65,11 @@ export function readConfig(env = process.env) {
   config.LICHA_DATA_DIR = (env.LICHA_DATA_DIR !== undefined || config.LICHA_ENABLE_ORDERING)
     ? resolve(nonempty('LICHA_DATA_DIR')) : null;
   if (env.LICHA_SMS_EVENT_NO !== undefined || config.LICHA_ENABLE_ORDERING) {
-    config.LICHA_SMS_EVENT_NO = positive(env.LICHA_SMS_EVENT_NO, 'LICHA_SMS_EVENT_NO');
+    config.LICHA_SMS_EVENT_NO = integer(env.LICHA_SMS_EVENT_NO, 'LICHA_SMS_EVENT_NO');
   }
   config.LICHA_LOG_DIR = resolve(nonempty('LICHA_LOG_DIR', './logs'));
   const delays = (env.LICHA_READ_BACKOFF_MS ?? '1000,2000').split(',');
   if (delays.length !== 2) invalid('LICHA_READ_BACKOFF_MS');
-  config.LICHA_READ_BACKOFF_MS = delays.map(s => positive(s.trim(), 'LICHA_READ_BACKOFF_MS'));
+  config.LICHA_READ_BACKOFF_MS = delays.map(s => integer(s.trim(), 'LICHA_READ_BACKOFF_MS'));
   return config;
 }

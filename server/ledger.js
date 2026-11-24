@@ -93,6 +93,8 @@ function validateRecord(record) {
     && Number.isSafeInteger(record.time) && record.time > 0
     && Number.isSafeInteger(record.totalFen) && record.totalFen > 0
     && /^\d{4}-\d{2}-\d{2}$/.test(record.day)
+    && ((record.memberQuota === undefined && record.globalQuota === undefined)
+      || (typeof record.memberQuota === 'boolean' && typeof record.globalQuota === 'boolean'))
     && states.has(record.state)
     && (['success', 'found'].includes(record.state) ? Boolean(orderNumber(record)) : !Object.hasOwn(record, 'orderNo'))
     && (record.state !== 'success' || Number.isSafeInteger(record.completedAt))
@@ -103,7 +105,8 @@ const persistedFields = new WeakMap();
 function rememberAuditFields(record) {
   // v1.8 的旧记录只可能是默认用券。
   persistedFields.set(record, Object.freeze({
-    requestKey:record.key, quotaDate:record.day, couponChoice:record.couponChoice ?? 'default'
+    requestKey:record.key, couponChoice:record.couponChoice ?? 'default',
+    ...((record.memberQuota !== false || record.globalQuota !== false) && {quotaDate:record.day})
   }));
 }
 export function persistedAuditFields(record) {

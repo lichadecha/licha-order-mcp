@@ -49,7 +49,7 @@ test('PRE-13 别的设备即使同会员也不能用编号，换绑再绑回也�
   assert.notEqual(otherRef, ref);
   await bind(s, phoneB);
   await checkExpired(r, s, ref);
-  await bindAgain(s);
+  await success(s, 'bind_member', { code: phone, codeType: 'phone' });
   await checkExpired(r, s, ref);
   assert.notEqual(await firstRef(s), ref);
   assert.equal(await firstRef(other), otherRef);
