@@ -16,7 +16,9 @@ const descriptions = {
 const text = {type:'string'};
 const nonempty = {type:'string', minLength:1};
 const stringList = {type:'array',items:text};
-const storeId = {anyOf:[{type:'integer',minimum:1,maximum:Number.MAX_SAFE_INTEGER},{type:'string',pattern:'^0*[1-9][0-9]*$'}]};
+export const maxStoreId = 2147483647;
+const storeId = {anyOf:[{type:'integer',minimum:1,maximum:maxStoreId},
+  {type:'string',pattern:'^0*[1-9][0-9]*$', description:'十进制门店编号，取值 1 到 2147483647。'}]};
 
 function shape(properties, required = []) {
   return {type:'object', properties, required, additionalProperties:false};

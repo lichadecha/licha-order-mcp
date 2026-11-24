@@ -115,7 +115,7 @@ test('R25 现有做法或加料有无效加价时不能当成免费', async t =>
   assert.equal(count(r, PATHS.coupons), 0);
 });
 
-test('R25 门店名录和调用方提供的商品、门店编号共用 long 上界，无效值不进入请求', async t => {
+test('R25 门店名录保留 long 编号，超出 long 的商品、门店入参不进入请求', async t => {
   const r = await setup(t);
   const s = await r.session();
   await bind(s);
@@ -130,6 +130,27 @@ test('R25 门店名录和调用方提供的商品、门店编号共用 long 上�
     await failure(s, 'get_menu', { storeId: value }, /参数/);
     await failure(s, 'get_item_detail', { storeId, goodsId: value }, /商品不存在/);
     await failure(s, 'prepare_order', { storeId, items: [{ goodsId: value, quantity: 1 }] }, /商品不存在/);
+  }
+  assert.equal(r.requests.length, before);
+});
+
+test('工具契约 §0 门店入参接受 int 上限和前导零，所有入口都在本地拒绝越界且不回显', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  r.mock.override.set(PATHS.categories, () => ok([]));
+  for (const value of [2147483647, '0002147483647', '001']) {
+    const menu = await success(s, 'get_menu', { storeId: value });
+    assert.equal(menu.storeId, String(Number(value)));
+  }
+  const before = r.requests.length;
+  for (const value of [2147483648, '0002147483648', '9'.repeat(100)]) {
+    for (const [tool, fields] of [
+      ['get_menu', {}], ['get_item_detail', { goodsId: exact }],
+      ['preview_order', { items: args.items }], ['prepare_order', { items: args.items }]
+    ]) {
+      const message = await failure(s, tool, { storeId: value, ...fields }, /工具参数/);
+      assert.ok(!message.includes(String(value)));
+    }
   }
   assert.equal(r.requests.length, before);
 });

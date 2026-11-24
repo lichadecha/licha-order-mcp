@@ -19,6 +19,11 @@ function readError(label, error = {}, fallback) {
   return Object.assign(new Error(`${label}：${reason}（${hint}）`), {reason:error.kind === 'business' ? reason : hint});
 }
 
+function storeView(store) {
+  return {storeId:store.storeId, name:projectText(store.name), shopCode:projectText(store.shopCode),
+    address:projectText(store.address), cityName:projectText(store.cityName)};
+}
+
 function openedHours(entries) {
   const ranges = [];
   for (const group of list(entries).flatMap(entry => [...list(entry.opentime), ...list(entry.opentimes)])) {
@@ -82,8 +87,7 @@ export class Browse {
           if (!storeId) continue;
           const rawCode = typeof row.code === 'string' ? row.code : id(row.code);
           const store = {
-            name:projectText(row.name), storeId, shopCode:projectText(rawCode),
-            address:projectText(row.address), cityName:projectText(row.cityName)
+            name:row.name, storeId, shopCode:rawCode, address:row.address, cityName:row.cityName
           };
           const searchable = [row.name, row.address, row.fullAddress, row.cityName, store.shopCode]
             .filter(value => typeof value === 'string').map(normalize);
@@ -98,7 +102,7 @@ export class Browse {
   async storeForOrder(storeId) {
     const directory = await this.#directory();
     const record = directory.records.get(decimalId(storeId));
-    if (record) return {name:record.store.name, shopCode:record.rawCode};
+    if (record) return {name:projectText(record.store.name), shopCode:record.rawCode};
   }
 
   async #liveStatus(storeId) {
@@ -133,22 +137,24 @@ export class Browse {
     const matches = [...directory.records.values()].filter(({searchable}) => searchable.some(s => s.includes(keyword)));
     if (matches.length === 1) {
       const {store} = matches[0];
-      return {matched:true, store:{...store, ...await this.#liveStatus(store.storeId)}};
+      return {matched:true, store:{...storeView(store), ...await this.#liveStatus(store.storeId)}};
     }
-    const candidates = matches.sort((a,b) => a.store.shopCode.localeCompare(b.store.shopCode)).map(({store,status}) =>
-      ({...store, openStatusText:statusText(status), statusSampledAt:directory.sampled}));
+    const candidates = matches.map(({store,status}) =>
+      ({...storeView(store), openStatusText:statusText(status), statusSampledAt:directory.sampled}))
+      .sort((a,b) => a.shopCode.localeCompare(b.shopCode));
     return {matched:false, candidates, ...(!candidates.length && {hint:'没找到这家店，试试商场名或城市名'})};
   }
 
   async #menu({storeId, keyword = ''}) {
     storeId = String(storeId);
     keyword = keyword.trim();
-    const categories = await this.#cached(['categories',storeId], this.config.LICHA_CACHE_CATEGORIES_MS, async () => {
+    const categoryRows = await this.#cached(['categories',storeId], this.config.LICHA_CACHE_CATEGORIES_MS, async () => {
       const data = await this.#read(PATHS.categories, {storeId,...channel}, '分类菜单拉取失败');
       if (!Array.isArray(data)) throw readError('分类菜单拉取失败');
       return list(data).filter(row => id(row.frontCategoryId)).sort((a,b) => (numeric(a.categorySort) ?? Infinity) - (numeric(b.categorySort) ?? Infinity))
-        .map(row => ({categoryName:projectText(row.categoryName), frontCategoryId:id(row.frontCategoryId)}));
+        .map(row => ({categoryName:row.categoryName, frontCategoryId:id(row.frontCategoryId)}));
     });
+    const categories = categoryRows.map(row => ({...row, categoryName:projectText(row.categoryName)}));
     if (!keyword) return {mode:'categories', storeId, categories};
     const folded = normalize(keyword);
     const category = categories.find(c => c.categoryName &&
@@ -156,32 +162,34 @@ export class Browse {
     const via = category ? 'category' : 'search';
     const params = {storeId, ...channel, includeProperties:['SKU','LABEL'],
       ...(category ? {frontCategoryId:category.frontCategoryId} : {name:keyword})};
-    const {items,count} = await this.#cached([via,storeId,category ? decimalId(category.frontCategoryId) : keyword],
+    const rows = await this.#cached([via,storeId,category ? decimalId(category.frontCategoryId) : keyword],
       category ? this.config.LICHA_CACHE_CATEGORIES_MS : this.config.LICHA_CACHE_SEARCH_MS, async () => {
         const label = category ? '按分类查商品失败' : '搜索失败';
         const rows = await this.#read(category ? PATHS.categoryItems : PATHS.search, params, label, '换个商品名试试');
         if (!Array.isArray(rows)) throw readError(label);
-        return {items:list(rows).map(menuItem).filter(Boolean), count:rows.length};
+        return rows;
       });
+    const items = list(rows).map(menuItem).filter(Boolean);
     let hint = listingHint;
     if (items.length === 0) hint = category ? `「${category.categoryName}」分类下暂无可点商品`
       : `没找到「${projectText(keyword)}」相关的商品，试试换个名字或问有什么系列`;
-    else if (!category && count >= 20) hint = '搜索结果较多，可能只显示了前 20 条的一部分，说更具体的名字能找得更准；' + listingHint;
+    else if (!category && rows.length >= 20) hint = '搜索结果较多，可能只显示了前 20 条的一部分，说更具体的名字能找得更准；' + listingHint;
     return {mode:'items', storeId, via, ...(category && {categoryName:category.categoryName}), items, hint};
   }
 
-  #item(storeId, goodsId, fresh = false) {
+  async #item(storeId, goodsId, fresh = false) {
     const key = responseId(goodsId);
     if (!key) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
-    return this.#cached(['item',String(storeId),key], this.config.LICHA_CACHE_ITEM_MS, async () => {
+    const row = await this.#cached(['item',String(storeId),key], this.config.LICHA_CACHE_ITEM_MS, async () => {
       const result = await this.#read(PATHS.item, {
         storeId, goodsIds:[id(goodsId)], ...channel,
         includeProperties:['SKU','PRACTICE','ATTACH','LABEL','CATEGORY'], includeExtras:['GOODS_DESC']
       }, '商品详情查询失败', '换个商品试试');
       const row = Array.isArray(result) ? result[0] : null;
       if (responseId(row?.goodsId) !== key) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
-      return {row, card:itemCard(row)};
+      return row;
     }, fresh);
+    return {row, card:itemCard(row)};
   }
 
   async quote({storeId, items}, preparing = false) {

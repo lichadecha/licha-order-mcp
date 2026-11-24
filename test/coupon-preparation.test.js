@@ -52,7 +52,7 @@ test('PRE-07/12 缺省与显式 default 同样替顾客挑券，none 省掉筛�
   assert.deepEqual(omitted.coupons, {
     choice: 'default', available: true, usable: [{ ref, title: '会员券', canDisYuan: '5.00', couponCenterType: 1 }],
     unusable: [], chosen: { title: '会员券', canDisYuan: '5.00', payAfterYuan: '15.00' }, autoPicked: true,
-    note: '顾客有 1 张券可用于本单，系统替顾客选了『会员券』，下单时会指定用这张。念完合计要加一句：「这单会用你的『会员券』，省 5.00 元，实付大约 ¥15.00；不想用券的话跟我说。」顾客说不用，就带 couponChoice="none" 重新组单；顾客没意见就照这张待确认单下单。'
+    note: '顾客有 1 张券可用于本单，系统替顾客选了『会员券』，下单时会指定用这张。念完合计要加一句：「这单会用你的『会员券』，省 5.00 元，实付大约 ¥15.00；不想用券的话跟我说。」顾客说不用，就带 couponChoice="none" 重新组单；否则保留这张券，仍要等顾客明确确认数量、优惠与金额后再下单。'
   });
   assert.equal(count(r, PATHS.coupons), 1);
   const explicit = await success(s, 'prepare_order', { ...basket, couponChoice: 'default' });
@@ -370,7 +370,7 @@ test('PRE-07 默认在可指定、抵扣为正且抵后仍需付款的券中选�
   assert.equal(draft.coupons.autoPicked, true);
   assert.equal(Object.hasOwn(draft.coupons, 'predicted'), false);
   assert.deepEqual(draft.coupons.chosen, { title: '三元券', canDisYuan: '3.00', payAfterYuan: '17.00' });
-  assert.equal(draft.coupons.note, '顾客有 5 张券可用于本单，系统替顾客选了抵得最多的『三元券』（省 3.00 元，实付大约 ¥17.00），下单时会指定用这张。念完合计要把 usable 里的券逐张念给顾客（券名、能省多少），然后问：「用这张、换一张，还是这单不用券？」顾客说用这张或随便，就照这张待确认单下单；点名另一张（只能是带 ref 的），就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。');
+  assert.equal(draft.coupons.note, '顾客有 5 张券可用于本单，系统替顾客选了抵得最多的『三元券』（省 3.00 元，实付大约 ¥17.00），下单时会指定用这张。念完合计要把 usable 里的券逐张念给顾客（券名、能省多少），然后问：「用这张、换一张，还是这单不用券？」顾客说用这张或随便，就保留这张券，仍要等顾客明确确认数量、优惠与金额后再下单；点名另一张（只能是带 ref 的），就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。');
   await place(s, draft);
   const { raw } = r.requests.find(req => req.path === PATHS.create);
   const { params } = JSON.parse(raw);

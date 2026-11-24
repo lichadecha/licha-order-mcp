@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { couponTextMask, projectText } from '../server/common.js';
+import { identifierTextMask, projectText } from '../server/common.js';
 import { PATHS } from '../server/qmai.js';
 import {
-  argsFor, basket, count, failure, goodsId, memberA, memberB, ok, place, prepare, shop, skuId, success, withBound
+  argsFor, basket, bind, count, failure, goodsId, memberA, memberB, ok, place, prepare, setup, shop, skuId, success, withBound
 } from '../test-support/commerce.js';
 
 const shortId = '7654327';
@@ -16,7 +16,7 @@ const available = { id: shortId, customerId: memberA, title: '三元券', unUseS
 const select = couponRef => ({ ...basket, couponChoice: 'specific', couponRef });
 
 test('OUT-02 券 ID 与手机号形态重叠时，以完整识别值取尾号', () => {
-  const mask = couponTextMask([{ id: '138000000001' }, { id: '76543270e-1' }]);
+  const mask = identifierTextMask(['138000000001', '76543270e-1']);
   assert.equal(projectText('长券138000000001，短券76543270e-1（7654327），电话13765432749', mask),
     '长券***0001，短券***（***），电话***2749');
 });
@@ -146,4 +146,81 @@ test('WRT-01 多余字段逐段投影，区分本设备券编号、普通字段�
   }
   assert.equal(count(r, PATHS.create), 0);
   await checkLogs(r, ref);
+});
+
+test('OUT-02 全页读回揭示的券实例、当前短会员编号与非典型手机号在优惠、等级、订单里都遮盖', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  const member = '741258';
+  const phone = '00123456789';
+  const newlyRead = '86420913';
+  const personal = '会员' + member + '电话' + phone;
+  const visible = '会员***电话***6789';
+  r.mock.override.set(PATHS.member, () => ok({customerId:member}));
+  await bind(s, phone);
+  r.mock.override.set(PATHS.level, () => ok({customerId:member, levelName:personal}));
+  assert.equal((await success(s, 'my_member_info')).level.name, visible);
+  r.mock.couponRows = [{...available, customerId:member, title:'茶券' + newlyRead}];
+  r.mock.override.set(PATHS.orderDetail, () => ok({...r.mock.last, actualAmount:1700, discountAmount:300,
+    discountList:[
+      {discountName:personal, discountSummary:'券' + newlyRead + personal, discountType:3, discountAmount:0},
+      {discountId:newlyRead, discountType:2, discountAmount:300}
+    ]}));
+  const result = await place(s, await prepare(s));
+  const applied = result.couponApplied;
+  assert.equal(applied.items[0].name, visible);
+  assert.equal(applied.items[0].summary, '券***0913' + visible);
+  assert.ok(applied.note.includes('指定了『茶券***0913』'));
+  assert.doesNotMatch(JSON.stringify(result), /741258|00123456789|86420913/);
+  r.mock.orders[0].itemList = [{goodsName:personal, num:1}];
+  assert.deepEqual((await success(s, 'my_orders')).orders[0].items, [visible]);
+});
+
+test('OUT-02 业务错误码回显短会员编号或券实例时，两条审计路径都不写原值', async t => {
+  const r = await setup(t);
+  const s = await r.session();
+  const member = '842913';
+  r.mock.override.set(PATHS.member, () => ok({customerId:member}));
+  await bind(s);
+  r.mock.couponRows = [{...available, customerId:member}];
+  for (const code of [member, shortId, 100002]) {
+    r.mock.override.set(PATHS.create, () => ({status:false, code:Number(code), message:'受限' + member + '券' + shortId}));
+    const reason = await failure(s, 'place_order', argsFor(await prepare(s)), /下单失败/);
+    assert.ok(reason.includes('受限***券***'));
+  }
+  for (const [file, field] of [['upstream','code'], ['write','qmaiCode']]) {
+    const rows = (await readFile(join(r.logDir, file + '.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
+      .filter(row => row.outcome === 'business' || row.reason === 'business');
+    assert.deepEqual(rows.map(row => row[field]), [undefined, undefined, 100002]);
+  }
+});
+
+test('OUT-02 缓存命中时按本次查询的会员投影商品名，设备之间各自独立', async t => {
+  const r = await setup(t);
+  const member = '742891';
+  r.mock.override.set(PATHS.member, () => ok({customerId:member}));
+  r.mock.override.set(PATHS.item, () => ok([{goodsId, name:'茶' + member, status:10, type:1,
+    goodsSkuList:[{skuId, salePrice:2000}]}]));
+  const bound = await r.session();
+  await bind(bound);
+  const guest = await r.session();
+  const args = {storeId:shop, goodsId};
+  assert.equal((await success(bound, 'get_item_detail', args)).name, '茶***');
+  assert.equal((await success(guest, 'get_item_detail', args)).name, '茶' + member);
+  assert.equal((await success(bound, 'get_item_detail', args)).name, '茶***');
+  assert.equal(count(r, PATHS.item), 1);
+});
+
+test('OUT-02 失败读回携带优惠明细时，错误文案和错误码也遮盖新揭示的券实例', async t => {
+  const {r, s, m} = await withBound(t);
+  const newlyRead = '8549106';
+  m.override.set(PATHS.orderDetail, () => ({status:false, code:Number(newlyRead),
+    message:'失效券' + newlyRead, data:{discountList:[{discountType:2, discountId:newlyRead}]}}));
+  const result = await place(s, await prepare(s));
+  assert.match(result.readbackNote, /失效券\*\*\*/);
+  assert.ok(!JSON.stringify(result).includes(newlyRead));
+  const rows = (await readFile(join(r.logDir, 'upstream.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  const error = rows.find(row => row.path === PATHS.orderDetail && row.outcome === 'business');
+  assert.ok(error);
+  assert.equal(error.code, undefined);
 });

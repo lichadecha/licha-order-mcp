@@ -31,7 +31,6 @@ const noChallenge = '还没给这个手机号发过验证码，或者之前那�
 
 export function createBindingFlow({config, qmai, book, logs, unresolved, discardDrafts, expireDrafts}) {
   const devices = new Map();
-  const current = device => devices.get(device)?.current;
   const challenges = new Map();
   const queuedChecks = new Map();
   const bindTimes = new Map();
@@ -49,17 +48,32 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     };
   }
 
+  function removeVerified(device, state, binding) {
+    state.verified.delete(binding.phone);
+    if (state.current === binding) {
+      state.current = undefined;
+      expireDrafts(device, binding.hash);
+    }
+    if (!state.verified.size) devices.delete(device);
+  }
+
+  function expired(binding, now) {
+    return now - binding.created >= config.LICHA_BINDING_MAX_AGE_MS ||
+      (!binding.busy && now - binding.touched > config.LICHA_BINDING_IDLE_TTL_MS);
+  }
+
+  function current(device) {
+    const state = devices.get(device);
+    const binding = state?.current;
+    if (!binding || !expired(binding, Date.now())) return binding;
+    removeVerified(device, state, binding);
+  }
+
   function sweep(now) {
     for (const [device, state] of devices) {
       for (const binding of state.verified.values()) {
-        if (binding.busy || now - binding.touched <= config.LICHA_BINDING_IDLE_TTL_MS) continue;
-        state.verified.delete(binding.phone);
-        if (state.current === binding) {
-          state.current = undefined;
-          expireDrafts(device, binding.hash);
-        }
+        if (expired(binding, now)) removeVerified(device, state, binding);
       }
-      if (!state.verified.size) devices.delete(device);
     }
     for (const [device, times] of bindTimes) if (times.at(-1) <= now - 3600000) bindTimes.delete(device);
     for (const [device, challenge] of challenges) {
@@ -108,22 +122,48 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     local.push(now);
     bindTimes.set(source.device, local);
     globalBindTimes.push(now);
-    let data;
+    let member;
     try {
-      data = await qmai.read(PATHS.member, { customerCode:{code:source.phone, type:1} });
+      member = await readMember(source.phone);
     } catch (error) {
       reject(source, error.kind, error.kind === 'credentials' ? error.message : bindFailed);
     }
+    if (!member) reject(source, 'not_member', notMember);
+    return member;
+  }
+
+  async function readMember(phone, options) {
+    const data = await qmai.read(PATHS.member, { customerCode:{code:phone, type:1} }, options);
     const wrapped = data !== null && typeof data === 'object' && Object.hasOwn(data, 'customerId');
     const value = wrapped ? data.customerId : data;
     const digits = integerDigits(value);
     if ((wrapped && value === null) || digits === '0' || (typeof value === 'string' && /^0*$/.test(value.trim()))) {
-      reject(source, 'not_member', notMember);
+      return null;
     }
     const id = decimalId(digits);
-    if (!id) reject(source, 'invalid_response', bindFailed);
+    if (!id) throw Object.assign(Error(bindFailed), {kind:'invalid_response'});
     const displayId = typeof value === 'string' && /^\d+$/.test(value) ? value : id;
     return {id, customerIdTail:tail(displayId)};
+  }
+
+  async function recheckMember(device, binding, couponIds) {
+    const source = {device, memberId:binding.id};
+    let member;
+    try {
+      member = await readMember(binding.phone, {retry:false, couponIds});
+    } catch {
+      logs.access({event:'order_member_recheck', outcome:'failed'}, source);
+      return 'failed';
+    }
+    const outcome = member?.id === binding.id ? 'matched' : 'changed';
+    if (outcome === 'changed') {
+      for (const [otherDevice, state] of devices) {
+        const verified = state.verified.get(binding.phone);
+        if (verified) removeVerified(otherDevice, state, verified);
+      }
+    }
+    logs.access({event:'order_member_recheck', outcome}, source);
+    return outcome;
   }
 
   function rejectExpired(source) {
@@ -180,7 +220,6 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     const {device} = source;
     const same = previous?.id === binding.id;
     if (!same) guardRebind(source, previous);
-    binding.created ??= Date.now();
     if (same) {
       if (exempt) logs.access({event:'bind', reason:'sms_exempt'}, source);
       else logs.access({event:'bind', reason:'same_member'}, {device, memberId:binding.id});
@@ -201,10 +240,11 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
         (discarded ? `原来那位顾客还没确认的 ${discarded} 张单已作废，需要重新组单。` : '') };
   }
 
-  function finish(source, previous, {id, customerIdTail}) {
+  function finish(source, {id, customerIdTail}, verifiedAt) {
     const {device, phone} = source;
+    const previous = current(device);
     const binding = {id, hash:digest(id), customerIdTail, identifierTail:tail(phone),
-      phone, via:'phone', touched:Date.now()};
+      phone, via:'phone', touched:verifiedAt, created:verifiedAt};
     const state = devices.get(device) ?? {verified:new Map(), current:undefined};
     devices.set(device, state);
     // 短信通过即记住号码；能否换人还要按原会员此刻的未决状态判断。
@@ -212,7 +252,7 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     return activate(source, previous, binding, false);
   }
 
-  async function verify(source, rawCaptcha, previous, arrivedAt) {
+  async function verify(source, rawCaptcha, arrivedAt) {
     const {device, phone} = source;
     const challenge = challenges.get(device);
     if (!challenge || challenge.phoneHash !== source.phoneHash) {
@@ -231,6 +271,7 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
       reject(source, 'check_failed', '验证码暂时没校验成功（是我们这边的问题），这条验证码仍然有效，请稍等几秒再试一次。');
     }
     if (result === true) {
+      const verifiedAt = Date.now();
       challenges.delete(device);
       logs.access({event:'sms_check', outcome:'passed'}, source);
       try {
@@ -238,7 +279,7 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
       } catch {
         reject(source, 'ledger_fault', '验证码已校验通过，但安全账本写入失败，本次未完成绑定。请直接在小程序里下单。');
       }
-      return finish(source, previous, challenge);
+      return finish(source, challenge, verifiedAt);
     }
     const remaining = config.LICHA_SMS_MAX_WRONG - ++challenge.wrong;
     const outcome = result === false ? 'wrong' : 'unrecognized';
@@ -259,9 +300,8 @@ export function createBindingFlow({config, qmai, book, logs, unresolved, discard
     if (!/^\d{11}$/.test(phone)) {
       reject({device}, 'format', `code 格式不正确：codeType=phone 要求去除空白后为 11 位纯数字（收到长度：${[...phone].length}，是否全为数字：${/^\d+$/.test(phone) ? '是' : '否'}）`);
     }
-    const previous = current(device);
     const source = {device, phone, phoneHash:book.phoneHash(phone)};
-    return captcha === undefined ? send(source, previous) : verify(source, captcha, previous, arrivedAt);
+    return captcha === undefined ? send(source, current(device)) : verify(source, captcha, arrivedAt);
   }
-  return {bind, current, sweep, holdVerification};
+  return {bind, current, sweep, holdVerification, recheckMember};
 }

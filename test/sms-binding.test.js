@@ -6,7 +6,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {createBindingFlow} from '../server/binding.js';
 import {digest} from '../server/common.js';
 import {PATHS} from '../server/qmai.js';
-import {argsFor, bind, bookFile, count, failure, memberA, number, ok, phone, phoneB, place, prepare, setup, success} from '../test-support/commerce.js';
+import {argsFor, bind, bookFile, count, failure, memberA, memberB, number, ok, phone, phoneB, place, prepare, setup, success} from '../test-support/commerce.js';
 import {mockCaptcha} from '../test-support/rig.js';
 
 const args = (code, captcha) => ({code, codeType:'phone', ...(captcha !== undefined && {captcha})});
@@ -117,9 +117,10 @@ test('BND-05/09/15 同会员另一号码验证后保留原绑定和订单，换�
   const r = await setup(t, {LICHA_RATE_BINDS_PER_DEVICE_PER_HOUR:'3', LICHA_RATE_BINDS_GLOBAL_PER_MIN:'3'});
   const s = await r.session(), sameDevice = await r.session(s.device);
   const alias = '13800007777';
+  const members = new Map([[phone, memberA], [alias, memberA], [phoneB, memberB]]);
+  r.mock.override.set(PATHS.member, ({customerCode}) => ok({customerId:members.get(customerCode.code) ?? null}));
   const first = await bind(s);
   const draft = await prepare(s);
-  r.mock.override.set(PATHS.member, () => ok({customerId:'9000000000000001234'}));
   const same = await bind(s, alias);
   assert.deepEqual(same.member, first.member);
   assert.equal(same.boundAt, first.boundAt);
@@ -129,7 +130,6 @@ test('BND-05/09/15 同会员另一号码验证后保留原绑定和订单，换�
   assert.equal(r.requests.length, before);
   await place(s, draft);
   assert.equal(r.requests.find(row => row.path === PATHS.create).params.mobile, phone);
-  r.mock.override.delete(PATHS.member);
   const other = await bind(s, phoneB);
   const limitReached = r.requests.length;
   await denied(s, '13900000001', undefined, /绑定尝试太频繁/);

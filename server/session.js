@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import {
   Server, StreamableHTTPServerTransport, CallToolRequestSchema, InitializeRequestSchema, ListToolsRequestSchema
 } from './protocol-runtime.js';
-import { decimalId, uuidPattern } from './common.js';
-import { tools, validators } from './tools.js';
+import { decimalId, uuidPattern, withMemberText } from './common.js';
+import { maxStoreId, tools, validators } from './tools.js';
 
 function json(res,status,body,headers = {}) {
   res.writeHead(status,{'content-type':'application/json; charset=utf-8',...headers});
@@ -108,7 +108,7 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
           return toolError('place_order 只接受 confirmToken 与 confirmAmountYuan 两个参数（收到多余的：' + path + '）。会员身份只能由服务端按设备绑定注入，不接受调用方传入。');
         }
       }
-      if (!validators.get(name)(args) || (Object.hasOwn(args,'storeId') && !decimalId(args.storeId))) {
+      if (!validators.get(name)(args) || (Object.hasOwn(args,'storeId') && Number(args.storeId) > maxStoreId)) {
         if (name === 'place_order') commerce.logPlaceRejection('invalid_arguments',args.confirmToken,s.device);
         if (name === 'bind_member') logs.access({event:'bind_rejected',reason:'invalid_arguments'},source);
         return toolError('工具参数的类型、取值或必填字段不符合要求。');
@@ -117,8 +117,8 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
         // 与上游发送的十进制编号一致，供门店名录、缓存和未决核对共用。
         const input = Object.hasOwn(args,'storeId')
           ? {...args,storeId:decimalId(args.storeId)} : args;
-        const result = browsing.has(name)
-          ? await browse.call(name,input) : await commerce.call(name,input,s.device,now);
+        const result = await withMemberText(commerce?.currentBinding(s.device), () => browsing.has(name)
+          ? browse.call(name,input) : commerce.call(name,input,s.device,now));
         return {content:[{type:'text',text:JSON.stringify(result,null,2)}]};
       } catch (error) {
         return toolError(error.message);
@@ -131,7 +131,7 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
 
   async function handle(req,res) {
     if (req.url === '/healthz' && req.method === 'GET') {
-      return json(res,200,{ok:true,version,ordering:!!commerce});
+      return json(res,200,{ok:true,version,ordering:!!commerce,...(commerce && {ledger:commerce.ledgerStatus})});
     }
     if (req.url !== '/mcp') return reject(res,404,'路径不存在。');
     const access = req.headers['x-licha-access'];

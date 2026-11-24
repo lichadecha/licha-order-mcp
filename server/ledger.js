@@ -11,10 +11,10 @@ import { orderNumber } from './commerce-view.js';
 
 const bookName = 'orders.sqlite';
 const initialName = '.orders-init.sqlite';
-const formatVersion = 5;
+const formatVersion = 6;
 const hourMs = 3600_000;
 const dayMs = 24 * hourMs;
-const filledColumn = 'filled INTEGER NOT NULL DEFAULT 0 CHECK (filled IN (0, 1))';
+const filledColumn = 'filled INTEGER CHECK (filled IN (0, 1))';
 const smsSchema = `CREATE TABLE sms_sends (
   phone_hash TEXT NOT NULL, sent_at INTEGER NOT NULL, checksum TEXT NOT NULL,
   ${filledColumn},
@@ -44,8 +44,8 @@ export function consumeSmsReceipt(receipt, attempt, phone) {
 }
 
 function smsChecksum(phoneHash, time, filled = 0) {
-  // 未回填沿用旧格式校验和；成功回填时连同状态一起更新。
-  return digest(phoneHash + ':' + time + (filled ? ':filled' : ''));
+  const suffix = filled === null ? ':unknown' : filled === 1 ? ':filled' : '';
+  return digest(phoneHash + ':' + time + suffix);
 }
 
 function smsLimits(times, config, now, midnight, globalDayFull) {
@@ -80,9 +80,10 @@ function createSmsTables(db) {
 
 function verifySmsRecords(db, version) {
   const filled = version >= 5 ? 'filled' : '0 AS filled';
+  const allowedStates = version >= 6 ? [0, 1, null] : [0, 1];
   for (const row of db.prepare(`SELECT phone_hash, sent_at, checksum, ${filled} FROM sms_sends`).iterate()) {
     if (!isDigest(row.phone_hash) || !Number.isSafeInteger(row.sent_at) || row.sent_at <= 0
-      || ![0, 1].includes(row.filled) || row.checksum !== smsChecksum(row.phone_hash, row.sent_at, row.filled)) {
+      || !allowedStates.includes(row.filled) || row.checksum !== smsChecksum(row.phone_hash, row.sent_at, row.filled)) {
       throw Error('发码记录损坏');
     }
   }
@@ -161,7 +162,7 @@ export class Ledger {
       this.db = new DatabaseSync(this.file);
       this.db.exec('PRAGMA synchronous=FULL');
       const version = this.db.prepare('PRAGMA user_version').get().user_version;
-      if (![2, 3, 4, formatVersion].includes(version)) {
+      if (![2, 3, 4, 5, formatVersion].includes(version)) {
         this.faultReason = cutover;
         throw Error(cutover);
       }
@@ -177,12 +178,17 @@ export class Ledger {
       }
       if (version >= 3) verifySmsRecords(this.db, version);
       if (version < formatVersion) {
-        // v2 无发码表；v3 的无密钥摘要无法换算；v4 的 HMAC 和限频记录原样保留。
+        // v2 无发码表，v3 的无密钥摘要无法换算。v5 已有回填状态，原样保留。
         if (version === 3) this.db.exec('PRAGMA secure_delete=ON');
         this.db.exec('BEGIN IMMEDIATE');
         if (version === 4) {
           this.db.exec(`ALTER TABLE sms_sends ADD COLUMN ${filledColumn}`);
-        } else {
+          // v4 只知道发过码。NULL 表示回填情况未知，校验和也要区分未知与未填。
+          const update = this.db.prepare('UPDATE sms_sends SET checksum=? WHERE phone_hash=? AND sent_at=?');
+          for (const {phone_hash, sent_at} of this.db.prepare('SELECT phone_hash, sent_at FROM sms_sends').all()) {
+            update.run(smsChecksum(phone_hash, sent_at, null), phone_hash, sent_at);
+          }
+        } else if (version < 4) {
           if (version === 3) this.db.exec('DROP TABLE sms_sends');
           createSmsTables(this.db);
         }
@@ -286,7 +292,8 @@ export class Ledger {
         const globalDayFull = total >= config.LICHA_SMS_GLOBAL_PER_DAY;
         const limits = smsLimits(history.map(row => row.sent_at), config, now, midnight, globalDayFull);
         const {expiredCount, unfilledCount} = this.db.prepare(`SELECT count(*) AS expiredCount,
-          count(*) FILTER (WHERE filled=0) AS unfilledCount FROM sms_sends WHERE sent_at BETWEEN ? AND ?`)
+          count(*) FILTER (WHERE filled=0) AS unfilledCount FROM sms_sends
+          WHERE filled IS NOT NULL AND sent_at BETWEEN ? AND ?`)
           .get(windowStart, now - config.LICHA_SMS_CODE_TTL_SEC * 1000);
         const braking = expiredCount >= config.LICHA_SMS_BRAKE_MIN_SAMPLE
           && unfilledCount * 100 > expiredCount * config.LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT;
@@ -326,7 +333,7 @@ export class Ledger {
     // 查询会员期间，其他设备可能已给同一号码发码，落盘前须重新检查。
     this.#withSmsAllowance(phoneHash, config, now, cutoff => {
       this.db.prepare('DELETE FROM sms_sends WHERE sent_at<=?').run(cutoff);
-      this.db.prepare('INSERT INTO sms_sends (phone_hash, sent_at, checksum) VALUES (?, ?, ?)')
+      this.db.prepare('INSERT INTO sms_sends (phone_hash, sent_at, checksum, filled) VALUES (?, ?, ?, 0)')
         .run(phoneHash, now, smsChecksum(phoneHash, now));
     });
     const receipt = Object.freeze({});

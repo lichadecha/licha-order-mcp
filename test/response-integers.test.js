@@ -101,7 +101,7 @@ test('R23 纯数字字符串创建成功，同号裸数详情和状态回执均�
   assert.equal(receipt.readbackFailed, true);
   assert.equal(receipt.qmaiActualAmountYuan, undefined);
   m.override.set(PATHS.orderStatus, () => ok(numericRow));
-  await failure(s, 'get_order_status', { orderNo }, /订单号与查询不符/);
+  await failure(s, 'get_order_status', { orderNo }, /读回的不是这一单/);
   m.override.set(PATHS.orderStatus, () => ok({ ...numericRow, orderNo }));
   assert.equal((await success(s, 'get_order_status', { orderNo })).status, 10);
 });

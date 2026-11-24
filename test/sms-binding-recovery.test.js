@@ -171,11 +171,18 @@ test('BND-12 两台设备并发给同一号发码仅放行一条，模拟企迈�
 test('LED-02/BND-12 运行中写入失败或重启发现发码表缺失，bind_member 均不发送短信', async t => {
   const r = await setup(t);
   const s = await r.session();
+  async function checkHealth(ledger) {
+    const response = await fetch(r.url + '/healthz');
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {ok:true, version:s.handshake.serverInfo.version, ordering:true, ledger});
+  }
+  await checkHealth('ok');
   const db = new DatabaseSync(bookFile(r));
   try {
     db.exec(`CREATE TRIGGER sms_write_failure BEFORE INSERT ON sms_sends
       BEGIN SELECT RAISE(ABORT, 'write failed'); END`);
     await failure(s, 'bind_member', args, /安全账本不可用，暂时不能发验证码/);
+    await checkHealth('fault');
     db.exec('DROP TRIGGER sms_write_failure');
     await failure(s, 'bind_member', args, /安全账本不可用，暂时不能发验证码/);
     assert.equal(db.prepare('SELECT count(*) AS n FROM sms_sends').get().n, 0);
@@ -183,6 +190,7 @@ test('LED-02/BND-12 运行中写入失败或重启发现发码表缺失，bind_m
     db.exec('DROP TABLE sms_sends');
   } finally { db.close(); }
   await r.start();
+  await checkHealth('fault');
   await failure(await r.session(), 'bind_member', args, /安全账本不可用，暂时不能发验证码/);
   assert.equal(count(r, PATHS.smsSend), 0);
   assert.equal(count(r, PATHS.smsCheck), 0);

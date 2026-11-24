@@ -1,7 +1,7 @@
 import { createBindingFlow, memberView } from './binding.js';
 import { isDeepStrictEqual } from 'node:util';
 import { currentQuotaDay, issueConfirmation } from './logs.js';
-import { beijingTime, couponInstanceId, couponTextMask, decimalId, digest, responseId, yuan } from './common.js';
+import { beijingTime, couponInstanceId, identifierTextMask, decimalId, digest, responseId, yuan } from './common.js';
 import { PATHS, readHint } from './qmai.js';
 import { Ledger } from './ledger.js';
 import { couponView, levelView, listedProducts, sameProducts, nonnegativeInteger, pendingCount, orderNumber, orderView, placedView, pointsView, reconciledPaymentNote, rowTime, statusView, toFen } from './commerce-view.js';
@@ -137,7 +137,8 @@ export async function createCommerce(config, qmai, browse, logs) {
         rows = Array.isArray(data) ? data : data?.list;
       } catch { /* couponView 按选择处理未查到的券信息 */ }
     }
-    const maskCouponIds = couponTextMask(rows);
+    const couponIds = Array.isArray(rows) ? rows.map(row => row?.id) : [];
+    const maskCouponIds = identifierTextMask(couponIds);
     const { coupons, chosenId } = couponView(rows, totalFen, !store || hasCode, couponChoice, b, selected, maskCouponIds);
     if (coupons.autoPicked) {
       Object.assign(params, couponFields(couponChoice, chosenId));
@@ -146,10 +147,11 @@ export async function createCommerce(config, qmai, browse, logs) {
     const paramsJson = JSON.stringify(params);
     if (book.fault) throw Error(bookProblem);
     const now = Date.now();
+    requireBinding('prepare_order', device);
     const confirmation = issueConfirmation();
     const confirmToken = confirmation.token;
     const discarded = supersede(draft => draft.hash === b.hash);
-    drafts.set(confirmToken, { confirmation, paramsJson, couponChoice, maskCouponIds,
+    drafts.set(confirmToken, { confirmation, paramsJson, couponChoice, couponIds,
       ...(chosenId && { chosenCoupon: { id: chosenId, ...coupons.chosen } }),
       totalFen, products: productEvidence, storeId, hash: b.hash,
       device, expires: now + tokenTtl, state: 'ready' });
@@ -197,18 +199,22 @@ export async function createCommerce(config, qmai, browse, logs) {
       log('rejected', reason);
       throw Error(message);
     }
-    let b;
-    try { b = requireBinding('place_order', device); } catch (e) { reject('WRT-02', e.message); }
-    source.memberId = b.id;
-    const draft = deviceDraft(confirmToken, device);
-    if (!draft) reject('WRT-03', missingToken);
-    source.confirmation = draft.confirmation;
-    audit.couponChoice = draft.couponChoice;
-    if (start >= draft.expires) reject('WRT-03', `确认令牌已过期（有效期 ${minutes} 分钟）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。`);
-    if (draft.state === 'replaced') reject('WRT-03', replaced);
-    if (draft.state === 'submitted') reject('WRT-03', missingToken);
-    if (draft.hash !== b.hash) reject('WRT-04', '这张待确认单不属于当前绑定的会员，已拒绝。请重新用 prepare_order 组单。');
-    if (draft.state !== 'ready') reject('WRT-03', missingToken);
+    function checkDraft(now) {
+      let b;
+      try { b = requireBinding('place_order', device); } catch (e) { reject('WRT-02', e.message); }
+      source.memberId = b.id;
+      const draft = deviceDraft(confirmToken, device);
+      if (!draft) reject('WRT-03', missingToken);
+      source.confirmation = draft.confirmation;
+      audit.couponChoice = draft.couponChoice;
+      if (now >= draft.expires) reject('WRT-03', `确认令牌已过期（有效期 ${minutes} 分钟）：请重新调用 prepare_order 组单，把新的待确认单念给顾客确认。`);
+      if (draft.state === 'replaced') reject('WRT-03', replaced);
+      if (draft.state === 'submitted') reject('WRT-03', missingToken);
+      if (draft.hash !== b.hash) reject('WRT-04', '这张待确认单不属于当前绑定的会员，已拒绝。请重新用 prepare_order 组单。');
+      if (draft.state !== 'ready') reject('WRT-03', missingToken);
+      return {b, draft};
+    }
+    const {b, draft} = checkDraft(start);
     const key = digest(confirmToken);
     const params = JSON.parse(draft.paramsJson);
     Object.assign(audit, { storeId: draft.storeId, totalFen: draft.totalFen,
@@ -218,13 +224,24 @@ export async function createCommerce(config, qmai, browse, logs) {
     const amount = toFen(confirmAmountYuan);
     if (amount === null || Math.abs(amount - draft.totalFen) > 1) reject('WRT-05',
       `复述金额与待确认单不一致：你报的是 ¥${amount === null ? '超出范围' : yuan(amount)}，待确认单是 ¥${yuan(draft.totalFen)}。请按待确认单的金额重新向顾客确认，不要凭记忆报数。`);
-    if (book.fault) reject('WRT-06', bookProblem);
-    const pending = unresolved(b.hash);
-    if (pending.length) reject('WRT-07', `上一次下单请求的结果还没有核对清楚（${pendingCount(pending)}），暂不放行新的下单。\n那次请求可能已经在企迈侧真的建了单——现在直接重下会变成两单、扣两次钱。\n请先调用 my_orders（查最近订单）核对企迈侧到底有没有那一单：\n　· 已经有那一单 → 不要再下，直接引导顾客去小程序付款；\n　· 确实没有那一单 → 核对动作本身会解除这道闸门，再重新走一次 prepare_order 组单即可。`);
+    function checkLedger() {
+      if (book.fault) reject('WRT-06', bookProblem);
+      const pending = unresolved(b.hash);
+      if (pending.length) reject('WRT-07', `上一次下单请求的结果还没有核对清楚（${pendingCount(pending)}），暂不放行新的下单。\n那次请求可能已经在企迈侧真的建了单——现在直接重下会变成两单、扣两次钱。\n请先调用 my_orders（查最近订单）核对企迈侧到底有没有那一单：\n　· 已经有那一单 → 不要再下，直接引导顾客去小程序付款；\n　· 确实没有那一单 → 核对动作本身会解除这道闸门，再重新走一次 prepare_order 组单即可。`);
+    }
+    checkLedger();
     const limit = config.LICHA_MAX_ORDER_AMOUNT_FEN;
     if (!(draft.totalFen > 0) || (limit > 0 && draft.totalFen > limit)) reject('WRT-08', limit > 0
       ? `单笔金额超上限（¥${yuan(limit)}），已拒绝下单。请减少商品后重新组单。`
       : '预估总额必须大于 0 元，已拒绝下单。请重新组单。');
+    const rechecked = await bindingFlow.recheckMember(device, b, draft.couponIds);
+    if (rechecked === 'changed') reject('WRT-22_changed',
+      '这个手机号在李茶的会员信息有变化，为了安全需要重新验证，这次没有下单。请先只带手机号调用一次 bind_member，让系统发验证码。');
+    if (rechecked === 'failed') reject('WRT-22_failed',
+      '暂时没法核对会员信息（不是你的号有问题），这次没有下单。请稍等一下再试。');
+    // 等待企迈时，别的设备可能组了新单、撤销绑定，或留下了一笔未决。
+    checkDraft(Date.now());
+    checkLedger();
     if ([...flights.values()].some(row => row.memberHash === b.hash)) reject('WRT-09_in_flight',
       '这位会员的上一笔下单还在处理中，请等它有结果后再试，不要重复提交。');
     const reservation = currentQuotaDay();
@@ -254,7 +271,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       catch (error) { reject('WRT-10', error.message); }
       let recorded = false;
       try {
-        created = await qmai.write(PATHS.create, params, { maskCouponIds: draft.maskCouponIds, beforeSend(attempt) {
+        created = await qmai.write(PATHS.create, params, { couponIds: draft.couponIds, beforeSend(attempt) {
           record.time = Date.now();
           const receipt = book.recordSending(record, attempt);
           recorded = true;
@@ -273,7 +290,7 @@ export async function createCommerce(config, qmai, browse, logs) {
         if (error.kind === 'business') {
           const hint = { 110004: '验签失败，检查凭证配置', 100002: '参数格式不对', 100007: '搜索词为空或不支持' }[error.code] || '接口暂时异常，换个问法试试';
           try { book.update({ ...record, state: 'failed' }); } catch { /* 重启后可能仍是未决，当场应返回上游的明确失败。 */ }
-          log('failed', 'business', { qmaiCode: error.code, messageLength: error.messageLength });
+          log('failed', 'business', { qmaiCode: error.auditCode, messageLength: error.messageLength });
           throw Error(`下单失败：${error.message || '未知错误'}（${hint}）。这一单没有创建，可以调整后重新组单。`);
         }
         try { book.update({ ...record, state: 'unknown', reason: error.kind || 'invalid' }); }
@@ -290,7 +307,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     }
     let detail, readError;
     try { detail = await qmai.read(PATHS.orderDetail, { orderNo: created.orderNo, bizType: 5, userId: b.id },
-      { maskCouponIds: draft.maskCouponIds }); }
+      { couponIds: draft.couponIds }); }
     catch (error) { readError = queryError(error, '响应为空'); }
     const result = placedView(created, detail, readError, draft, b);
     if (result.readbackFailed) {
@@ -310,12 +327,14 @@ export async function createCommerce(config, qmai, browse, logs) {
     catch (error) { throw Error(queryError(error, '查询失败：查无此单或接口异常')); }
     if (!row || typeof row !== 'object') throw Error('查询失败：查无此单或接口异常');
     const receiptOrderNo = orderNumber(row);
-    if (Object.hasOwn(row, 'orderNo') && !receiptOrderNo) throw Error('查询失败：返回的订单号与查询不符');
+    if (Object.hasOwn(row, 'orderNo') && receiptOrderNo !== orderNo) {
+      throw Error('无法查询：门店系统读回的不是这一单，请核对订单号后再试。');
+    }
     if (owner(row) !== b.id) {
       logs.access({event:'ownership_rejected', orderNo}, {device,memberId:b.id});
       throw Error('无法查询：该订单不属于当前绑定的会员');
     }
-    const result = { orderNo: receiptOrderNo || orderNo, ...statusView(row.status, true) };
+    const result = { ...(receiptOrderNo && {orderNo:receiptOrderNo}), ...statusView(row.status, true) };
     const pending = unresolved(b.hash);
     if (pending.length) Object.assign(result, { unresolvedPendingWrites: pending.length,
       pendingWriteNote: '此前有下单请求结果未知、下单闸门仍然关着。这一次按单号查到的单不能用来核对那笔请求——订单状态接口的回执里没有下单时间，无法判断它是不是那一次建出来的。请改用 my_orders（按时间段列最近订单）核对，那条路径带下单时间。' });
@@ -352,16 +371,16 @@ export async function createCommerce(config, qmai, browse, logs) {
     if (!Array.isArray(data?.data)) throw Error('查询订单列表失败：接口异常');
     const visible = [];
     let outOfRange = 0, discarded = 0, unverifiedNotShown = 0;
-    let hasMissingOwner = false;
+    let allRowsOwned = true;
     for (const row of data.data) {
       const missingOwner = row?.userId === undefined;
-      // 即使时间越界，归属缺失也意味着上游可能给错了页，不能据此判无单。
-      if (missingOwner) hasMissingOwner = true;
+      const owned = owner(row) === b.id;
+      if (!owned) allRowsOwned = false;
       const time = rowTime(row);
       if (time !== null && (time < start || time > end)) outOfRange++;
       else if (!orderNumber(row)) discarded++;
       else if (missingOwner) unverifiedNotShown++;
-      else if (owner(row) !== b.id) discarded++;
+      else if (!owned) discarded++;
       else visible.push(row);
     }
     if (outOfRange) logs.access({event:'orders_out_of_range', count:outOfRange}, {device,memberId:b.id});
@@ -379,7 +398,7 @@ export async function createCommerce(config, qmai, browse, logs) {
       store: Object.hasOwn(row, 'storeId') ? responseId(row.storeId) : undefined
     }));
     const distinctOrderNos = new Set(evidence.filter(entry => entry.time !== null).map(entry => entry.row.orderNo));
-    const complete = total !== null && total <= distinctOrderNos.size && !discarded && !hasMissingOwner
+    const complete = total !== null && total <= distinctOrderNos.size && !discarded && allRowsOwned
       && evidence.every(entry => entry.time !== null && entry.store !== null && entry.products !== null);
     const known = book.knownOrders();
     const found = [];
@@ -438,16 +457,18 @@ export async function createCommerce(config, qmai, browse, logs) {
         const handler = { prepare_order: prepare, get_order_status: status, my_orders: orders, my_member_info: memberInfo }[name];
         result = await handler(args, binding, device);
       }
-      if (name !== 'bind_member' || result.bound) bindingFlow.current(device).touched = Date.now();
+      const active = bindingFlow.current(device);
+      if (active && (name !== 'bind_member' || result.bound)) active.touched = Date.now();
       return result;
     } finally {
       if (current) current.busy = false;
     }
   }
-  const cleanup = setInterval(() => sweep(Date.now()), Math.min(60000, tokenTtl, config.LICHA_BINDING_IDLE_TTL_MS)).unref();
+  const cleanup = setInterval(() => sweep(Date.now()), Math.min(60000, tokenTtl, config.LICHA_BINDING_IDLE_TTL_MS, config.LICHA_BINDING_MAX_AGE_MS)).unref();
   function isDeviceCouponRef(device, key) {
     return !!bindingFlow.current(device)?.couponRefs.get(key);
   }
-  return { call, holdVerification:bindingFlow.holdVerification, logPlaceRejection, isDeviceCouponRef,
+  return { call, currentBinding:bindingFlow.current, holdVerification:bindingFlow.holdVerification, logPlaceRejection, isDeviceCouponRef,
+    get ledgerStatus() { return book.fault ? 'fault' : 'ok'; },
     close() { clearInterval(cleanup); book.close(); } };
 }

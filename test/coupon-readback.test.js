@@ -87,7 +87,7 @@ test('WRT-18/20/21 四种读回失败都丢弃金额和优惠，按顾客用券�
   }
 });
 
-test('WRT-17 默认未挑券时仅对读回的优惠条目作说明', () => {
+test('WRT-17 默认未挑券时明确零优惠不带说明，有优惠条目逐项说明', () => {
   const orderNo = number(1);
   const draft = { totalFen: 2000, couponChoice: 'default' };
   const detail = { orderNo, userId: memberA, actualAmount: 2000, discountAmount: 0 };
@@ -297,10 +297,6 @@ test('WRT-17/20/21 三种用券选择遇到非数组明细时，即使合计为�
       const applied = choice === 'specific'
         ? specificReceipt({ discountList, discountAmount: 0 }).couponApplied
         : readDiscounts(choice, discountList, 0);
-      if (choice === 'default') {
-        assert.equal(applied, undefined);
-        continue;
-      }
       assert.deepEqual(applied.items, []);
       assert.equal(Object.hasOwn(applied, 'matchesPrediction'), false);
       assert.equal(Object.hasOwn(applied, 'matchesChoice'), false);

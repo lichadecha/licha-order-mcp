@@ -275,7 +275,7 @@ test('安全读回和优惠证据 WRT-15/16/17/18/19', async t => {
   assert.equal(zeroDiscount.couponApplied, undefined);
   const missing = await orderWith(row => ({...row,actualAmount:1899,discountAmount:null}));
   assert.ok(missing.warning);
-  assert.equal(missing.couponApplied, undefined);
+  assert.deepEqual(missing.couponApplied, {items:[], note:'读回里没取到优惠明细，无法确认这单有没有用券或其他优惠；请按读回实付如实告知，如有疑问请顾客在小程序「我的订单」核对。'});
   const noncoupon = await orderWith(row => ({...row,actualAmount:1900,discountAmount:100,
     discountList:[{discountType:3,discountAmount:100,discountName:'满减'}]}));
   assert.equal(Object.hasOwn(noncoupon.couponApplied, 'matchesPrediction'), false);
@@ -434,7 +434,7 @@ test('发送前账本故障时停止创建、已绑定仍可查单、重启后�
   await failure(second,'place_order',argsFor(b),/安全账本不可用/);
   await failure(s,'prepare_order',basket,/安全账本不可用/);
   assert.equal((await success(s,'my_orders')).count,0);
-  assert.equal((await success(s,'get_order_status',{orderNo:number(1)})).orderNo, number(1));
+  assert.equal((await success(s,'get_order_status',{orderNo:number(1)})).status, 10);
   assert.equal(count(r,PATHS.create),0);
   const assertFault = async () => {
     await r.restart();

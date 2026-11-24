@@ -163,19 +163,24 @@ test('QRY-06 订单号不合 R23 时本地拒绝，不回显原值、不调用�
   assert.equal(r.requests.length, before);
 });
 
-test('QRY-02 QRY-06 状态接口优先返回本人回执单号，缺失时使用已校验的入参', async t => {
+test('QRY-02 QRY-06 即使同一会员，单号不符也拒绝读回', async t => {
   const { m, s } = await withBound(t);
   const orderNo = 'aB1234567890';
   const receiptOrderNo = number(2);
   m.override.set(PATHS.orderStatus, () => ok({ orderNo: receiptOrderNo, userId: memberA, status: 10 }));
-  assert.equal((await success(s, 'get_order_status', { orderNo })).orderNo, receiptOrderNo);
+  assert.equal(await failure(s, 'get_order_status', { orderNo }, /读回的不是这一单/),
+    '无法查询：门店系统读回的不是这一单，请核对订单号后再试。');
   m.override.set(PATHS.orderStatus, () => ok({ orderNo: receiptOrderNo, userId: memberB, status: 10 }));
-  const error = await failure(s, 'get_order_status', { orderNo }, /不属于/);
+  const error = await failure(s, 'get_order_status', { orderNo }, /读回的不是这一单/);
   assert.ok(!error.includes(receiptOrderNo));
   assert.doesNotMatch(error, /待支付|完成付款/);
-  m.override.delete(PATHS.orderStatus);
-  const longest = '9'.repeat(40);
-  assert.equal((await success(s, 'get_order_status', { orderNo: longest })).orderNo, longest);
+});
+
+test('QRY-06 状态回执不带单号时只返回已查到的状态', async t => {
+  const {s} = await withBound(t);
+  const result = await success(s, 'get_order_status', {orderNo:'9'.repeat(40)});
+  assert.equal(Object.hasOwn(result, 'orderNo'), false);
+  assert.equal(result.status, 10);
 });
 
 test('QRY-02/03 状态回执的单号已提供但不合格时，拒绝返回状态和付款提示', async t => {
@@ -183,13 +188,13 @@ test('QRY-02/03 状态回执的单号已提供但不合格时，拒绝返回状�
   const requested = number(1);
   for (const orderNo of [number(2) + ' ', [number(2)], null, '']) {
     m.override.set(PATHS.orderStatus, () => ok({ orderNo, userId: memberA, status: 10 }));
-    const error = await failure(s, 'get_order_status', { orderNo: requested }, /查询失败/);
+    const error = await failure(s, 'get_order_status', { orderNo: requested }, /读回的不是这一单/);
     assert.ok(!error.includes(number(2)));
     assert.doesNotMatch(error, /待支付|付款/);
   }
   const digits = '9000000000000001';
   m.override.set(PATHS.orderStatus, () => ok({ orderNo: JSON.rawJSON(digits), userId: memberA, status: 10 }));
-  await failure(s, 'get_order_status', { orderNo: digits }, /查询失败/);
+  await failure(s, 'get_order_status', { orderNo: digits }, /读回的不是这一单/);
   m.override.set(PATHS.orderStatus, () => ok({ orderNo: requested, userId: memberA, status: 10 }));
   assert.equal((await success(s, 'get_order_status', { orderNo: requested })).status, 10);
 });
@@ -280,6 +285,27 @@ test('UNR-04 总数为零，归属缺失的越界行仍阻止判无单，换成�
   const empty = await success(s, 'my_orders', { days: 1 });
   assert.equal(empty.resolvedPendingWrites, 1);
   assert.match(empty.pendingWriteNote, /企迈侧没有建单/);
+  assert.equal(bookRecords(r)[0].state, 'absent');
+});
+
+test('UNR-04 时段外出现他人订单时整页不能证明无单，换成本人的越界行才解除', async t => {
+  const service = await withBound(t, { LICHA_ORDER_MATCH_WINDOW_MS: '10' });
+  const { r, m, s } = service;
+  await unknownOrder(service);
+  await delay(20);
+  let outsideOwner = memberB;
+  m.override.set(PATHS.orderList, ({ orderAtStart }) => ok({
+    data: [candidate(orderAtStart + 60000), { ...candidate(orderAtStart - 1, 2), userId: outsideOwner }],
+    total: 1
+  }));
+  const pending = await success(s, 'my_orders', { days: 1 });
+  assert.deepEqual(pending.orders.map(row => row.orderNo), [number(1)]);
+  assert.equal(pending.discardedNotOwned, undefined);
+  assert.equal(pending.unresolvedPendingWrites, 1);
+  assert.equal(bookRecords(r)[0].state, 'unknown');
+  outsideOwner = memberA;
+  const resolved = await success(s, 'my_orders', { days: 1 });
+  assert.equal(resolved.resolvedPendingWrites, 1);
   assert.equal(bookRecords(r)[0].state, 'absent');
 });
 

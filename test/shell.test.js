@@ -120,6 +120,29 @@ async function newPort() {
   return port;
 }
 
+test('顾客零配置时薄壳使用说明书所列的正式端点，自动附上公开准入串', async t => {
+  const dir = await sandbox(t);
+  const endpoint = 'https://lichadecha.com/mcp';
+  const readme = await readFile(join(root, 'README.md'), 'utf8');
+  assert.ok(readme.includes(endpoint));
+  assert.doesNotMatch(readme, /待替换的占位地址|内置公开占位串/);
+  const local = await remote(t);
+  // 只检查薄壳原本要访问的端点，所有 HTTP 请求均送本机模拟服务。
+  const redirect = join(dir, 'mock-fetch.mjs');
+  await writeFile(redirect, `
+    const fetchLocal = globalThis.fetch;
+    globalThis.fetch = (url, options) => {
+      if (String(url) !== ${JSON.stringify(endpoint)}) throw Error('默认端点不符');
+      return fetchLocal(${JSON.stringify(local.url)}, options);
+    };`);
+  const shell = startShell(t, dir, undefined, {
+    env: { LICHA_ACCESS_KEY: undefined }, nodeArgs: ['--import', redirect]
+  });
+  await shell.connect();
+  const header = local.requests[0].req.headers['x-licha-access'];
+  assert.ok(header && header !== access);
+});
+
 test('SHL-01 干净目录离线安装根包后免编译，经 stdio 连接真实服务端列出工具', async (t) => {
   const dir = await sandbox(t);
   const npm = process.env.npm_execpath;

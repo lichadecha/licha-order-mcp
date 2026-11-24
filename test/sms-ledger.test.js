@@ -255,7 +255,7 @@ function legacyBook(dir, version) {
   return {unresolved, found};
 }
 
-test('LED-01 格式 4 升级保留原有 HMAC、发码记录与日额告警，旧记录计入刹车', t => {
+test('LED-01 格式 4 升级保留 HMAC、按号限频、全服务日额与首拒标记', t => {
   const dir = directory(t);
   const {unresolved, found} = legacyBook(dir, 4);
   const book = new Ledger(dir);
@@ -263,9 +263,46 @@ test('LED-01 格式 4 升级保留原有 HMAC、发码记录与日额告警，�
     assert.equal(book.fault, false);
     assert.deepEqual([...book.records.values()], [unresolved, found]);
     assert.equal(inspect(dir, db => db.prepare('SELECT phone_hash FROM sms_sends').get().phone_hash), book.phoneHash(phone));
-    const policy = {...config, LICHA_SMS_BRAKE_MIN_SAMPLE:1, LICHA_SMS_GLOBAL_PER_DAY:1};
+    const policy = {...config, LICHA_SMS_BRAKE_MIN_SAMPLE:1, LICHA_SMS_GLOBAL_PER_DAY:1,
+      LICHA_SMS_PER_PHONE_PER_HOUR:1, LICHA_SMS_PER_PHONE_PER_DAY:1};
+    assert.throws(() => book.checkSmsAllowed(phone, policy, start + 1),
+      {tiers:['global_day', 'day', 'hour', 'cooldown'], firstGlobalRejection:false});
     assert.throws(() => book.checkSmsAllowed(other, policy, start + 300_000),
-      {tiers:['global_day', 'brake'], firstGlobalRejection:false, firstBrakeRejection:true, expiredCount:1, unfilledCount:1});
+      {tiers:['global_day'], firstGlobalRejection:false, firstBrakeRejection:false, expiredCount:0, unfilledCount:0});
+  } finally { book.close(); }
+});
+
+test('BND-12 格式 4 的未知记录与新版未填并存，重启后刹车分子和分母只统计新记录', t => {
+  const dir = directory(t);
+  legacyBook(dir, 4);
+  let book = new Ledger(dir);
+  const policy = {...config, LICHA_SMS_BRAKE_MIN_SAMPLE:1};
+  try {
+    book.recordSmsSending(other, {}, policy, start + 300_000);
+    book.close();
+    book = new Ledger(dir);
+    const states = inspect(dir, db => db.prepare('SELECT filled FROM sms_sends ORDER BY sent_at').all());
+    assert.deepEqual(states.map(row => row.filled), [null, 0]);
+    assert.throws(() => book.checkSmsAllowed(other, policy, start + 600_000),
+      {tiers:['brake'], expiredCount:1, unfilledCount:1});
+  } finally { book.close(); }
+});
+
+test('LED-01 格式 5 升级保留逐笔回填与未填证据，继续参与刹车', t => {
+  const dir = directory(t);
+  legacyBook(dir, 4);
+  inspect(dir, db => {
+    db.exec('ALTER TABLE sms_sends ADD COLUMN filled INTEGER NOT NULL DEFAULT 0 CHECK (filled IN (0, 1))');
+    const hash = db.prepare('SELECT phone_hash FROM sms_sends').get().phone_hash;
+    const time = start + 1;
+    db.prepare('INSERT INTO sms_sends VALUES (?, ?, ?, 1)').run(hash, time, digest(hash + ':' + time + ':filled'));
+    db.exec('PRAGMA user_version=5');
+  }, false);
+  const book = new Ledger(dir);
+  const policy = {...config, LICHA_SMS_BRAKE_MIN_SAMPLE:2, LICHA_SMS_BRAKE_MAX_UNFILLED_PERCENT:49};
+  try {
+    assert.throws(() => book.checkSmsAllowed(other, policy, start + 360_000),
+      {tiers:['brake'], expiredCount:2, unfilledCount:1});
   } finally { book.close(); }
 });
 

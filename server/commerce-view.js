@@ -1,4 +1,4 @@
-import { beijingTime, couponInstanceId, digest, integerDigits, projectText, responseId, yuan } from './common.js';
+import { beijingTime, couponInstanceId, digest, identifierTextMask, integerDigits, projectText, readbackCouponIds, responseId, yuan } from './common.js';
 
 export const pendingCount = rows => `${rows.length} 笔状态未知${rows[0]?.time ? '，最早一笔发生在 ' + beijingTime(rows[0].time) : ''}`;
 
@@ -100,8 +100,8 @@ export function couponView(rows, totalFen, hasCode, choice, binding, selected, m
     } else {
       coupons.autoPicked = true;
       coupons.note = usable.length === 1
-        ? `顾客有 1 张券可用于本单，系统替顾客选了『${title}』，下单时会指定用这张。念完合计要加一句：「这单会用你的『${title}』，省 ${canDisYuan} 元，实付大约 ¥${payAfterYuan}；不想用券的话跟我说。」顾客说不用，就带 couponChoice="none" 重新组单；顾客没意见就照这张待确认单下单。`
-        : `顾客有 ${usable.length} 张券可用于本单，系统替顾客选了抵得最多的『${title}』（省 ${canDisYuan} 元，实付大约 ¥${payAfterYuan}），下单时会指定用这张。念完合计要把 usable 里的券逐张念给顾客（券名、能省多少），然后问：「用这张、换一张，还是这单不用券？」顾客说用这张或随便，就照这张待确认单下单；点名另一张（只能是带 ref 的），就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。`;
+        ? `顾客有 1 张券可用于本单，系统替顾客选了『${title}』，下单时会指定用这张。念完合计要加一句：「这单会用你的『${title}』，省 ${canDisYuan} 元，实付大约 ¥${payAfterYuan}；不想用券的话跟我说。」顾客说不用，就带 couponChoice="none" 重新组单；否则保留这张券，仍要等顾客明确确认数量、优惠与金额后再下单。`
+        : `顾客有 ${usable.length} 张券可用于本单，系统替顾客选了抵得最多的『${title}』（省 ${canDisYuan} 元，实付大约 ¥${payAfterYuan}），下单时会指定用这张。念完合计要把 usable 里的券逐张念给顾客（券名、能省多少），然后问：「用这张、换一张，还是这单不用券？」顾客说用这张或随便，就保留这张券，仍要等顾客明确确认数量、优惠与金额后再下单；点名另一张（只能是带 ref 的），就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。`;
     }
     return { coupons, chosenId: chosen.id };
   }
@@ -120,7 +120,7 @@ export function couponView(rows, totalFen, hasCode, choice, binding, selected, m
 // 企迈契约 §4 提供了这些非券类型；新类型需有依据才能分类。
 const otherDiscountTypes = new Set([3, 5, 6, 8, 10, 12, 21, 70, 71]);
 
-function discountView(detail, { couponChoice, chosenCoupon, maskCouponIds }, actualFen) {
+function discountView(detail, { couponChoice, chosenCoupon }, actualFen, maskCouponIds) {
   const noCoupon = couponChoice === 'none';
   const couponIds = [];
   const items = [];
@@ -142,13 +142,13 @@ function discountView(detail, { couponChoice, chosenCoupon, maskCouponIds }, act
       items.push(entry);
     }
   }
-  if (!chosenCoupon && !noCoupon && !items.length) return;
+  if (!chosenCoupon && !noCoupon && !items.length && zeroDiscount) return;
   const result = { items };
   const totalMismatch = items.length > 0 && totalFen !== null && itemSumFen !== null && itemSumFen !== totalFen;
   const description = items.map(item => (item.summary || item.name)
     + (item.amountYuan === null ? '（金额未知）' : `（抵 ¥${item.amountYuan}）`)).join('；');
   if (chosenCoupon) {
-    const title = chosenCoupon.title;
+    const title = maskCouponIds(chosenCoupon.title);
     const knownTypes = items.every(item => item.isCoupon !== undefined);
     const rejection = '请先如实告诉顾客，并说明付款页改不了券；这种情况我们这边改不了，不要重新组单再下。';
     // 已知用了别的券就足以判定未照办。要确认只用了指定的券，还须排除其余条目的歧义。
@@ -198,7 +198,9 @@ function discountView(detail, { couponChoice, chosenCoupon, maskCouponIds }, act
     result.matchesChoice = true;
     result.note = '按顾客的选择，这单没有用券（读回显示没有任何优惠）。';
   } else {
-    result.note = '顾客选了这单不用券，但读回里没取到优惠明细，无法确认门店系统有没有用券；请按读回实付如实告知，并请顾客在小程序「我的订单」里看一下这一单有没有用券。';
+    result.note = noCoupon
+      ? '顾客选了这单不用券，但读回里没取到优惠明细，无法确认门店系统有没有用券；请按读回实付如实告知，并请顾客在小程序「我的订单」里看一下这一单有没有用券。'
+      : '读回里没取到优惠明细，无法确认这单有没有用券或其他优惠；请按读回实付如实告知，如有疑问请顾客在小程序「我的订单」核对。';
   }
   return result;
 }
@@ -207,6 +209,7 @@ export function placedView(created, detail, readError, draft, binding) {
   const { orderNo } = created;
   const actual = nonnegativeInteger(detail?.actualAmount);
   const result = { placed: true, orderNo };
+  const maskIds = identifierTextMask([...(draft.couponIds ?? []), draft.chosenCoupon?.id, ...readbackCouponIds(detail)], binding);
   let problem;
   if (!detail || !Object.keys(detail).length) problem = `没读到门店系统的最终金额（${readError || '响应为空'}）`;
   else if (detail.orderNo !== orderNo) problem = '读回的内容对不上这一单，已丢弃';
@@ -216,14 +219,14 @@ export function placedView(created, detail, readError, draft, binding) {
     result.readbackFailed = true;
     result.readbackNote = `订单已创建成功（订单号 ${orderNo}），但${problem}。请让顾客在小程序「我的订单」核对金额后再付款。`;
     if (draft.couponChoice === 'none') result.readbackNote += '这单顾客选了不用券，核对金额时请顺便看一下有没有用券。';
-    if (draft.chosenCoupon) result.readbackNote += `这单顾客指定了用『${draft.chosenCoupon.title}』，核对金额时请顺便看一下用的是不是这张。`;
+    if (draft.chosenCoupon) result.readbackNote += `这单顾客指定了用『${maskIds(draft.chosenCoupon.title)}』，核对金额时请顺便看一下用的是不是这张。`;
     result.nextStep = '订单已创建，但最终金额没有核实，不要向顾客报金额。请让顾客在小程序「我的订单」核对金额后再付款——我们不代付、不碰任何支付凭据。';
     return result;
   }
   result.estimatedTotalYuan = yuan(draft.totalFen);
   result.qmaiActualAmountYuan = yuan(actual);
   result.diffYuan = yuan(actual - draft.totalFen);
-  const applied = discountView(detail, draft, actual);
+  const applied = discountView(detail, draft, actual, maskIds);
   if (applied) result.couponApplied = applied;
   const expectedFen = draft.chosenCoupon ? toFen(draft.chosenCoupon.payAfterYuan) : draft.totalFen;
   const diff = actual - expectedFen;

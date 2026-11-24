@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { mockCaptcha, rig } from '../test-support/rig.js';
-import { bind, failure, phone, phoneB, success } from '../test-support/commerce.js';
+import { argsFor, bind, failure, goodsId, phone, phoneB, prepare, skuId, success } from '../test-support/commerce.js';
 import { PATHS } from '../server/qmai.js';
 
 const baseTime = Date.UTC(2026, 0, 1, 12, 0, 57);
@@ -196,4 +196,37 @@ test('BND-09 格式预检、设备一小时与全局一分钟滑窗分别计数�
   await attempt(3_600_000, a);  // 刚好释放 a 的首次。
   await attempt(3_600_000, a, bindsLimited);
   await attempt(3_660_001, a);
+});
+
+test('SES-04/BND-15 绝对期限自各号码短信通过起计，持续使用也在到期当刻失效', async t => {
+  const {service, at} = await withClock(t, {LICHA_BINDING_IDLE_TTL_MS:'3000', LICHA_BINDING_MAX_AGE_MS:'6000',
+    LICHA_SMS_COOLDOWN_SEC:'1'}, (path, params) => {
+    if (path === PATHS.member) return {status:true, data:params.customerCode.code === phone ? 1234 : 5678};
+    if (path === PATHS.orderList) return {status:true, data:{data:[], total:0}};
+    if (path === PATHS.item) return {status:true, data:[{goodsId, name:'茶', goodsSkuList:[{skuId,salePrice:100}]}]};
+    if (path === PATHS.stores) return {status:true, data:{list:[]}};
+    return {status:true};
+  });
+  const s = await service.session();
+  await success(s, 'bind_member', valid);
+  await at(2000);
+  const first = await success(s, 'bind_member', {...valid, captcha:mockCaptcha});
+  await at(4000);
+  const second = await bind(s, phoneB);
+  await at(4500);
+  await success(s, 'bind_member', valid);
+  await at(6500);
+  await success(s, 'bind_member', {...valid, code:phoneB});
+  await success(s, 'bind_member', valid);
+  await at(7999);
+  assert.deepEqual((await success(s, 'my_orders')).member, first.member);
+  const draft = await prepare(s);
+  await at(8000);
+  const before = service.requests.length;
+  await failure(s, 'my_orders', {}, /尚未绑定/);
+  assert.deepEqual((await success(s, 'bind_member', {...valid, code:phoneB})).member, second.member);
+  assert.equal(service.requests.length, before);
+  assert.equal((await success(s, 'bind_member', valid)).verificationSent, true);
+  await success(s, 'bind_member', {...valid, captcha:mockCaptcha});
+  await failure(s, 'place_order', argsFor(draft), /确认令牌无效/);
 });

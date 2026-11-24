@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 
 export const uuidPattern = /^[a-f\d]{8}-[a-f\d]{4}-4[a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
@@ -58,15 +59,32 @@ export function maskNumbers(value) {
   return value.replace(privateNumbers, tail);
 }
 
-// 在排除归属异常或互相冲突的行之前取 ID。掩码只随本次组单及其提交使用。
-export function couponTextMask(rows) {
-  if (!Array.isArray(rows)) return maskNumbers;
+// 将当前会员的投影限定在这一次工具调用内，包括浏览与上游失败。
+const memberText = new AsyncLocalStorage();
+
+export function withMemberText(binding, run) {
+  if (!binding) return run();
+  return memberText.run({binding, mask: identifierTextMask([], binding)}, run);
+}
+
+export const currentTextMask = () => memberText.getStore()?.mask ?? maskNumbers;
+
+export function readbackCouponIds(detail) {
+  return Array.isArray(detail?.discountList) ? detail.discountList.map(row => row?.discountId) : [];
+}
+
+export function identifierTextMask(values, binding = memberText.getStore()?.binding) {
   const ids = new Map();
-  for (const row of rows) {
-    const id = couponInstanceId(row?.id);
+  for (const value of values) {
+    const id = couponInstanceId(value);
     if (id === null) continue;
     ids.set(id, tail(id));
-    ids.set(String(row.id), tail(id));
+    ids.set(String(value), tail(id));
+  }
+  if (binding?.id) ids.set(binding.id, tail(binding.id));
+  if (binding?.phone) {
+    ids.set(binding.phone, tail(binding.phone));
+    ids.set(String(Number(binding.phone)), tail(binding.phone));
   }
   if (!ids.size) return maskNumbers;
   // R25 的合法数字原文中，只有小数点和指数的加号需要正则转义。
@@ -79,7 +97,7 @@ export function couponTextMask(rows) {
   });
 }
 
-export function cleanText(value, mask = maskNumbers) {
+export function cleanText(value, mask = currentTextMask()) {
   if (typeof value !== 'string') return '';
   const publicText = value
     .replace(/(?:https?:\/\/|www\.)[^\s，。；、）)]+/gi, ' ')

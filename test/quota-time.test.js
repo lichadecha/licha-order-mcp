@@ -42,13 +42,13 @@ test('WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写�
   const offset = join(clockDir,'offset');
   const midnight = Date.parse('2031-02-08T00:00:00+08:00');
   const setClock = async ms => {
-    await writeFile(offset+'.next',String(ms-Date.now()));
+    await writeFile(offset+'.next',String(ms));
     await rename(offset+'.next',offset);
   };
   await setClock(midnight - 15000);
-  // 只改变子进程 Date.now 的基准。定时器、排队、落盘、网络仍使用真实时间。
-  const preload = "import {readFileSync} from 'node:fs';const now=Date.now.bind(Date);" +
-    "Date.now=()=>now()+Number(readFileSync("+JSON.stringify(offset)+",'utf8'));";
+  // 固定子进程的日历时钟，定时器、排队、落盘、网络仍使用真实时间。
+  const preload = "import {readFileSync} from 'node:fs';" +
+    "Date.now=()=>Number(readFileSync("+JSON.stringify(offset)+",'utf8'));";
   const hook = 'data:text/javascript;base64,'+Buffer.from(preload).toString('base64');
   const created = [];
   const firstReceived = Promise.withResolvers();
@@ -63,12 +63,12 @@ test('WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写�
     })});
   const customers = await Promise.all(['001','002'].map(code=>bind(r,code)));
   const drafts = await Promise.all(customers.map(prepare));
-  // 一次真实读取占据最近的发送时刻，保证下单的占位与真正发出之间跨越午夜。
-  await value(customers[0].call('get_menu',{storeId:602}));
   await setClock(midnight - 380);
   const attempts = customers.map((s,i)=>place(s,drafts[i]));
   const early = await Promise.race(attempts.map((promise,i)=>promise.then(result=>({result,i}))));
   assert.match(early.result.content[0].text,/总单量已到上限/);
+  // 两次 WRT-22 均已完成，输家被当日额度拦下；让赢家在次日真正发出。
+  await setClock(midnight);
   await firstReceived.promise;
   const [sent] = bookRecords(r);
   assert.equal(sent.day,'2031-02-07');
@@ -99,10 +99,16 @@ test('WRT-09 LED-07 LOG-03 并发占最后一额跨北京午夜，账本与写�
 test('WRT-11 等待实际发送名额超时，无发单记录且个人、全局占位都释放', async t => {
   const interval = 430;
   const readStarted = Promise.withResolvers();
+  const recheckReceived = Promise.withResolvers(), release = Promise.withResolvers();
+  let holdRecheck = false;
   const upstream = mockUpstream(()=>good({orderNo:'D00000000000000000911'}));
   const r = await rig(t,{mockSms:true,env:{LICHA_UPSTREAM_MIN_INTERVAL_MS:String(interval),LICHA_WRITE_TIMEOUT_MS:'650',
-    LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1',LICHA_MAX_ORDERS_PER_DAY:'1'},
-    upstream(path, params, wire) {
+    LICHA_READ_TIMEOUT_MS:'5000',LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY:'1',LICHA_MAX_ORDERS_PER_DAY:'1'},
+    async upstream(path, params, wire) {
+      if (path === PATHS.member && holdRecheck) {
+        recheckReceived.resolve();
+        await release.promise;
+      }
       if (path === PATHS.categories) readStarted.resolve();
       return upstream(path, params, wire);
     }});
@@ -110,9 +116,13 @@ test('WRT-11 等待实际发送名额超时，无发单记录且个人、全局�
   const first = await prepare(s);
   // 单个间隔能发短信。两个不同门店的读取先占据发送时隙，使下单等待超过写超时。
   const readers = await Promise.all([r.session(), r.session()]);
+  holdRecheck = true;
+  const placing = place(s,first);
+  await recheckReceived.promise;
   const menuReads = readers.map((reader, i) => value(reader.call('get_menu', {storeId: 610 + i})));
   await readStarted.promise;
-  const response = await place(s,first);
+  release.resolve();
+  const response = await placing;
   await Promise.all(menuReads);
   assert.equal(response.isError,true);
   assert.match(response.content[0].text,/排队的人多，这次下单请求没有发出/);
