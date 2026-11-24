@@ -20,6 +20,11 @@ test('PRE-12/13 仅 prepare_order 公开三种用券选择和可选的券编号�
   assert.deepEqual(prepareTool.inputSchema.properties.couponRef, { type: 'string', minLength: 1, maxLength: 128 });
   assert.ok(!prepareTool.inputSchema.required.includes('couponRef'));
   assert.match(prepareTool.description, /顾客明确说这单不用券时传 "none"；顾客点名要用某一张时传 "specific"，并在 couponRef 里带上那张券的 ref/);
+  assert.ok(prepareTool.description.includes('数量（每行数量与总杯数 totalQuantity）、优惠（系统默认会用哪张券省多少 / 不用券 / 用指定的哪张）、金额（合计与预计实付）'));
+  assert.ok(prepareTool.description.includes('三样没有得到顾客明确的「确认」，不得调用 place_order。总杯数 10 杯及以上、或合计 300 元及以上的大单，念完后再单独复述一次「一共 N 杯、实付约 X 元」，得到第二次确认才可下单。'));
+  const placeTool = tools.find(tool => tool.name === 'place_order');
+  assert.ok(placeTool.description.includes('只有在顾客对念给他听的待确认单——数量、优惠、金额三样——明确说了确认之后才能调用'));
+  assert.ok(placeTool.description.includes('confirmAmountYuan 必须是刚念给顾客、顾客确认过的那个合计金额'));
   const previewTool = tools.find(tool => tool.name === 'preview_order');
   assert.ok(!Object.hasOwn(previewTool.inputSchema.properties, 'couponChoice'));
   assert.ok(!Object.hasOwn(previewTool.inputSchema.properties, 'couponRef'));

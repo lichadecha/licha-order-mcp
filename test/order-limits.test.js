@@ -5,22 +5,36 @@ import {join} from 'node:path';
 import {readConfig} from '../server/config.js';
 import {Ledger} from '../server/ledger.js';
 import {PATHS} from '../server/qmai.js';
-import {argsFor, bind, bindAgain, bookRecords, count, failure, number, ok, phoneB, place,
-  prepare, withBound} from '../test-support/commerce.js';
+import {argsFor, basket, bind, bindAgain, bookRecords, count, failure, number, ok, phoneB, place,
+  prepare, success, withBound} from '../test-support/commerce.js';
 
 const personal = 'LICHA_MAX_ORDERS_PER_CUSTOMER_PER_DAY';
 const global = 'LICHA_MAX_ORDERS_PER_DAY';
 
-test('§3.2 每日单量默认 0，只接受非负安全整数；单笔金额仍须正数', () => {
+test('§3.2 单笔金额及每日单量上限默认 0，只接受非负安全整数', () => {
   const env = {LICHA_ACCESS_KEYS:'test'};
-  for (const key of [personal, global]) {
+  for (const key of ['LICHA_MAX_ORDER_AMOUNT_FEN', personal, global]) {
     assert.equal(readConfig(env)[key], 0);
     for (const value of ['0', '1', '23']) assert.equal(readConfig({...env,[key]:value})[key], Number(value));
     for (const value of ['-1', '1.5', 'abc', '', '9007199254740992']) {
       assert.throws(() => readConfig({...env,[key]:value}), {message:'配置无效：' + key});
     }
   }
-  assert.throws(() => readConfig({...env,LICHA_MAX_ORDER_AMOUNT_FEN:'0'}), /LICHA_MAX_ORDER_AMOUNT_FEN/);
+});
+
+test('PRE-04 WRT-05/08 默认可组大单，待确认单给出各行合计杯数，下单仍核对确认金额', async t => {
+  const {r, s} = await withBound(t);
+  const items = [6, 9].map(quantity => ({...basket.items[0], quantity}));
+  const draft = await success(s, 'prepare_order', {...basket, items});
+  assert.equal(draft.totalQuantity, 15);
+  const fields = Object.keys(draft);
+  const index = fields.indexOf('lines');
+  assert.deepEqual(fields.slice(index, index + 3), ['lines', 'totalQuantity', 'estimatedTotalYuan']);
+  assert.equal(draft.estimatedTotalYuan, '300.00');
+  await failure(s, 'place_order', {...argsFor(draft), confirmAmountYuan: 299}, /复述金额与待确认单不一致/);
+  assert.equal(count(r, PATHS.create), 0);
+  assert.equal((await place(s, draft)).placed, true);
+  assert.equal(count(r, PATHS.create), 1);
 });
 
 test('WRT-09 每日两项不限时仍拦同会员在途，同日可超过原先两项上限', async t => {

@@ -376,7 +376,7 @@ test('未决隔离、静默期、分页及唯一正证据 BND-07 WRT-07 UNR-01/0
   assert.match(absent.pendingWriteNote,/没有建单/);
 });
 
-test('零元预估不占位 WRT-08', async t => {
+test('WRT-08 金额不限时，零元预估仍被拒绝', async t => {
   // 正常目录已拦截负加价。直接给下单层一份零元报价，单独检验发送前护栏。
   const browseURL = new URL('../server/browse.js', import.meta.url).href;
   const preload = `import { Browse } from ${JSON.stringify(browseURL)};
@@ -385,11 +385,33 @@ test('零元预估不占位 WRT-08', async t => {
       return { ...await quote.apply(this, args), totalFen: 0 };
     };`;
   const { r, s } = await withBound(t, {
+    LICHA_MAX_ORDER_AMOUNT_FEN: '0',
     NODE_OPTIONS: '--import=data:text/javascript;base64,' + Buffer.from(preload).toString('base64')
   });
   const draft = await prepare(s);
   assert.equal(draft.estimatedTotalYuan,'0.00');
-  await failure(s,'place_order',{confirmToken:draft.confirmToken,confirmAmountYuan:0.01},/超上限/);
+  const reason = await failure(s,'place_order',{confirmToken:draft.confirmToken,confirmAmountYuan:0.01},/大于 0|正数/);
+  assert.doesNotMatch(reason,/超上限/);
+  assert.equal(count(r,PATHS.create),0);
+});
+
+test('WRT-08 提交时独立复查正数上限，超一分也不发送', async t => {
+  // 在组单的金额校验之后收紧测试配置，让同一张已签发的待确认单触及提交层上限。
+  const browseURL = new URL('../server/browse.js', import.meta.url).href;
+  const preload = `import { Browse } from ${JSON.stringify(browseURL)};
+    const storeForOrder = Browse.prototype.storeForOrder;
+    Browse.prototype.storeForOrder = function (...args) {
+      this.config.LICHA_MAX_ORDER_AMOUNT_FEN = 1999;
+      return storeForOrder.apply(this, args);
+    };`;
+  const { r, s } = await withBound(t, {
+    LICHA_MAX_ORDER_AMOUNT_FEN: '2000',
+    NODE_OPTIONS: '--import=data:text/javascript;base64,' + Buffer.from(preload).toString('base64')
+  });
+  const draft = await prepare(s);
+  assert.equal(draft.estimatedTotalYuan,'20.00');
+  const reason = await failure(s,'place_order',argsFor(draft),/单笔金额超上限/);
+  assert.equal(reason,'单笔金额超上限（¥19.99），已拒绝下单。请减少商品后重新组单。');
   assert.equal(count(r,PATHS.create),0);
 });
 

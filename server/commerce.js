@@ -116,7 +116,8 @@ export async function createCommerce(config, qmai, browse, logs) {
     }
     if (book.fault) throw Error(bookProblem);
     const { totalFen, lines, orderItems, tradeMarks, productEvidence } = await browse.quote(args, true);
-    if (totalFen > config.LICHA_MAX_ORDER_AMOUNT_FEN) throw Error(`单笔金额超上限：本单预估 ¥${yuan(totalFen)}，上限 ¥${yuan(config.LICHA_MAX_ORDER_AMOUNT_FEN)}。请减少商品后重新组单。`);
+    const limit = config.LICHA_MAX_ORDER_AMOUNT_FEN;
+    if (limit > 0 && totalFen > limit) throw Error(`单笔金额超上限：本单预估 ¥${yuan(totalFen)}，上限 ¥${yuan(limit)}。请减少商品后重新组单。`);
     const storeId = String(args.storeId);
     const params = { storeId, items: orderItems, orderType: 1, source: 18, userId: b.id,
       channelCode: 'AI_AGENT', scene: 'AI_AGENT', member: true,
@@ -151,6 +152,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     const result = { confirmToken, member: memberView(b), store: { storeId, ...(store?.name && { name: maskCouponIds(store.name) }) },
       lines: lines.map(line => ({ ...line, name: maskCouponIds(line.name), specName: maskCouponIds(line.specName),
         practices: line.practices.map(maskCouponIds), attaches: line.attaches.map(maskCouponIds) })),
+      totalQuantity: lines.reduce((sum, line) => sum + line.quantity, 0),
       estimatedTotalYuan: yuan(totalFen), coupons };
     const recent = [...book.records.values()].filter(row => row.memberHash === b.hash && orderNumber(row)
       && (row.state === 'success' || row.state === 'found'))
@@ -214,8 +216,10 @@ export async function createCommerce(config, qmai, browse, logs) {
     if (book.fault) reject('WRT-06', bookProblem);
     const pending = unresolved(b.hash);
     if (pending.length) reject('WRT-07', `上一次下单请求的结果还没有核对清楚（${pendingCount(pending)}），暂不放行新的下单。\n那次请求可能已经在企迈侧真的建了单——现在直接重下会变成两单、扣两次钱。\n请先调用 my_orders（查最近订单）核对企迈侧到底有没有那一单：\n　· 已经有那一单 → 不要再下，直接引导顾客去小程序付款；\n　· 确实没有那一单 → 核对动作本身会解除这道闸门，再重新走一次 prepare_order 组单即可。`);
-    if (!(draft.totalFen > 0) || draft.totalFen > config.LICHA_MAX_ORDER_AMOUNT_FEN) reject('WRT-08',
-      `单笔金额超上限（¥${yuan(config.LICHA_MAX_ORDER_AMOUNT_FEN)}），已拒绝下单。请减少商品后重新组单。`);
+    const limit = config.LICHA_MAX_ORDER_AMOUNT_FEN;
+    if (!(draft.totalFen > 0) || (limit > 0 && draft.totalFen > limit)) reject('WRT-08', limit > 0
+      ? `单笔金额超上限（¥${yuan(limit)}），已拒绝下单。请减少商品后重新组单。`
+      : '预估总额必须大于 0 元，已拒绝下单。请重新组单。');
     if ([...flights.values()].some(row => row.memberHash === b.hash)) reject('WRT-09_in_flight',
       '这位会员的上一笔下单还在处理中，请等它有结果后再试，不要重复提交。');
     const reservation = currentQuotaDay();

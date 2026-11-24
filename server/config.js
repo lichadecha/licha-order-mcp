@@ -2,7 +2,7 @@ import { resolve } from 'node:path';
 import { uuidPattern } from './common.js';
 
 const defaults = {
-  MAX_ORDER_AMOUNT_FEN: 10000,
+  MAX_ORDER_AMOUNT_FEN: 0,
   MAX_ORDERS_PER_CUSTOMER_PER_DAY: 0,
   MAX_ORDERS_PER_DAY: 0,
   CONFIRM_TOKEN_TTL_MS: 300000,

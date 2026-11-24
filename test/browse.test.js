@@ -166,7 +166,7 @@ test('BRW-08 逐行算价、同名做法及缺价规格', async t => {
 test('BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照', async t => {
   let reads = 0, row = product();
   const member = '8999999999999909001', orderNo = 'D00000000000000000901';
-  const r = await rig(t,{mockSms:true,upstream(path,params,{res}) {
+  const r = await rig(t,{mockSms:true,env:{LICHA_MAX_ORDER_AMOUNT_FEN:'10000'},upstream(path,params,{res}) {
     switch (kind(path)) {
       case PATHS.member: return good({customerId:member});
       case PATHS.item: reads++; return good([row]);
@@ -192,7 +192,9 @@ test('BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发�
   assert.deepEqual(couponRequest.params.tradeMarks,Array(2).fill({tradeMark:digits,num:1,price:50}));
   assert.ok(couponRequest.raw.includes('"customerId":'+member));
   row.goodsSkuList[0].salePrice = 4741;
-  assert.match((await prepare()).content[0].text,/单笔金额超上限/);
+  const overLimit = await prepare();
+  assert.equal(overLimit.isError,true);
+  assert.equal(overLimit.content[0].text,'单笔金额超上限：本单预估 ¥100.02，上限 ¥100.00。请减少商品后重新组单。');
   assert.equal((await detail()).skus[0].priceFen,4741);
   assert.equal(reads,3);
   row = product();
