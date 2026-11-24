@@ -1,8 +1,16 @@
-# 李茶的茶点单 MCP v1.12.1 交付清单
+# 李茶的茶点单 MCP v1.12.3 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](README.md)
 
-## v1.12.1 单笔金额与顾客确认
+## v1.12.3 点单卡片的品牌描述与多号绑定
+
+- **商品描述（BRW-11）。** 卡片将企迈 `goodsExtra.goodsDesc` 的 `desc` 和 `detail` 分别投影为 `description.summary` 和 `description.detail`。去掉 HTML 标签、还原常见实体，段落用「；」连接，连续空白压为一个空格。按 OUT-02 去网址与疑似凭证，手机号和长数字串只留尾号。两项分别按 60 和 400 个 Unicode 码点截断，超长加省略号，空项省略，两项都空时省略整个对象。菜单列表不带描述。[工具契约 §3](spec/tool-contract.md#3-get_item_detail点单卡片)
+- **组单刷新（PRE-03、BRW-09）。** 浏览卡片和组单现读共用商品详情请求。两处均保留 `includeProperties` 并带上 `includeExtras: ["GOODS_DESC"]`，组单刷新缓存后，后续卡片也能显示最新的品牌描述。[详情请求与缓存](server/browse.js)
+- **已验证号码（BND-15）。** 现有实现符合本次澄清。每台设备按号码保存验证记录，个数不限。所有号码共用 `LICHA_BINDING_IDLE_TTL_MS`，分别计算闲置时间，只刷新当前绑定。绑定流程无需区分号码与顾客的关系。[绑定与失效](server/binding.js) · [各号独立计时、重启与设备隔离](test/window.test.js)
+
+Node 22.23.1 连续三次运行完整 `npm test`，每轮均通过 264 项，失败、跳过和取消均为 0。商品描述通过本地 MCP 调用回放 11 月 24 日合成样本中的字段，并与[规格样本](spec/samples/live-20261124/3.1.12_getShopGoodsDetail_withGoodsDesc_composed_20261124.json)核对。
+
+## v1.12.1 单笔金额与顾客确认（历史记录）
 
 - **单笔金额。** `LICHA_MAX_ORDER_AMOUNT_FEN` 接受非负整数，默认从 10000 分调整为 0。取 0 时，组单跳过上限检查（PRE-04），下单仍要求预估总额为正数（WRT-08）。设为正数时，合计等于上限可通过，超过上限沿用原拒绝文案。
 - **待确认单。** `totalQuantity` 位于 `lines` 和 `estimatedTotalYuan` 之间，等于各行 `quantity` 之和。Agent 须让顾客明确确认每行数量与总杯数、优惠、合计与预计实付。总杯数达到 10 杯或合计达到 300 元时，再单独复述总杯数与预计实付，取得第二次确认后下单。`place_order` 使用待确认单的令牌，`confirmAmountYuan` 取顾客确认过的券前合计。
@@ -285,23 +293,24 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
 | ORD-01 | [server/session.js](server/session.js) · makeEndpoint | [SES-01 SES-07 ORD-01 准入、设备归属、并发末席、失败和关闭归还名额](test/session.test.js#L27) |
-| ORD-02 | [server/qmai.js](server/qmai.js) · readPaths、Qmai.write、Qmai.sms · [账本发送凭据](server/ledger.js) | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12)<br>[ORD-02 增加路径常量不会自动获得读权限](test/write-gate.test.js#L37) · [短信出口、关停与落盘凭据](test/sms-gateway.test.js#L81) |
-| ORD-03 | [server/qmai.js](server/qmai.js) · Qmai.read、Qmai.write、Qmai.sms | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L292) |
+| ORD-02 | [server/qmai.js](server/qmai.js) · readPaths、Qmai.write、Qmai.sms · [账本发送凭据](server/ledger.js) | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L378)<br>[ORD-02 WRT-11 写出口拒绝缺失、伪造、跨次复用的落盘凭据](test/write-gate.test.js#L12)<br>[ORD-02 增加路径常量不会自动获得读权限](test/write-gate.test.js#L37) · [短信出口、关停与落盘凭据](test/sms-gateway.test.js#L81) |
+| ORD-03 | [server/qmai.js](server/qmai.js) · Qmai.read、Qmai.write、Qmai.sms | [ORD-02 ORD-03 出口白名单与未知路径发前拒绝](test/browse.test.js#L378) |
 
 ### 浏览与算价
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
-| BRW-01 | [server/browse.js](server/browse.js) · #directory、#find | [BRW-01 BRW-02 BRW-03 门店匹配、采样和两路刷新](test/browse.test.js#L26) |
-| BRW-02 | [server/browse.js](server/browse.js) · #directory、#find | [BRW-01 BRW-02 BRW-03 门店匹配、采样和两路刷新](test/browse.test.js#L26) |
-| BRW-03 | [server/browse.js](server/browse.js) · #liveStatus | [BRW-01 BRW-02 BRW-03 门店匹配、采样和两路刷新](test/browse.test.js#L26)<br>[BRW-03 BRW-04 R24 营业时间内层复数和菜单布尔标记](test/browse.test.js#L464) |
-| BRW-04 | [server/browse.js](server/browse.js) · #menu | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L66)<br>[BRW-04 BRW-08 错形分类不缓存；算价失败只给一次商品原因](test/browse.test.js#L363)<br>[BRW-03 BRW-04 R24 营业时间内层复数和菜单布尔标记](test/browse.test.js#L464) |
-| BRW-05 | [server/catalog.js](server/catalog.js) · menuItem，get_menu 的提示见 browse.js | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L66) |
-| BRW-06 | [server/catalog.js](server/catalog.js) · menuItem，get_menu 的提示见 browse.js | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L66) |
-| BRW-07 | [server/catalog.js](server/catalog.js) · itemCard，商品 ID 核对见 Browse.#item | [BRW-07 OUT-01 卡片投影、空值、估清优先级和商品一致性](test/browse.test.js#L105)<br>[OUT-01 BRW-07 畸形公开 ID 字段不能携出无关的识别值](test/browse.test.js#L345) |
-| BRW-08 | [server/price.js](server/price.js) · selectSku、selectPractices、checkOptionSpacing、priceLine | [BRW-08 逐行算价、同名做法及缺价规格](test/browse.test.js#L139)<br>[BRW-04 BRW-08 错形分类不缓存；算价失败只给一次商品原因](test/browse.test.js#L363)<br>[BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至创建请求](test/browse.test.js#L386) |
-| BRW-09 | [server/browse.js](server/browse.js) · #cached、#item、quote | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164)<br>[BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读缓存](test/browse.test.js#L318) |
-| BRW-10 | [server/qmai.js](server/qmai.js) · Qmai.#read、post | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L223) |
+| BRW-01 | [server/browse.js](server/browse.js) · #directory、#find | [BRW-01 BRW-02 BRW-03 门店匹配、采样和两路刷新](test/browse.test.js#L30) |
+| BRW-02 | [server/browse.js](server/browse.js) · #directory、#find | [BRW-01 BRW-02 BRW-03 门店匹配、采样和两路刷新](test/browse.test.js#L30) |
+| BRW-03 | [server/browse.js](server/browse.js) · #liveStatus | [BRW-01 BRW-02 BRW-03 门店匹配、采样和两路刷新](test/browse.test.js#L30)<br>[BRW-03 BRW-04 R24 营业时间内层复数和菜单布尔标记](test/browse.test.js#L582) |
+| BRW-04 | [server/browse.js](server/browse.js) · #menu | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L70)<br>[BRW-04 BRW-08 错形分类不缓存；算价失败只给一次商品原因](test/browse.test.js#L449)<br>[BRW-03 BRW-04 R24 营业时间内层复数和菜单布尔标记](test/browse.test.js#L582) |
+| BRW-05 | [server/catalog.js](server/catalog.js) · menuItem，get_menu 的提示见 browse.js | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L70) |
+| BRW-06 | [server/catalog.js](server/catalog.js) · menuItem，get_menu 的提示见 browse.js | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L70) |
+| BRW-07 | [server/catalog.js](server/catalog.js) · itemCard，商品 ID 核对见 Browse.#item | [BRW-07 OUT-01 卡片投影、空值、估清优先级和商品一致性](test/browse.test.js#L112)<br>[OUT-01 BRW-07 畸形公开 ID 字段不能携出无关的识别值](test/browse.test.js#L431) |
+| BRW-08 | [server/price.js](server/price.js) · selectSku、selectPractices、checkOptionSpacing、priceLine | [BRW-08 逐行算价、同名做法及缺价规格](test/browse.test.js#L194)<br>[BRW-04 BRW-08 错形分类不缓存；算价失败只给一次商品原因](test/browse.test.js#L449)<br>[BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至创建请求](test/browse.test.js#L504) |
+| BRW-09 | [server/browse.js](server/browse.js) · #cached、#item、quote | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219)<br>[BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读缓存](test/browse.test.js#L404) |
+| BRW-10 | [server/qmai.js](server/qmai.js) · Qmai.#read、post | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285) |
+| BRW-11 | [详情请求](server/browse.js) · [卡片投影](server/catalog.js) | [描述样本、清洗脱敏、长度边界与空项](test/browse.test.js#L146) |
 
 ### 绑定
 
@@ -321,6 +330,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | BND-12 | [发码计数与落盘凭据](server/ledger.js) | [四档限频与 HMAC](test/sms-ledger.test.js) · [并发、重启与故障](test/sms-binding-recovery.test.js) |
 | BND-13 | [设备待验证](server/binding.js) | [重启失效](test/sms-binding-recovery.test.js) · [出参与日志隐私](test/sms-binding.test.js) |
 | BND-14 | [访问审计](server/logs.js) | [发码和校验分类、手机号与设备摘要](test/sms-binding.test.js) |
+| BND-15 | [设备内验证记录与统一闲置期限](server/binding.js) | [切回已验证号码](test/member-identity.test.js) · [各号独立计时、重启与设备隔离](test/window.test.js) |
 
 ### 组单
 
@@ -328,10 +338,10 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 | --- | --- | --- |
 | PRE-01 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19) |
 | PRE-02 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [运行时故障仍可查单，重启发现损坏后可浏览、无法绑定](test/commerce.test.js#L387) |
-| PRE-03 | [server/browse.js](server/browse.js) · quote、#item | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164)<br>[BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读缓存](test/browse.test.js#L318) |
-| PRE-04 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164) |
-| PRE-05 | [server/price.js](server/price.js) · priceLine | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164) |
-| PRE-06 | [server/commerce.js](server/commerce.js) · prepare、checkOrderFields，分行内部 ID 核对见 price.js | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L164)<br>[BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至创建请求](test/browse.test.js#L386)<br>[递归拒绝七个预约字段 PRE-06](test/commerce.test.js#L129) |
+| PRE-03 | [server/browse.js](server/browse.js) · quote、#item | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219)<br>[BRW-09 PRE-03 同毫秒开始的旧浏览响应晚到，保留组单现读缓存](test/browse.test.js#L404) |
+| PRE-04 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219) |
+| PRE-05 | [server/price.js](server/price.js) · priceLine | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219) |
+| PRE-06 | [server/commerce.js](server/commerce.js) · prepare、checkOrderFields，分行内部 ID 核对见 price.js | [BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发快照](test/browse.test.js#L219)<br>[BRW-08 PRE-06 加料原文、展示同名和做法双重解释都核对至创建请求](test/browse.test.js#L504)<br>[递归拒绝七个预约字段 PRE-06](test/commerce.test.js#L129) |
 | PRE-07 | [server/commerce-view.js](server/commerce-view.js) · couponView，单次筛券见 commerce.js 的 prepare | [券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99) |
 | PRE-08 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [绑定预检、幂等、换绑与识别值最小化 BND-01/02/03/04/05/06/08/10 PRE-01/08/10 WRT-02/04 QRY-01](test/commerce.test.js#L19)<br>[设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
 | PRE-09 | [server/commerce.js](server/commerce.js) · requireBinding、prepare | [设备隔离、跨设备替代、过期清理 SES-02/03 PRE-08/09 WRT-03](test/commerce.test.js#L77) |
@@ -418,9 +428,9 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
-| OUT-01 | [server/catalog.js](server/catalog.js) · itemCard、menuItem，交易投影见 commerce-view.js | [BRW-07 OUT-01 卡片投影、空值、估清优先级和商品一致性](test/browse.test.js#L105)<br>[OUT-01 BRW-07 畸形公开 ID 字段不能携出无关的识别值](test/browse.test.js#L345)<br>[券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99) |
-| OUT-02 | [server/common.js](server/common.js) · projectText | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L223)<br>[券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99)<br>[OUT-02 错误文本投影按码点截断并移除网址、凭证、电话与长数字](test/session.test.js#L190) |
-| OUT-03 | [server/qmai.js](server/qmai.js) · readHint，写结果未知文案见 commerce.js 的 unknownMessage | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L223)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201) |
+| OUT-01 | [server/catalog.js](server/catalog.js) · itemCard、menuItem，交易投影见 commerce-view.js | [BRW-07 OUT-01 卡片投影、空值、估清优先级和商品一致性](test/browse.test.js#L112)<br>[OUT-01 BRW-07 畸形公开 ID 字段不能携出无关的识别值](test/browse.test.js#L431)<br>[券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99) |
+| OUT-02 | [server/common.js](server/common.js) · projectText | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285)<br>[券预测优先级、投影、一次查询和缺门店编码 PRE-07 OUT-01/02](test/commerce.test.js#L99)<br>[OUT-02 错误文本投影按码点截断并移除网址、凭证、电话与长数字](test/session.test.js#L190) |
+| OUT-03 | [server/qmai.js](server/qmai.js) · readHint，写结果未知文案见 commerce.js 的 unknownMessage | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285)<br>[资金出口拒绝明确失败；不确定回执从不重试 WRT-10/12/14 LED-07 OUT-03](test/commerce.test.js#L201) |
 
 ### 薄壳
 
@@ -439,7 +449,7 @@ Node 22.23.1 运行 `npm test`，234 项全部通过。
 
 | ID | 实现位置 | 对应测试名 |
 | --- | --- | --- |
-| UPS-01 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L66)<br>[BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L223)<br>[UPS-01 R4 响应数组、嵌套字段与字符串中的数字保持无损](test/browse.test.js#L305)<br>[UPS-01 R21 损坏的密钥封装不作为普通字符串签名](test/browse.test.js#L381) |
-| UPS-02 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [UPS-02 全局队列按实际发送时刻限速、慢响应可并行](test/browse.test.js#L268) |
-| UPS-03 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L223)<br>[UPS-03 读超时覆盖收到响应头后的半截响应体](test/quota-time.test.js#L120) |
-| UPS-04 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [UPS-04 签名实现损坏时真实启动拒绝就绪](test/browse.test.js#L311) |
+| UPS-01 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID](test/browse.test.js#L70)<br>[BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285)<br>[UPS-01 R4 响应数组、嵌套字段与字符串中的数字保持无损](test/browse.test.js#L391)<br>[UPS-01 R21 损坏的密钥封装不作为普通字符串签名](test/browse.test.js#L482) |
+| UPS-02 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [UPS-02 全局队列按实际发送时刻限速、慢响应可并行](test/browse.test.js#L354) |
+| UPS-03 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [BRW-10 UPS-01 UPS-03 OUT-02 OUT-03 重试重签、读超时和异常响应](test/browse.test.js#L285)<br>[UPS-03 读超时覆盖收到响应头后的半截响应体](test/quota-time.test.js#L120) |
+| UPS-04 | [server/qmai.js](server/qmai.js) · Qmai、post、sign、checkSignature | [UPS-04 签名实现损坏时真实启动拒绝就绪](test/browse.test.js#L397) |

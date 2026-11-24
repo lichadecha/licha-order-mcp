@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {rig} from '../test-support/rig.js';
 import {bind} from '../test-support/commerce.js';
 import {Browse} from '../server/browse.js';
+import {itemCard} from '../server/catalog.js';
 import {PATHS, Qmai, parseResponse, sign} from '../server/qmai.js';
 
 const good = data => ({status:true, code:0, data});
@@ -66,7 +68,7 @@ test('BRW-01 BRW-02 BRW-03 门店匹配、采样和两路刷新', async t => {
 });
 
 test('BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 ID', async t => {
-  const sample = product();
+  const sample = product({goodsExtra:{goodsDesc:{desc:'配料只在卡片展示'}}});
   const entries = [
     sample, product({goodsId:'22',type:2}), product({goodsId:'23',status:20}),
     product({goodsId:'24',goodsSkuList:[{salePrice:null}]}), product({goodsId:'25',goodsSkuList:[{salePrice:false}]}),
@@ -97,9 +99,12 @@ test('BRW-04 BRW-05 BRW-06 菜单分支、过滤和估清，UPS-01 无损分类 
   assert.equal(result.items[1].soldOut,true);
   assert.equal(Object.hasOwn(result.items[0],'soldOut'),false);
   assert.deepEqual(result.items[0].labels,['新款','文字标签']);
+  assert.ok(!Object.hasOwn(result.items[0], 'description'));
   assert.equal(result.items[2].priceYuan,'15.00');
   assert.match(result.hint,/以 get_item_detail 点单卡片为准/);
-  assert.match((await menu('测试')).hint,/前 20 条/);
+  const search = await menu('测试');
+  assert.match(search.hint,/前 20 条/);
+  assert.ok(!Object.hasOwn(search.items[0], 'description'));
   assert.match((await menu('隐藏品')).hint,/^没找到/);
   assert.equal(r.requests.filter(x => kind(x.path) === PATHS.categories).length,1);
 });
@@ -138,6 +143,54 @@ test('BRW-07 OUT-01 卡片投影、空值、估清优先级和商品一致性', 
   assert.equal((await detail()).goodsId,digits);
 });
 
+test('BRW-11 点单卡片请求描述并展示 11-24 样本中的配料、能量和杯量', async t => {
+  // 摘自规格样本 3.1.12_getShopGoodsDetail_withGoodsDesc_composed_20261124，保留原始数字和商品描述。
+  const sampleFile = '../test-support/item-description-20261124.json';
+  const raw = await readFile(new URL(sampleFile, import.meta.url), 'utf8');
+  const r = await rig(t, {upstream(path, params, {res}) { res.end(raw); }});
+  const s = await r.session();
+  const card = await invoke(s, 'get_item_detail', {storeId:301, goodsId:'1288634197238501377'});
+  const [request] = r.requests;
+  assert.equal(request.path, PATHS.item);
+  assert.deepEqual(request.params.includeProperties, ['SKU','PRACTICE','ATTACH','LABEL','CATEGORY']);
+  assert.deepEqual(request.params.includeExtras, ['GOODS_DESC']);
+  assert.deepEqual(card.description, {
+    summary:'红富士苹果 | 岩冠大红袍',
+    detail:'配料：HPP红富士苹果/岩冠大红袍；因采用HPP冷压鲜榨，产品会有沉淀，喝前请搅拌。为保证口感，本品不可去冰。' +
+      '；能量（冰）：不另外加糖≈95kcal, 30%L阿拉伯糖≈136kcal；能量（热）：不另外加糖=74kcal, 30%L阿拉伯糖=115kcal' +
+      '；茶多酚：■■■□□；规格：冰420ml，热350ml'
+  });
+});
+
+test('BRW-11 OUT-02 描述只投影非空字段，去掉网址、凭证并遮盖长号码', () => {
+  const cases = [
+    [{desc:'<b>苹果</b> &amp; 茶'}, {summary:'苹果 & 茶'}],
+    [{detail:'<p>杯量&nbsp; 420ml</p><p>联系+8613800000000，编号1234567890123456789</p>'},
+      {detail:'杯量 420ml；联系***0000，编号***6789'}],
+    [{desc:'配料 https://example.invalid/hidden 茶', detail:'无糖 appSECRET：FAKE_REDACT_ME 热饮'},
+      {summary:'配料 茶', detail:'无糖 热饮'}],
+    [{desc:'<p>&nbsp;</p>', detail:' \t\n '}, undefined],
+    [{desc:'https://example.invalid/hidden', detail:'AppToken=FAKE_REDACT_ME'}, undefined],
+    [{desc:123, detail:null}, undefined],
+    [undefined, undefined]
+  ];
+  for (const [goodsDesc, expected] of cases) {
+    const card = itemCard(product({goodsExtra:{goodsDesc}}));
+    if (expected) assert.deepEqual(card.description, expected);
+    else assert.ok(!Object.hasOwn(card, 'description'));
+  }
+});
+
+test('BRW-11 短描述与长说明各按 Unicode 码点计数，恰好到上限时保留原文', () => {
+  const summary = '🍎'.repeat(60), detail = '🍵'.repeat(400);
+  for (const extra of ['', '多一字']) {
+    const goodsDesc = {desc:summary + extra, detail:detail + extra};
+    const projected = itemCard(product({goodsExtra:{goodsDesc}})).description;
+    const suffix = extra ? '…' : '';
+    assert.deepEqual(projected, {summary:summary + suffix, detail:detail + suffix});
+  }
+});
+
 test('BRW-08 逐行算价、同名做法及缺价规格', async t => {
   const row = product();
   row.goodsSkuList.push({skuId:'2',salePrice:''},{skuId:'3',salePrice:2000,inventory:0},{skuId:'4',salePrice:2200});
@@ -169,7 +222,9 @@ test('BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发�
   const r = await rig(t,{mockSms:true,env:{LICHA_MAX_ORDER_AMOUNT_FEN:'10000'},upstream(path,params,{res}) {
     switch (kind(path)) {
       case PATHS.member: return good({customerId:member});
-      case PATHS.item: reads++; return good([row]);
+      case PATHS.item:
+        reads++;
+        return good([{...row, goodsExtra:params.includeExtras?.includes('GOODS_DESC') ? row.goodsExtra : null}]);
       case PATHS.stores: return good({list:[{id:301,code:'01',name:'试验店'}]});
       case PATHS.coupons: return good([]);
       case PATHS.create: return good({orderNo});
@@ -192,10 +247,13 @@ test('BRW-09 PRE-03 PRE-04 PRE-05 PRE-06 现价、必选、内部 ID 与签发�
   assert.deepEqual(couponRequest.params.tradeMarks,Array(2).fill({tradeMark:digits,num:1,price:50}));
   assert.ok(couponRequest.raw.includes('"customerId":'+member));
   row.goodsSkuList[0].salePrice = 4741;
+  row.goodsExtra = {goodsDesc:{desc:'新配料说明'}};
   const overLimit = await prepare();
   assert.equal(overLimit.isError,true);
   assert.equal(overLimit.content[0].text,'单笔金额超上限：本单预估 ¥100.02，上限 ¥100.00。请减少商品后重新组单。');
-  assert.equal((await detail()).skus[0].priceFen,4741);
+  const refreshed = await detail();
+  assert.equal(refreshed.skus[0].priceFen,4741);
+  assert.deepEqual(refreshed.description, {summary:'新配料说明'});
   assert.equal(reads,3);
   row = product();
   const missing = await s.call('prepare_order',{...args,items:[{...item,practices:[]}]});

@@ -79,12 +79,19 @@ export function couponTextMask(rows) {
   });
 }
 
-export function projectText(value, mask = maskNumbers) {
+export function cleanText(value, mask = maskNumbers) {
   if (typeof value !== 'string') return '';
   const publicText = value
     .replace(/(?:https?:\/\/|www\.)[^\s，。；、）)]+/gi, ' ')
     .replace(/[a-z\d_.-]*(?:key|secret|token)[a-z\d_.-]*\s*[=：:]\s*[^\s，。；、]+/gi, ' ');
-  const cleaned = mask(publicText).replace(/\s+/g, ' ').trim();
-  const chars = Array.from(cleaned);
-  return chars.length > 80 ? chars.slice(0, 80).join('') + '…' : cleaned;
+  return mask(publicText).replace(/\s+/g, ' ').trim();
+}
+
+export function truncateText(text, limit) {
+  const chars = Array.from(text);
+  return chars.length > limit ? chars.slice(0, limit).join('') + '…' : text;
+}
+
+export function projectText(value, mask) {
+  return truncateText(cleanText(value, mask), 80);
 }

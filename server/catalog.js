@@ -1,4 +1,4 @@
-import {integerDigits, projectText, responseId, yuan} from './common.js';
+import {cleanText, integerDigits, projectText, responseId, truncateText, yuan} from './common.js';
 
 export const list = value => Array.isArray(value)
   ? value.filter(entry => entry && typeof entry === 'object' && !Array.isArray(entry)) : [];
@@ -27,6 +27,29 @@ export const optionPrice = value => missingPrice(value) ? 0 : value;
 function labels(row) {
   return list(row.labelList).filter(label => numeric(label.type) !== 2)
     .map(label => projectText(label.text) || projectText(label.labelTypeText)).filter(Boolean);
+}
+
+const entities = {
+  nbsp:' ', amp:'&', lt:'<', gt:'>', quot:'"', apos:"'", ensp:' ', emsp:' ',
+  ndash:'–', mdash:'—', hellip:'…', deg:'°', times:'×'
+};
+const entityPattern = /&([a-z]+|#\d+|#x[\da-f]+);/gi;
+function decodeEntity(match, name) {
+  const key = name.toLowerCase();
+  if (key[0] !== '#') return Object.hasOwn(entities, key) ? entities[key] : match;
+  const point = key.startsWith('#x') ? parseInt(key.slice(2), 16) : Number(key.slice(1));
+  return point > 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)
+    ? String.fromCodePoint(point) : '�';
+}
+
+function descriptionText(value, limit) {
+  if (typeof value !== 'string') return '';
+  // 标签先于实体处理，品牌写成 &lt; 的比较符应当保留。行内标签不切断词或数字。
+  const tags = /<!--[\s\S]*?-->|<\/?([a-z][\w:-]*)\b(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi;
+  const paragraphs = value.replace(tags, (_, tag) => /^(?:p|br|div|li)$/i.test(tag) ? '\0' : '').split('\0');
+  const text = paragraphs.map(part => cleanText(part.replace(entityPattern, decodeEntity)))
+    .filter(Boolean).join('；');
+  return truncateText(text, limit);
 }
 
 function validSkuIds(sku) {
@@ -80,9 +103,14 @@ export function itemCard(row) {
   if (numeric(row.status) === 20) unavailableReason = '已下架';
   else if (!skus.some(sku => sku.priceFen > 0)) unavailableReason = '非售卖条目';
   else if (!skus.some(sku => sku.available)) unavailableReason = '暂时估清，点不了';
-  return {
+  const card = {
     goodsId:id(row.goodsId), name:projectText(row.name), type, isSetMeal:type === 3,
     ...(categoryName && {categoryName}), labels:labels(row), available:!unavailableReason,
     ...(unavailableReason && {unavailableReason}), skus, practices, attaches
   };
+  const goodsDesc = row.goodsExtra?.goodsDesc;
+  const summary = descriptionText(goodsDesc?.desc, 60);
+  const detail = descriptionText(goodsDesc?.detail, 400);
+  if (summary || detail) card.description = {...(summary && {summary}), ...(detail && {detail})};
+  return card;
 }

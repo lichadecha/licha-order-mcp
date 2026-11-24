@@ -174,8 +174,10 @@ export class Browse {
     const key = responseId(goodsId);
     if (!key) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
     return this.#cached(['item',String(storeId),key], this.config.LICHA_CACHE_ITEM_MS, async () => {
-      const result = await this.#read(PATHS.item, {storeId, goodsIds:[id(goodsId)], ...channel,
-        includeProperties:['SKU','PRACTICE','ATTACH','LABEL','CATEGORY']}, '商品详情查询失败', '换个商品试试');
+      const result = await this.#read(PATHS.item, {
+        storeId, goodsIds:[id(goodsId)], ...channel,
+        includeProperties:['SKU','PRACTICE','ATTACH','LABEL','CATEGORY'], includeExtras:['GOODS_DESC']
+      }, '商品详情查询失败', '换个商品试试');
       const row = Array.isArray(result) ? result[0] : null;
       if (responseId(row?.goodsId) !== key) throw Object.assign(new Error(itemMissing), {reason:'商品不存在或已下架'});
       return {row, card:itemCard(row)};
