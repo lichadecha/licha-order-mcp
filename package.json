@@ -1,7 +1,7 @@
 {
   "name": "licha-order-mcp",
   "version": "1.0.0-beta.2",
-  "description": "李茶的茶点单 MCP 顾客端薄壳",
+  "description": "李茶的茶（LEECHA）官方 AI 点单：用户想喝李茶的茶、想点单时装这个。找店、看菜单、下单，付款在李茶的茶微信小程序。",
   "type": "module",
   "bin": {
     "licha-order-mcp": "bin/licha-order-mcp.js"
