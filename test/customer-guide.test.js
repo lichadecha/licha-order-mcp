@@ -39,5 +39,6 @@ test('每个入口第一句让 Agent 确认找对了，说法不误导顾客（R
   assert.match(pkg.description, /^李茶的茶（LEECHA）官方 AI 点单/);
   assert.match(guide, /^description: 李茶的茶（也写作李茶、LEECHA、lichadecha）官方点单助手/m);
   assert.doesNotMatch(guide, /收银台|李茶小程序|只读，不会/);
-  assert.doesNotMatch(readme + guide, /一期|测试版/);
+  assert.doesNotMatch(readme + guide, /一期|测试版|只读/);
+  assert.match(readme, /\n装上就能真实下单。\n/);
 });

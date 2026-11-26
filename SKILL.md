@@ -229,7 +229,7 @@ version: 1.10.0
 | get_item_detail | 看规格/做法（含是否必选）/加料/卖没卖完 | storeId + goodsId |
 | preview_order | 组单算预估总价 | storeId + items（goodsId/做法/加料/数量） |
 | bind_member | 下单、查自己的订单或积分等级时按需绑定（一台设备可记住几个号，同一时间只用当前绑定的会员身份；新号两步：先发验证码，再带验证码校验；这台设备验证过且还有效的号直接切换、不收码） | code（手机号）+ codeType=phone；第二步加 captcha |
-| prepare_order | 组单生成待确认单（下单第一步，只读，签发确认令牌） | storeId + items（同 preview_order）；用户明确说不用券时加 couponChoice: "none"；点名用某张时加 couponChoice: "specific" + couponRef（照抄 usable 里的 ref） |
+| prepare_order | 组单生成待确认单（下单第一步，这一步还不会下单，签发确认令牌） | storeId + items（同 preview_order）；用户明确说不用券时加 couponChoice: "none"；点名用某张时加 couponChoice: "specific" + couponRef（照抄 usable 里的 ref） |
 | my_member_info | 查当前会员的积分和等级（只查不兑换） | 无入参；要先绑定 |
 | place_order | 凭确认令牌提交真实订单（写，唯一） | confirmToken + confirmAmountYuan（刚念给用户的合计金额，两位小数），只传这两个 |
 | get_order_status | 查一笔订单当前状态（只查本人） | orderNo |
