@@ -1,6 +1,6 @@
 # 李茶的茶点单 MCP · 服务端运行说明
 
-> 给开发和部署的人看。顾客和顾客的 AI 助手看仓库首页 [README.md](README.md) 和 [SKILL.md](SKILL.md)。
+> 给开发和部署的人看。顾客和顾客的 AI 助手看仓库首页 [README.md](../README.md) 和 [SKILL.md](../SKILL.md)。
 
 服务端启动命令（Node 22.13 或更高的 22.x，先设置下表中的环境变量）
 
@@ -35,13 +35,13 @@ npm run rebuild:runtimes
 npm test
 ```
 
-仓库根是顾客端包，随包分发约 114 KiB 的薄壳协议运行库。发布时客户端的命令形式为 `npx -y github:lichadecha/licha-order-mcp#<标签>`。正式地址和公开准入串集中在 `bin/licha-order-mcp.js`。2026-11-24 发布公开测试版（当前 `v1.0.0-beta.2`，含规格 v1.16 与顾客说明书 v1.8.0）：`npx -y github:lichadecha/licha-order-mcp#v1.0.0-beta.2`；内置的是测试版专用准入串，服务端删掉即作废。
+仓库根是顾客端包，随包分发约 114 KiB 的薄壳协议运行库。顾客按首页的命令 `npx -y github:lichadecha/licha-order-mcp` 安装（拉 main；main 只在验收通过后更新），也可以带标签固定版本，如 `#v1.0.0-beta.2`。正式地址和公开准入串集中在 `bin/licha-order-mcp.js`；品牌方在服务端停用这把准入串即可让所有顾客端失效。
 
 ## 服务端环境
 
 仅设置 `LICHA_ACCESS_KEYS` 即可启动浏览模式。凭证缺项时仍可握手并查看工具清单。调用需要上游数据的工具会说明凭证不完整。举例，本机客户端与服务端可约定使用 `FAKE_LOCAL_ACCESS`。下单模式须额外设置 `LICHA_ENABLE_ORDERING=1`、`LICHA_DATA_DIR` 和企迈商家后台的短信事件编号 `LICHA_SMS_EVENT_NO`。事件编号缺失或无效时，服务拒绝启动。下列目录的相对路径均按服务进程的启动工作目录解析。服务管理器宜传入绝对路径，重启时复用同一账本。
 
-服务器专用的企迈应用按 v1.13 允许清单勾选 16 项权限，其中会员信息查询使用 4.1.6「会员积分查询」和 4.1.15「查询会员等级和经验值」。[企迈接口契约](spec/qmai-contract.md)
+服务器专用的企迈应用按 v1.13 允许清单勾选 16 项权限，其中会员信息查询使用 4.1.6「会员积分查询」和 4.1.15「查询会员等级和经验值」。企迈接口契约（品牌方内部规格）
 
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |

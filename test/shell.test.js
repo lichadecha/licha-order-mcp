@@ -123,7 +123,7 @@ async function newPort() {
 test('顾客零配置时薄壳使用说明书所列的正式端点，自动附上公开准入串', async t => {
   const dir = await sandbox(t);
   const endpoint = 'https://lichadecha.com/mcp';
-  const readme = await readFile(join(root, 'SERVER.md'), 'utf8');
+  const readme = await readFile(join(root, 'docs', 'SERVER.md'), 'utf8');
   assert.ok(readme.includes(endpoint));
   assert.doesNotMatch(readme, /待替换的占位地址|内置公开占位串/);
   const local = await remote(t);
