@@ -6,7 +6,7 @@ const tool = 'my_member_info';
 const pointsPath = 'v3/crm/points/getCustomerPoints';
 const levelPath = 'v3/crm/customer/getLevelExperience';
 const member = { last4: '***0000', via: 'phone' };
-const note = '积分可以在李茶小程序的积分商城兑换；这里只能查，不能兑换。';
+const note = '积分可以在李茶的茶小程序的积分商城兑换；这里只能查，不能兑换。';
 const noPoints = note + '积分暂时没查到，稍后可以再问一次。';
 const noLevel = note + '会员等级暂时没查到，稍后可以再问一次。';
 const level = { name: 'VIP1' };
@@ -21,7 +21,7 @@ test('ORD-01 QRY-07 空参查当前绑定会员，未绑定和指定他人均不
   const r = await setup(t);
   const s = await r.session();
   const definition = (await s.rpc('tools/list')).tools.find(entry => entry.name === tool);
-  assert.equal(definition.description, '查当前绑定会员的积分和会员等级。只查当前绑定的会员本人；只查不改——本工具不能兑换积分、不能领券，顾客问积分怎么用，请引导他去李茶小程序的积分商城。需先用 bind_member 绑定。');
+  assert.equal(definition.description, '查当前绑定会员的积分和会员等级。只查当前绑定的会员本人；只查不改——本工具不能兑换积分、不能领券，顾客问积分怎么用，请引导他去李茶的茶小程序的积分商城。需先用 bind_member 绑定。');
   assert.equal(await failure(s, tool, {}, /未绑定/), '本会话尚未绑定会员身份，请先用 bind_member 绑定');
   assert.equal(r.requests.length, 0);
   await bind(s);

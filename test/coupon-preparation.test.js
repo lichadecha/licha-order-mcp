@@ -405,7 +405,7 @@ for (const [reason, rows] of [
     assert.equal(coupons.usable.length, rows.length);
     for (const key of ['predicted', 'chosen', 'autoPicked']) assert.equal(Object.hasOwn(coupons, key), false);
     assert.equal(coupons.note, rows.length === 1
-      ? '查到可用券但抵扣金额都为 0。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」'
+      ? '查到可用券但抵扣金额都为 0。念单时优惠一项说：「系统没提示会用券，实付以下单后小程序里显示的为准。」'
       : `顾客有 2 张券可用于本单，但系统这次没法替顾客挑（${reason}）。念单时优惠一项说：「门店系统可能会自动用你的一张券，实付以下单后为准；想指定用哪张或不用券跟我说。」顾客点名 usable 里带 ref 的某一张，就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。`);
     await place(s, draft);
     const { raw } = r.requests.find(req => req.path === PATHS.create);

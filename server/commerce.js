@@ -350,7 +350,7 @@ export async function createCommerce(config, qmai, browse, logs) {
     const level = levelView(levelData.value, binding.id);
     if (!points && !level) throw Error('会员信息暂时没查到（是我们这边的问题，不是你的会员有问题），稍后再试。');
 
-    const result = { member: memberView(binding), note: '积分可以在李茶小程序的积分商城兑换；这里只能查，不能兑换。' };
+    const result = { member: memberView(binding), note: '积分可以在李茶的茶小程序的积分商城兑换；这里只能查，不能兑换。' };
     if (points) result.points = points;
     if (level) result.level = level;
     if (!points || !level) {

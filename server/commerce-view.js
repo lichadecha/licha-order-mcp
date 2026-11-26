@@ -63,7 +63,7 @@ export function couponView(rows, totalFen, hasCode, choice, binding, selected, m
       ? '券信息暂时没查到，没法确认这张券能不能用，所以这次不能指定用券。可以按默认或不用券组单，或稍后再试。'
       : '这家门店暂时查不了券，没法指定用券。可以按默认或不用券组单。');
     coupons.note = hasCode
-      ? '券信息暂时没查到。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」下单后以门店系统读回的实付为准，如有优惠会在读回里体现。'
+      ? '券信息暂时没查到。念单时优惠一项说：「系统没提示会用券，实付以下单后小程序里显示的为准。」下单后以门店系统读回的实付为准，如有优惠会在读回里体现。'
       : '这家门店暂时查不了券；下单后以门店系统读回的实付为准。';
     return { coupons };
   }
@@ -110,9 +110,9 @@ export function couponView(rows, totalFen, hasCode, choice, binding, selected, m
       ? '能用的券会把这单抵成 0 元，用不用要顾客自己定' : '这些券缺少指定所需的信息';
     coupons.note = `顾客有 ${usable.length} 张券可用于本单，但系统这次没法替顾客挑（${reason}）。念单时优惠一项说：「门店系统可能会自动用你的一张券，实付以下单后为准；想指定用哪张或不用券跟我说。」顾客点名 usable 里带 ref 的某一张，就带 couponChoice="specific" 和那张的 ref 重新组单；说不用券，就带 couponChoice="none" 重新组单。`;
   } else if (usable.length) {
-    coupons.note = '查到可用券但抵扣金额都为 0。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」';
+    coupons.note = '查到可用券但抵扣金额都为 0。念单时优惠一项说：「系统没提示会用券，实付以下单后小程序里显示的为准。」';
   } else {
-    coupons.note = `顾客没有可用于本单的券${unusable.length ? '（' + unusable.length + ' 张不可用）' : ''}。念单时优惠一项说：「系统没提示会用券，以门店收银台为准。」`;
+    coupons.note = `顾客没有可用于本单的券${unusable.length ? '（' + unusable.length + ' 张不可用）' : ''}。念单时优惠一项说：「系统没提示会用券，实付以下单后小程序里显示的为准。」`;
   }
   return { coupons };
 }

@@ -1,8 +1,13 @@
-# 李茶的茶点单 MCP v1.17 交付清单
+# 李茶的茶点单 MCP v1.18 交付清单
 
 根包提供顾客端 stdio 薄壳，独立的 `server/` 包提供 Streamable HTTP 服务端和本机账本运维命令。三个入口均可从任意工作目录按绝对路径启动。[运行说明](SERVER.md)
 
-## v1.17 初始化说明
+## v1.18 顾客视角文字修订
+
+- 按工具契约 v1.18 改五处顾客容易误会的文字：`find_store` 描述不再写「点单第一步先找店」；找店没命中时 `hint` 列出名录里有门店的城市（取不到城市名时用旧文案）；`preview_order`、`prepare_order`、`bind_member` 描述改新句；待确认单 `coupons.note` 里「以门店收银台为准」改为「实付以下单后小程序里显示的为准」；初始化说明首行带品牌名写法与「官方」。出参结构不变。
+- [找店提示测试](../test/browse.test.js) · [待确认单文案测试](../test/commerce.test.js) · [初始化说明测试](../test/instructions.test.js)
+
+## v1.17 初始化说明（历史记录）
 
 - 服务端在初始化答复里带 `instructions`（RCP-01）：`LICHA_ENABLE_ORDERING` 精确等于 `1` 时给「开通下单」文案，否则给「只开浏览」文案，逐字照工具契约 §0.2，文案常量在 `server/instructions.js`。薄壳不改动，原样转发。[初始化说明测试](../test/instructions.test.js)
 - 测试覆盖两种形态逐字相等、开关为 `true` 时按只开浏览、以及经薄壳握手拿到同一段文案。

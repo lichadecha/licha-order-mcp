@@ -39,6 +39,15 @@ function openedHours(entries) {
   return [...new Set(ranges)].join('、');
 }
 
+// 契约 §1（v1.18）：没命中时列出名录里有门店的城市，按 shopCode 升序（空编码排最后、彼此保持名录原顺序）、首次出现先后去重；取不到城市名用旧文案。
+function missHint(records) {
+  const cities = [...new Set([...records.values()].map(({store}) => storeView(store))
+    .sort((a,b) => !a.shopCode - !b.shopCode || (a.shopCode && a.shopCode.localeCompare(b.shopCode))).map(v => v.cityName).filter(Boolean))];
+  return cities.length
+    ? `没找到这家店。目前有门店的城市：${cities.join('、')}。顾客说的城市不在里面，就直说那里还没有店；在里面就请他说商场名或地标。`
+    : '没找到这家店，试试商场名或城市名';
+}
+
 export class Browse {
   #cache = new Map();
   #nextSweep = 0;
@@ -142,7 +151,7 @@ export class Browse {
     const candidates = matches.map(({store,status}) =>
       ({...storeView(store), openStatusText:statusText(status), statusSampledAt:directory.sampled}))
       .sort((a,b) => a.shopCode.localeCompare(b.shopCode));
-    return {matched:false, candidates, ...(!candidates.length && {hint:'没找到这家店，试试商场名或城市名'})};
+    return {matched:false, candidates, ...(!candidates.length && {hint:missHint(directory.records)})};
   }
 
   async #menu({storeId, keyword = ''}) {

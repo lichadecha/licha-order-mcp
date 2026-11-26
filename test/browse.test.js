@@ -600,3 +600,35 @@ test('BRW-03 BRW-04 R24 营业时间内层复数和菜单布尔标记',async t =
   const {items} = await invoke(s,'get_menu',{storeId:301,keyword:'茶'});
   assert.deepEqual(items.map(i=>[i.hasAttach,i.hasPractice]),[[true,true],[false,false]]);
 });
+
+test('BRW-01 v1.18 没命中时 hint 列出有门店的城市：去重、按 shopCode 升序', async t => {
+  const shops = [
+    {id:1,code:'09',name:'甲店',cityName:'深圳市',openStatus:1},
+    {id:2,code:'03',name:'乙店',cityName:'北京市',openStatus:1},
+    {id:3,code:'05',name:'丙店',cityName:'深圳市',openStatus:1},
+    {id:4,code:'01',name:'丁店',cityName:'上海市',openStatus:1},
+    {id:5,code:'02',name:'戊店',openStatus:1}
+  ];
+  const r = await rig(t,{upstream:path => { assert.equal(kind(path),PATHS.stores); return good({list:shops}); }});
+  const result = await invoke(await r.session(),'find_store',{query:'成都'});
+  assert.deepEqual(result.candidates,[]);
+  assert.equal(result.hint,'没找到这家店。目前有门店的城市：上海市、北京市、深圳市。顾客说的城市不在里面，就直说那里还没有店；在里面就请他说商场名或地标。');
+});
+
+test('BRW-01 v1.18 名录没有任何城市名时 hint 回退旧文案', async t => {
+  const r = await rig(t,{upstream:() => good({list:[{id:1,code:'01',name:'甲店',openStatus:1},{id:2,code:'02',name:'乙店',cityName:'  ',openStatus:1}]})});
+  const result = await invoke(await r.session(),'find_store',{query:'成都'});
+  assert.equal(result.hint,'没找到这家店，试试商场名或城市名');
+});
+
+test('BRW-01 v1.18 列城市时空编码的店排在有编码的店之后，彼此保持名录原顺序', async t => {
+  const shops = [
+    {id:1,name:'甲店',cityName:'杭州市',openStatus:1},
+    {id:2,code:'09',name:'乙店',cityName:'深圳市',openStatus:1},
+    {id:3,name:'丙店',cityName:'南京市',openStatus:1},
+    {id:4,code:'03',name:'丁店',cityName:'北京市',openStatus:1}
+  ];
+  const r = await rig(t,{upstream:() => good({list:shops})});
+  const result = await invoke(await r.session(),'find_store',{query:'成都'});
+  assert.match(result.hint,/目前有门店的城市：北京市、深圳市、杭州市、南京市。/);
+});
