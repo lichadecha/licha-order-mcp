@@ -3,6 +3,7 @@ import {
   Server, StreamableHTTPServerTransport, CallToolRequestSchema, InitializeRequestSchema, ListToolsRequestSchema
 } from './protocol-runtime.js';
 import { decimalId, uuidPattern, withMemberText } from './common.js';
+import { BROWSE_ONLY_INSTRUCTIONS, ORDERING_INSTRUCTIONS } from './instructions.js';
 import { maxStoreId, tools, validators } from './tools.js';
 
 function json(res,status,body,headers = {}) {
@@ -191,7 +192,7 @@ export function makeEndpoint({version,config,logs,browse,commerce}) {
       release();
       return reject(res,400,'请先初始化会话。');
     }
-    const server = new Server({name:'licha-order-mcp',version},{capabilities:{tools:{}}});
+    const server = new Server({name:'licha-order-mcp',version},{capabilities:{tools:{}},instructions:commerce ? ORDERING_INSTRUCTIONS : BROWSE_ONLY_INSTRUCTIONS});
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator:randomUUID,enableJsonResponse:true,
       onsessioninitialized(id) { release(); sessions.set(id,s); },
